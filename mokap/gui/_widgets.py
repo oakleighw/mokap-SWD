@@ -614,6 +614,7 @@ class RecordingWindow(VideoWindowBase):
         super().__init__(camera, main_window_ref)
 
         self._n_enabled = False
+        self._wb_enabled = False
         self._magnifier_enabled = False
 
         # Magnification parameters
@@ -775,6 +776,12 @@ class RecordingWindow(VideoWindowBase):
         self.magn_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self.magn_button.clicked.connect(self._toggle_mag_display)
         line_layout.addWidget(self.magn_button)
+
+        self.wb_button = QPushButton('White Balance')
+        # self.n_button.setCheckable(True)
+        self.wb_button.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
+        self.wb_button.clicked.connect(self._white_balance_once_display)
+        line_layout.addWidget(self.wb_button)
 
         self.magn_slider = QSlider(Qt.Vertical)
         self.magn_slider.setMinimum(1)
@@ -949,6 +956,15 @@ class RecordingWindow(VideoWindowBase):
             self.n_button.setStyleSheet(f'background-color: #80{self._mainwindow.col_green.lstrip("#")};')
             self._n_enabled = True
 
+    def _white_balance_once_display(self):
+        if not self._wb_enabled:
+            self._wb_enabled = True
+            self.wb_button.setStyleSheet(f'background-color: #80{self._mainwindow.col_green.lstrip("#")};')
+            self.update_white_balance()
+            QTimer.singleShot(100, lambda: self.wb_button.setStyleSheet('')) #turns green for a tiny amount of time (not a toggle)
+            self._wb_enabled = False
+            
+
     def _toggle_mag_display(self):
         if self._magnifier_enabled:
             self.magn_button.setStyleSheet('')
@@ -958,6 +974,11 @@ class RecordingWindow(VideoWindowBase):
             self.magn_button.setStyleSheet(f'background-color: #80{self._mainwindow.col_yellow.lstrip("#")};')
             # self.magn_slider.setDisabled(False)
             self._magnifier_enabled = True
+
+    def update_white_balance(self):
+        self._mainwindow.mc.cameras[self.idx].ptr.BalanceWhiteAuto=  'Once'
+        #setattr(self._mainwindow.mc.cameras[self.idx], 'BalanceWhiteAuto', 'BalanceWhiteAuto_Once')
+
 
     def update_param(self, label):
         if label == 'framerate' and self._mainwindow.mc.triggered and self._mainwindow.mc.acquiring:
