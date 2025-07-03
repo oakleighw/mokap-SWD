@@ -2,6 +2,7 @@ import json
 import pickle
 import re
 import logging
+from dataclasses import dataclass, field
 from typing import Tuple, Union, Optional,  Dict, List, FrozenSet
 from collections import defaultdict
 from itertools import combinations
@@ -124,16 +125,18 @@ class CandidateSkeleton:
 
 CONFIG = {
 
+    # TODO: okay this dict is getting ridiculously big lol
+
     # --- Stats Bootstrapper parameters ---
     "BOOTSTRAP_GENERIC_MAD_RATIO": 0.10,    # Generic MAD ratio to apply when bootstrapping from a simple prior or if data-driven MAD is zero
     "BOOTSTRAP_MIN_SAMPLES": 20,            # Min samples needed to calculate data-driven stats for a bone
-    "BOOTSTRAP_MAX_BONE_LEN": 3.0,          # Max bone length for the simple greedy assembler used in bootstrapping
+    "BOOTSTRAP_MAX_BONE_LEN": 4.0,          # Max bone length for the simple greedy assembler used in bootstrapping
 
     # --- Anatomy Learner parameters ---
     "LEARNER_MIN_SAMPLES_FOR_UPDATE": 100,  # How many new high-quality skeleton measurements before re-calculating anatomy stats
     "LEARNER_MIN_SCORE_FOR_LEARNING": 5.0,  # Minimum score of a tracked skeleton to be used for learning
-    "LEARNER_MIN_REF_BONE_LEN": 1.0,        # Sanity check: min plausible length of reference bone for learning
-    "LEARNER_MAX_REF_BONE_LEN": 15.0,       # Sanity check: max plausible length of reference bone for learning
+    "LEARNER_MIN_REF_BONE_LEN": 1.0,        # Min plausible length of reference bone for learning
+    "LEARNER_MAX_REF_BONE_LEN": 15.0,       # Max plausible length of reference bone for learning
 
     # --- Assembler parameters ---
     "ASSEMBLER_MIN_KPS_FOR_SKELETON": 3,        # Min keypoints to be considered a valid skeleton fragment
@@ -149,12 +152,16 @@ CONFIG = {
     "CONFLICT_SOLVER_JACCARD_THRESHOLD": 0.85,  # Jaccard proximity threshold to consider two skeletons 'clones'
 
     # --- Tracker parameters ---
-    "TRACKER_MAX_AGE": 15,                  # How many frames a track can coast without an update before being deleted
-    "TRACKER_MIN_KPS_FOR_INFERENCE": 3,     # Min shared KPs needed to infer a missing central keypoint via alignment
-    "TRACKER_SCALE_LEARNING_RATE": 0.25,    # Learning rate for the track's adapting scale estimate
-    "TRACKER_ASSOCIATION_RADIUS": 1.0,      # Max distance between a track's prediction and a candidate for association
-    "TRACKER_ASSOCIATION_MIN_KPS": 3,       # Min shared keypoints to associate a track with a candidate
-    "TRACKER_CONTINUITY_BONUS": 500.0,      # Large bonus to a candidate's score if it matches an existing track
+    "TRACKER_MAX_AGE": 15,                    # How many frames a track can coast without an update before being deleted
+    "TRACKER_UNCERTAINTY_THRESHOLD": 100,     # This is for variance of the position, so 100 is equivalent to a std dev of 10 units
+    "TRACKER_MIN_KPS_FOR_INFERENCE": 3,       # Min shared KPs needed to infer a missing central keypoint via alignment
+    "TRACKER_SCALE_LEARNING_RATE": 0.25,      # Learning rate for the track's adapting scale estimate
+    "TRACKER_ASSOCIATION_RADIUS": 1.0,        # Max distance between a track's prediction and a candidate for association
+    "TRACKER_ASSOCIATION_MIN_KPS": 3,         # Min shared keypoints to associate a track with a candidate
+    "TRACKER_CONTINUITY_BONUS": 500.0,        # Large bonus to a candidate's score if it matches an existing track
+    "TRACKER_ANATOMICAL_SCORE_ALPHA": 0.15,   # Smoothing factor for the track's score. 0 = no update, 1 = new value only
+    "TRACKER_INFERRED_HEALTH_PENALTY": 0.05,  # Health reduction for an update based on an inferred point
+    "TRACKER_HEALTH_DECAY_RATE": 0.98,        # Multiplicative decay of health per frame without an update
     
     # --- Cost function weights (for final assignment) ---
     "COST_POSE_DISTANCE_WEIGHT": 0.9,       # Weights for the Hungarian algorithm cost matrix. Lower cost = better
@@ -651,6 +658,14 @@ class Track:
         self.time_since_update = 0
         self.last_update_frame = frame_idx
 
+        # Track health and score metrics
+        self.health = 1.0  # Running confidence metric (1.0 = high confidence)
+        self.anatomical_integrity = initial_skeleton.score  # Exponential Moving Average of the skeleton score
+
+        self.score_ema_alpha = CONFIG['TRACKER_ANATOMICAL_SCORE_ALPHA']
+        self.inferred_health_penalty = CONFIG['TRACKER_INFERRED_HEALTH_PENALTY']
+        self.health_decay_rate = CONFIG['TRACKER_HEALTH_DECAY_RATE']
+
         self.skeleton: AssembledSkeleton = initial_skeleton
         self.central_kp = central_kp
 
@@ -699,10 +714,15 @@ class Track:
     def predict(self, current_frame_idx: int):
         """ Predicts the state of the track for the current frame """
 
-        for _ in range(current_frame_idx - self.last_update_frame):
+        # The number of prediction steps is how many frames we've coasted
+        steps_to_predict = current_frame_idx - self.last_update_frame
+
+        for _ in range(steps_to_predict):
             self.kf.predict()
             self.age += 1
             self.time_since_update += 1
+            # Decay health for each frame without a measurement update
+            self.health *= self.health_decay_rate
 
     def update(self, skeleton: AssembledSkeleton, frame_idx: int):
         """
@@ -711,6 +731,7 @@ class Track:
         If the central keypoint is missing, it attempts to infer its position using
         rigid alignment (Kabsch algorithm) before updating the Kalman Filter
         """
+
         update_skeleton = skeleton
         inferred = False
 
@@ -723,7 +744,8 @@ class Track:
                 inferred = True
             else:
                 # if inference fails (too few points) we can't update the KF
-                # We still update the track's skeleton to the partial view, reset its age, and exit
+                # We still update the track's skeleton to the partial view, reset its age,
+                # but do *not* update health or score_ema, as it was not a full KF update
                 self.skeleton = skeleton
                 self.score = skeleton.score
                 self.time_since_update = 0
@@ -747,6 +769,21 @@ class Track:
             self.kf.R = original_R  # and restore for the next update
         else:
             self.kf.update(measurement)
+
+        # Update health and score metrics after a successful KF update
+
+        # Update the smoothed score (EMA)
+        self.anatomical_integrity = self.score_ema_alpha * skeleton.score + (1 - self.score_ema_alpha) * self.anatomical_integrity
+
+        # Update the track's health
+        if inferred:
+            # The update was based on an inferred point, so it's a bit less certain...
+            # so restore health, but with a lil penalty
+            self.health = 1.0 - self.inferred_health_penalty
+        else:
+            # The update was based on a direct measurement: this is a high-confidence event
+            # so reset health to its maximum value
+            self.health = 1.0
 
     def _infer_missing_central_kp(self, fragment: AssembledSkeleton) -> Optional[AssembledSkeleton]:
         """
@@ -805,6 +842,19 @@ class Track:
         Returns the predicted scale from the KF state
         """
         return self.kf.x[6, 0]
+
+    @property
+    def uncertainty(self) -> Dict[str, np.ndarray]:
+        """
+        Returns the uncertainty (variance) of the state variables from the
+        Kalman Filter's covariance matrix P
+        """
+        diag_P = self.kf.P.diagonal()
+        return {
+            'position': diag_P[0:3],
+            'velocity': diag_P[3:6],
+            'scale': diag_P[6]
+        }
 
 
 class SkeletonAssembler:
@@ -1237,8 +1287,12 @@ class MultiObjectTracker:
         return [t for t in self.tracks if t.time_since_update == 0]
 
     def prune_tracks(self):
-        """ Removes tracks that have been lost for too long """
-        self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
+        """ Removes tracks that have been lost for too long or that are very uncertain """
+
+        self.tracks = [
+            t for t in self.tracks
+            if t.time_since_update <= self.max_age and not np.sum(t.uncertainty['position']) > CONFIG['TRACKER_UNCERTAINTY_THRESHOLD']
+        ]
 
     def _calculate_association_bonuses(self,
             candidates: List[CandidateSkeleton],
