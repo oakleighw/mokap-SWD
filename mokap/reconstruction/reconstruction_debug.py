@@ -16,7 +16,7 @@ from mokap.utils.geometry.fitting import bundle_intersection_AABB
 from mokap.utils.geometry.projective import undistort_points, back_projection, project_points, project_to_multiple_cameras
 from mokap.utils.geometry.transforms import extrinsics_matrix, extmat_to_rtvecs
 from mokap.utils.visualisation import plot_cameras_3d, plot_points_3d, CUSTOM_COLORS
-from mokap.reconstruction.reconstructor import Reconstructor
+from mokap.reconstruction.reconstruction import Reconstructor
 
 
 class ReconstructorVisualizer:
@@ -223,7 +223,7 @@ if __name__ == '__main__':
     prefix = '240905-1616'
     session = 22
     DEBUG_FRAME = 926
-    DEBUG_KEYPOINT = 'thorax'
+    DEBUG_KEYPOINT = 'neck'
     DEBUG_CAM_I, DEBUG_CAM_J = 0, 3
 
     df = fileio.load_session(folder / prefix / 'inputs' / 'tracking', session=session)
