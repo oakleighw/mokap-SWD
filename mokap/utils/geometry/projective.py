@@ -2,8 +2,8 @@ from functools import partial
 from typing import Tuple, Union, Optional, Dict
 import jax
 from jax import numpy as jnp
-from mokap.utils.geometry.transforms import (rodrigues, extrinsics_matrix, invert_extrinsics_matrix,
-                                             projection_matrix, extmat_to_rtvecs)
+from mokap.utils.geometry.transforms import (rodrigues, extrinsics_matrix, projection_matrix,
+                                             extmat_to_rtvecs, invert_intrinsics_matrix)
 
 
 _eps = 1e-8
@@ -340,7 +340,7 @@ def back_projection(
     hom2d = jnp.concatenate([points2d_flat, ones], axis=1)  # (N, 3)
 
     # normalized camera coords: K^-1 @ hom2d  (3, N).T -> (N, 3)
-    invK = jnp.linalg.inv(camera_matrix)
+    invK = invert_intrinsics_matrix(camera_matrix)
     cam_dirs = (invK @ hom2d.T).T  # (N, 3)
 
     # apply depth (broadcast if scalar)
@@ -481,6 +481,8 @@ def triangulate_points_from_projections(
     if lambda_reg != 0.0:
         # build A^T A + lambda I for each point
         ATA = jnp.einsum('pni,pnj->pij', A, A) + lambda_reg * jnp.eye(4)
+
+        # TODO: jnp.linalg.svd is still incompatible with Apple silicon JAX-Metal...
         _, _, Vh = jnp.linalg.svd(ATA, full_matrices=False)
     else:
         _, _, Vh = jnp.linalg.svd(A, full_matrices=False)

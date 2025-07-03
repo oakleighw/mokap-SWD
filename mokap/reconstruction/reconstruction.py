@@ -10,7 +10,6 @@ import networkx as nx
 from networkx.algorithms.clique import find_cliques
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse import csr_matrix
-from functools import lru_cache
 from sklearn.cluster import DBSCAN
 import pandas as pd
 from alive_progress import alive_bar
@@ -20,7 +19,7 @@ from mokap.utils.geometry.projective import (
     undistort_points, back_projection, triangulate_points_from_projections, project_points, project_to_multiple_cameras
 )
 from mokap.utils.geometry.transforms import (
-    extrinsics_matrix, projection_matrix, invert_rtvecs, extmat_to_rtvecs
+    extrinsics_matrix, projection_matrix, invert_rtvecs, extmat_to_rtvecs, invert_extrinsics_matrix
 )
 
 logger = logging.getLogger(__name__)
@@ -145,11 +144,14 @@ class Reconstructor:
                               ) -> Tuple[ArrayLike, np.ndarray]:
         """ Orchestrates the full reconstruction pipeline for a single keypoint """
 
-        @lru_cache(maxsize=None)
+        cost_matrix_cache = {}
+
         def get_cached_cost_mat(i: int, j: int) -> jnp.ndarray:
             # ensure i < j for cache consistency
             if i > j: i, j = j, i
-            return self._compute_cost_matrix(points_per_cam[i], points_per_cam[j], i, j)
+            if (i, j) not in cost_matrix_cache:
+                cost_matrix_cache[(i, j)] = self._compute_cost_matrix(points_per_cam[i], points_per_cam[j], i, j)
+            return cost_matrix_cache[(i, j)]
 
         # Step 1: Generate all plausible 3D point hypotheses
         all_pts, all_groups, view_counts, summed_confs, all_errors = self._generate_hypotheses(
@@ -440,7 +442,7 @@ class Reconstructor:
         udets_j = undistort_points(dets_j, K_j, D_j)
 
         # Get the 3D rays for each point in the source camera (i)
-        E_c2w_i = jnp.linalg.inv(E_i)
+        E_c2w_i = invert_extrinsics_matrix(E_i)
         cam_center_i = E_c2w_i[:3, 3]
 
         # back_projection handles undistortion internally and gives us a point on the ray
