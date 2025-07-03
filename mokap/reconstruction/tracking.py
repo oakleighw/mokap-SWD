@@ -6,6 +6,7 @@ from typing import Tuple, Union, Optional,  Dict, List, FrozenSet
 from collections import defaultdict
 from itertools import combinations
 from pathlib import Path
+import pandas as pd
 import networkx as nx
 import numpy as np
 from alive_progress import alive_bar
@@ -17,8 +18,66 @@ from scipy.stats import median_abs_deviation
 from scipy.spatial import cKDTree
 from mokap.utils import fileio
 from mokap.utils.geometry.fitting import find_rigid_transform
-import pandas as pd
-from dataclasses import dataclass, field
+
+
+# TODO: Profile the two solvers a bit more
+#
+# from pyscipopt import Model
+# import cProfile
+# import pstats
+#
+# def solve_mwis_SCIP(graph: nx.Graph) -> list[int]:
+#     """ Solves the MWIS problem using the SCIP ILP solver """
+#
+#     model = Model("mwis")
+#     model.hideOutput()
+#
+#     # Create a binary variable for each node in the graph
+#     # The variable will be 1 if the node is in the solution, 0 otherwise
+#     nodes = list(graph.nodes())
+#     variables = {node: model.addVar(vtype="B", name=f"x_{node}") for node in nodes}
+#
+#     # Set the objective function: Maximize the sum of the weights of the selected nodes
+#     objective_terms = [graph.nodes[node]['weight'] * variables[node] for node in nodes]
+#     model.setObjective(sum(objective_terms), "maximize")
+#
+#     # Add constraints: For every edge (u, v) in the conflict graph, the two nodes
+#     # cannot be chosen together. This is the "independent set" constraint
+#     # x_u + x_v <= 1
+#     for u, v in graph.edges():
+#         model.addCons(variables[u] + variables[v] <= 1)
+#
+#     # Solve the model
+#     model.optimize()
+#
+#     # Extract the solution
+#     solution_nodes = []
+#     if model.getStatus() == "optimal":
+#         for node in nodes:
+#             # Check if the variable is close to 1 in the solution
+#             if model.getVal(variables[node]) > 0.99:
+#                 solution_nodes.append(node)
+#
+#     return solution_nodes
+
+
+def solve_mwis_networkx(graph: nx.Graph) -> list[int]:
+    """ The basic MWIS solver using networkx """
+
+    # TODO: move this to utils bc it is also used by the reconstructor
+
+    if graph.number_of_nodes() == 0:
+        return []
+
+    # The MWC of the complement is equivalent to MWIS of the original
+    complement_graph = nx.complement(graph)
+
+    # Copy weights to the complement graph
+    node_weights = nx.get_node_attributes(graph, 'weight')
+    nx.set_node_attributes(complement_graph, node_weights, name='weight')
+
+    winner_indices, _ = nx.algorithms.clique.max_weight_clique(complement_graph, weight='weight')
+    return winner_indices
 
 
 logger = logging.getLogger(__name__)
@@ -882,14 +941,12 @@ class SkeletonAssembler:
                     logger.debug(f"  - Conflict (Proximity): Skel {i} vs {j}. Jaccard: {proximal_intersection:.2f}")
                     conflict_graph.add_edge(i, j)
 
-            # Solve for best set:
             # The Maximum Weight Independent Set (MWIS) of the conflict graph is the set of
             # non-conflicting skeletons with the maximum total score. This is equivalent to
             # finding the max weight clique in the complement graph
 
-            complement_graph = nx.complement(conflict_graph)
-            nx.set_node_attributes(complement_graph, nx.get_node_attributes(conflict_graph, 'weight'), name='weight')
-            winner_indices, _ = nx.algorithms.clique.max_weight_clique(complement_graph, weight='weight')
+            winner_indices = solve_mwis_networkx(conflict_graph)
+            # winner_indices = solve_mwis_SCIP(conflict_graph)
 
         final_skeletons = [
             AssembledSkeleton(
@@ -912,6 +969,8 @@ class SkeletonAssembler:
             points_map:     Dict[PointNode, PointObservation]
     ) -> Optional[CandidateSkeleton]:
         """ Grows a single skeleton candidate from an anchor point using a holistic score """
+
+        # TODO: This method is slow af, needs to be sped up
 
         score_cache = {}
 
@@ -1264,7 +1323,6 @@ if __name__ == '__main__':
 
     folder = Path().home() / 'Desktop' / '3d_ant_data'
     prefix = '240905-1616'
-    session = 22
 
     stats_output_file = 'normalized_bone_stats.json'
     # prior_stats_file = Path().home() / 'Desktop' / 'bone_lengths.csv'
@@ -1297,6 +1355,7 @@ if __name__ == '__main__':
     reconstructed_data_map = {item['frame_idx']: item for item in all_reconstructed_points}
     all_frames = sorted(reconstructed_data_map.keys())
     min_frame, max_frame = all_frames[0], all_frames[-1]
+
     all_tracked_skeletons = []
 
     with alive_bar(title='Tracking Skeletons...', length=20, total=(max_frame - min_frame + 1), force_tty=True) as bar:
@@ -1328,8 +1387,9 @@ if __name__ == '__main__':
 
     print("Tracking complete.")
 
+
     # Save final results
-    
+
     output_file = 'final_tracked_skeletons.pkl'
     with open(output_file, 'wb') as f:
         pickle.dump(all_tracked_skeletons, f)
