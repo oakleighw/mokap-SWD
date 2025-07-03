@@ -184,7 +184,7 @@ def read_parameters(filepath, camera_name=None):
         return data
 
 
-def load_skeleton_SLEAP(slp_path, indices=False):
+def load_skeleton_SLEAP(slp_path, symmetry=False, indices=False):
     import sleap_io
 
     slp_path = Path(slp_path)
@@ -194,10 +194,15 @@ def load_skeleton_SLEAP(slp_path, indices=False):
     else:
         slp_content = sleap_io.load_file(slp_path)
 
-    if indices:
-        return slp_content.skeleton.node_names, slp_content.skeleton.edge_inds
+    keypoints = slp_content.skeleton.node_names
+    bones = slp_content.skeleton.edge_inds if indices else slp_content.skeleton.edge_names
+    symmetry_names = slp_content.skeleton.symmetry_names
+
+    # TODO: this is for backward-compatibility, but we prob want to always return symmetry
+    if symmetry:
+        return keypoints, bones, symmetry_names
     else:
-        return slp_content.skeleton.node_names, slp_content.skeleton.edge_names
+        return keypoints, bones
 
 
 def SLP_to_df(slp_content, camera_name=None, session=None):

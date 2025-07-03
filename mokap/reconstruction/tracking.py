@@ -1276,34 +1276,13 @@ if __name__ == '__main__':
 
     # Load data
     all_reconstructed_points = pickle.load(open(reconstructed_points_file, 'rb'))
-    _, bones = fileio.load_skeleton_SLEAP(skeleton_input_path, indices=False)
-
-    symmetry_groups = [
-
-        ('eye_L', 'eye_R'),
-
-        ('leg_f_L0', 'leg_f_R0'),
-        ('leg_f_L1', 'leg_f_R1'),
-        ('leg_f_L2', 'leg_f_R2'),
-
-        ('leg_m_L0', 'leg_m_R0'),
-        ('leg_m_L1', 'leg_m_R1'),
-        ('leg_m_L2', 'leg_m_R2'),
-
-        ('a_L0', 'a_R0'),
-        ('a_L1', 'a_R1'),
-        ('a_L2', 'a_R2'),
-
-        ('m_L0', 'm_R0'),
-        ('m_L1', 'm_R1'),
-
-    ]
+    keypoints, bones, symmetry = fileio.load_skeleton_SLEAP(skeleton_input_path, symmetry=True)
 
     # Get Anatomical stats
     bootstrapper = StatsBootstrapper(
         output_path=stats_output_file,
         bones_list=bones,
-        symmetry_map=symmetry_groups,
+        symmetry_map=symmetry,
         prior_stats_path=prior_stats_file,
         bootstrap_data=all_reconstructed_points
     )
