@@ -237,20 +237,28 @@ if __name__ == '__main__':
     videos_paths = list((folder / prefix / 'sources').glob(f'*session{session}.mp4'))
     images = get_frames(videos_paths, cameras_names, DEBUG_FRAME)
 
-    reconstructor_config = {'repro_thresh': 10.0, 'cluster_radius': 2.0}
+    reconstructor_config = {
+        'repro_thresh': 10.0,
+        'cluster_radius': 2.0,
+        'view_count_weight': 10.0,
+        'detection_confidence_weight': 5.0,
+        'repro_error_weight': 1.0
+    }
     reconstructor = Reconstructor(camera_parameters=cal_data, volume_bounds=volume_bounds, config=reconstructor_config)
     viz = ReconstructorVisualizer(reconstructor)
 
     df_frame = df.loc[pd.IndexSlice[:, :, DEBUG_FRAME], :]
     detections_by_keypoint = reconstructor._prepare_data(df_frame, [DEBUG_KEYPOINT])
     dets_per_cam = detections_by_keypoint[DEBUG_KEYPOINT]
+    points_per_cam = [d[0] for d in dets_per_cam]
+    confs_per_cam = [d[1] for d in dets_per_cam]
 
 
     # ==========================================================================
     #  LEVEL 1: RAYS CASTING VISUALIZATION IN 3D
     # ==========================================================================
     print("\n--- LEVEL 1: Visualizing 3D Rays ---")
-    viz.plot_cameras_rays(dets_per_cam)
+    viz.plot_cameras_rays(points_per_cam)
 
 
     # ==========================================================================
@@ -258,8 +266,8 @@ if __name__ == '__main__':
     # ==========================================================================
     print(f"\n--- LEVEL 2: Visualizing Epipolar Segments ---")
     viz.plot_epipolar_segments(
-        dets_i=dets_per_cam[DEBUG_CAM_I],
-        dets_j=dets_per_cam[DEBUG_CAM_J],
+        dets_i=dets_per_cam[DEBUG_CAM_I][0],
+        dets_j=dets_per_cam[DEBUG_CAM_J][0],
         img_j=images[cameras_names[DEBUG_CAM_J]],
         cam_idx_i=DEBUG_CAM_I,
         cam_idx_j=DEBUG_CAM_J
@@ -274,10 +282,12 @@ if __name__ == '__main__':
     # Get the raw, unfiltered hypotheses by calling the internal generation method
     @lru_cache(maxsize=None)
     def get_cost_mat(i, j):
-        return reconstructor._compute_cost_matrix(dets_per_cam[i], dets_per_cam[j], i, j)
+        return reconstructor._compute_cost_matrix(points_per_cam[i], points_per_cam[j], i, j)
 
 
-    raw_pts, raw_groups, _, raw_errors = reconstructor._generate_hypotheses(dets_per_cam, get_cost_mat)
+    raw_pts, raw_groups, raw_view_counts, raw_summed_confs, raw_errors = reconstructor._generate_hypotheses(
+        points_per_cam, confs_per_cam, get_cost_mat
+    )
     print(f"Found {raw_pts.shape[0]} initial point hypotheses.")
 
     if raw_pts.shape[0] > 0:
@@ -289,10 +299,10 @@ if __name__ == '__main__':
         detections_for_point = np.full((reconstructor.num_cams, 2), np.nan)
         used_indices = set(group_for_point)
         for cam_idx, det_idx in group_for_point:
-            detections_for_point[cam_idx] = dets_per_cam[cam_idx][det_idx]
+            detections_for_point[cam_idx] = points_per_cam[cam_idx][det_idx]
 
         other_detections = []
-        for c_idx, dets_in_cam in enumerate(dets_per_cam):
+        for c_idx, dets_in_cam in enumerate(points_per_cam):
             other_dets_in_cam = [d for d_idx, d in enumerate(dets_in_cam) if (c_idx, d_idx) not in used_indices]
             other_detections.append(np.array(other_dets_in_cam) if other_dets_in_cam else np.empty((0, 2)))
 
