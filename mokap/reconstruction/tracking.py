@@ -22,44 +22,44 @@ from mokap.utils.geometry.fitting import find_rigid_transform
 
 
 # TODO: Profile the two solvers a bit more
-#
-# from pyscipopt import Model
-# import cProfile
-# import pstats
-#
-# def solve_mwis_SCIP(graph: nx.Graph) -> list[int]:
-#     """ Solves the MWIS problem using the SCIP ILP solver """
-#
-#     model = Model("mwis")
-#     model.hideOutput()
-#
-#     # Create a binary variable for each node in the graph
-#     # The variable will be 1 if the node is in the solution, 0 otherwise
-#     nodes = list(graph.nodes())
-#     variables = {node: model.addVar(vtype="B", name=f"x_{node}") for node in nodes}
-#
-#     # Set the objective function: Maximize the sum of the weights of the selected nodes
-#     objective_terms = [graph.nodes[node]['weight'] * variables[node] for node in nodes]
-#     model.setObjective(sum(objective_terms), "maximize")
-#
-#     # Add constraints: For every edge (u, v) in the conflict graph, the two nodes
-#     # cannot be chosen together. This is the "independent set" constraint
-#     # x_u + x_v <= 1
-#     for u, v in graph.edges():
-#         model.addCons(variables[u] + variables[v] <= 1)
-#
-#     # Solve the model
-#     model.optimize()
-#
-#     # Extract the solution
-#     solution_nodes = []
-#     if model.getStatus() == "optimal":
-#         for node in nodes:
-#             # Check if the variable is close to 1 in the solution
-#             if model.getVal(variables[node]) > 0.99:
-#                 solution_nodes.append(node)
-#
-#     return solution_nodes
+
+from pyscipopt import Model
+import cProfile
+import pstats
+
+def solve_mwis_SCIP(graph: nx.Graph) -> list[int]:
+    """ Solves the MWIS problem using the SCIP ILP solver """
+
+    model = Model("mwis")
+    model.hideOutput()
+
+    # Create a binary variable for each node in the graph
+    # The variable will be 1 if the node is in the solution, 0 otherwise
+    nodes = list(graph.nodes())
+    variables = {node: model.addVar(vtype="B", name=f"x_{node}") for node in nodes}
+
+    # Set the objective function: Maximize the sum of the weights of the selected nodes
+    objective_terms = [graph.nodes[node]['weight'] * variables[node] for node in nodes]
+    model.setObjective(sum(objective_terms), "maximize")
+
+    # Add constraints: For every edge (u, v) in the conflict graph, the two nodes
+    # cannot be chosen together. This is the "independent set" constraint
+    # x_u + x_v <= 1
+    for u, v in graph.edges():
+        model.addCons(variables[u] + variables[v] <= 1)
+
+    # Solve the model
+    model.optimize()
+
+    # Extract the solution
+    solution_nodes = []
+    if model.getStatus() == "optimal":
+        for node in nodes:
+            # Check if the variable is close to 1 in the solution
+            if model.getVal(variables[node]) > 0.99:
+                solution_nodes.append(node)
+
+    return solution_nodes
 
 
 def solve_mwis_networkx(graph: nx.Graph) -> list[int]:
@@ -879,8 +879,10 @@ class SkeletonAssembler:
         if not skeleton_graph.nodes:
             raise ValueError("Cannot assemble skeletons from an empty bone list.")
 
+        self._skeleton_graph = skeleton_graph
+
         # Get keypoints degrees, and determine which is the central, which are anchors
-        degrees = dict(skeleton_graph.degree())
+        degrees = dict(self._skeleton_graph.degree())
 
         leaf_nodes = {node for node, degree in degrees.items() if degree == 1}
         all_kps = set(degrees.keys())
@@ -995,8 +997,8 @@ class SkeletonAssembler:
             # non-conflicting skeletons with the maximum total score. This is equivalent to
             # finding the max weight clique in the complement graph
 
-            winner_indices = solve_mwis_networkx(conflict_graph)
-            # winner_indices = solve_mwis_SCIP(conflict_graph)
+            # winner_indices = solve_mwis_networkx(conflict_graph)
+            winner_indices = solve_mwis_SCIP(conflict_graph)
 
         final_skeletons = [
             AssembledSkeleton(
@@ -1020,100 +1022,135 @@ class SkeletonAssembler:
     ) -> Optional[CandidateSkeleton]:
         """ Grows a single skeleton candidate from an anchor point using a holistic score """
 
-        # TODO: This method is slow af, needs to be sped up
+        # Build a KD-Tree for spatial lookups
+        all_nodes_list = list(points_map.keys())
+        all_positions = np.array([points_map[node].pos for node in all_nodes_list])
+        if all_positions.shape[0] == 0:
+            return None
+        kdtree = cKDTree(all_positions)
 
-        score_cache = {}
+        # Map keypoint names to the indices in all_nodes_list for quick lookup
+        kp_to_indices = defaultdict(list)
+        for i, node in enumerate(all_nodes_list):
+            kp_to_indices[node[0]].append(i)
 
-        def _holistic_score(nodes_to_score: FrozenSet[PointNode]) -> float:
-
-            if nodes_to_score in score_cache:
-                return score_cache[nodes_to_score]
-
-            if len(nodes_to_score) < 2:
-                return 0.0
-
-            kps_dict = {node[0]: points_map[node].pos for node in nodes_to_score}
-            scale = self._get_skeleton_scale(kps_dict)
-
-            if not (CONFIG["ASSEMBLER_MIN_SANE_SCALE"] < scale < CONFIG["ASSEMBLER_MAX_SANE_SCALE"]):
-                return -1000  # penalize skeletons with insane scales early
-
-            total_score = 0.0
-            num_bones = 0
-            for kp1_name, kp2_name in combinations(kps_dict.keys(), 2):
-                bone = frozenset((kp1_name, kp2_name))
-                if bone in self.bones_list:
-                    score = self._score_bone(bone, kps_dict, points_map, nodes_to_score, scale)
-                    total_score += score
-                    num_bones += 1
-
-            score = total_score / (num_bones + 1e-6)
-            score_cache[nodes_to_score] = score
-            return score
+        # generous radius based on the reference anatomy
+        # TODO: use a value derived from the anatomy learner
+        max_bone_len = self.median_ref_len * CONFIG["BOOTSTRAP_MAX_BONE_LEN"]
 
         current_nodes = {anchor_node}
+        current_kps = {anchor_node[0]: points_map[anchor_node].pos}
+
+        # Initialize score tracking
+        total_bone_score = 0.0
+        num_bones = 0
 
         while True:
-            # The score for comparison must include the size bonus just like the final score
-            current_avg_score = _holistic_score(frozenset(current_nodes))
-            current_growth_score = current_avg_score * len(current_nodes)
+            current_kp_names = {node[0] for node in current_nodes}
 
-            current_kp_types = {node[0] for node in current_nodes}
-            logger.debug(
-                f"  [Loop] Nodes: {len(current_nodes)} {current_kp_types}, "
-                f"AvgScore: {current_avg_score:.3f}, "
-                f"GrowthScore: {current_growth_score:.3f}"
-            )
+            # Find candidates using topology and spatial proximity
+            nodes_to_evaluate = set()
+            for node_in_skel in current_nodes:
+                # Find neighboring keypoint types from the skeleton graph
+                neighbor_kp_types = {
+                    n for n in self._skeleton_graph.neighbors(node_in_skel[0]) if n not in current_kp_names
+                }
 
-            # Find all valid keypoints that could connect to the current skeleton
-            nodes_to_evaluate = {
-                cand_node for node in current_nodes
-                for cand_node in points_map
-                if cand_node not in current_nodes and cand_node[0] not in current_kp_types
-                   and frozenset((node[0], cand_node[0])) in self.bones_list
-            }
+                if not neighbor_kp_types:
+                    continue
+
+                # Query the KD-Tree for nearby points
+                center_pos = points_map[node_in_skel].pos
+                nearby_indices = kdtree.query_ball_point(center_pos, r=max_bone_len)
+
+                # Filter these nearby points to be of the correct type and not already in the skeleton
+                for idx in nearby_indices:
+                    cand_node = all_nodes_list[idx]
+                    if cand_node[0] in neighbor_kp_types:
+                        nodes_to_evaluate.add(cand_node)
+
             if not nodes_to_evaluate:
                 break
 
-            # Score each potential extension
-            potential_extensions = [
-                (node, _holistic_score(frozenset(current_nodes | {node})) * (len(current_nodes) + 1))
-                for node in nodes_to_evaluate
-            ]
-            if not potential_extensions:
-                logger.debug("  [Break] No more potential extensions.")
-                break
+            best_extension = None
+            best_new_growth_score = -float('inf')
 
-            # Find the extension that results in the best new holistic score
-            best_node, best_new_score = max(potential_extensions, key=lambda x: x[1])
+            # Evaluate each potential extension incrementally
+            for cand_node in nodes_to_evaluate:
+                # Estimate new scale if we were to add this node
+                temp_kps = current_kps.copy()
+                temp_kps[cand_node[0]] = points_map[cand_node].pos
+                new_scale = self._get_skeleton_scale(temp_kps)
 
-            # If the best new score is better or not much worse than the current score, grow
-            if best_new_score > (current_growth_score - CONFIG["ASSEMBLER_SCORE_DEBT_TOLERANCE"]):
-                logger.debug(
-                    f"  [OK] Adding {best_node[0]}. "
-                    f"New score {best_new_score:.2f} is within tolerance of current {current_growth_score:.2f}."
-                )
+                if not (CONFIG["ASSEMBLER_MIN_SANE_SCALE"] < new_scale < CONFIG["ASSEMBLER_MAX_SANE_SCALE"]):
+                    continue
+
+                # Calculate the score contribution of the new bones
+                new_bone_score_sum = 0
+                new_bone_count = 0
+                for existing_node in current_nodes:
+
+                    bone = frozenset((cand_node[0], existing_node[0]))
+
+                    if bone in self.bones_list:
+                        # Create a temporary map of nodes and keypoints for scoring
+                        temp_nodes = frozenset(current_nodes | {cand_node})
+                        score = self._score_bone(bone, temp_kps, points_map, temp_nodes, new_scale)
+
+                        if score < -500:  # abort if any new bone is impossible
+                            new_bone_score_sum = -float('inf')
+                            break
+
+                        new_bone_score_sum += score
+                        new_bone_count += 1
+
+                if new_bone_count == 0 or new_bone_score_sum == -float('inf'):
+                    continue
+
+                # New holistic score if this node is added
+                new_total_score = total_bone_score + new_bone_score_sum
+                new_total_bones = num_bones + new_bone_count
+                new_avg_score = new_total_score / new_total_bones
+
+                # The growth score must include the size bonus
+                new_growth_score = new_avg_score * (len(current_nodes) + 1)
+
+                if new_growth_score > best_new_growth_score:
+                    best_new_growth_score = new_growth_score
+                    best_extension = {
+                        "node": cand_node,
+                        "score_contribution": new_bone_score_sum,
+                        "bone_count_increase": new_bone_count
+                    }
+
+            current_avg_score = (total_bone_score / num_bones) if num_bones > 0 else 0
+            current_growth_score = current_avg_score * len(current_nodes)
+
+            # If the best new score is better or not much worse, grow
+            if best_extension and best_new_growth_score > (current_growth_score - CONFIG["ASSEMBLER_SCORE_DEBT_TOLERANCE"]):
+                best_node = best_extension["node"]
+
                 current_nodes.add(best_node)
+                current_kps[best_node[0]] = points_map[best_node].pos
+
+                total_bone_score += best_extension["score_contribution"]
+                num_bones += best_extension["bone_count_increase"]
+
             else:
-                logger.debug(
-                    f"  [Break] Best new score ({best_new_score:.3f}) is a drop of "
-                    f"more than {CONFIG['ASSEMBLER_SCORE_DEBT_TOLERANCE']}. Stopping growth."
-                )
-                break
+                break  # stop growth
 
         if len(current_nodes) < CONFIG["ASSEMBLER_MIN_KPS_FOR_SKELETON"]:
             return None
 
-        final_kps = {node[0]: points_map[node].pos for node in current_nodes}
-        final_score = _holistic_score(frozenset(current_nodes))
-        if final_score <= 0:
+        final_avg_score = (total_bone_score / num_bones) if num_bones > 0 else 0.0
+        if final_avg_score <= 0:
             return None
 
         return CandidateSkeleton(
             nodes=frozenset(current_nodes),
-            score=final_score * len(current_nodes),
-            original_score=final_score * len(current_nodes),
-            scale=self._get_skeleton_scale(final_kps)
+            score=final_avg_score * len(current_nodes),
+            original_score=final_avg_score * len(current_nodes),
+            scale=self._get_skeleton_scale(current_kps)
         )
 
     def _get_skeleton_scale(self, keypoints: Dict[str, np.ndarray]) -> float:
