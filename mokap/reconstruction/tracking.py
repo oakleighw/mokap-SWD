@@ -102,7 +102,7 @@ class AssembledSkeleton:
     score: float
     scale: float
     point_indices: Dict[str, int] = field(default_factory=dict)
-    track_id: int = -1
+    tracklet_id: int = -1
 
     def to_dict(self) -> dict:
         return {
@@ -110,7 +110,7 @@ class AssembledSkeleton:
             'score': self.score,
             'scale': self.scale,
             'point_indices': self.point_indices,
-            'track_id': self.track_id
+            'tracklet_id': self.tracklet_id
         }
 
 @dataclass
@@ -152,14 +152,14 @@ CONFIG = {
     "CONFLICT_SOLVER_JACCARD_THRESHOLD": 0.85,  # Jaccard proximity threshold to consider two skeletons 'clones'
 
     # --- Tracker parameters ---
-    "TRACKER_MAX_AGE": 15,                    # How many frames a track can coast without an update before being deleted
+    "TRACKER_MAX_AGE": 15,                    # How many frames a tracklet can coast without an update before being deleted
     "TRACKER_UNCERTAINTY_THRESHOLD": 100,     # This is for variance of the position, so 100 is equivalent to a std dev of 10 units
     "TRACKER_MIN_KPS_FOR_INFERENCE": 3,       # Min shared KPs needed to infer a missing central keypoint via alignment
-    "TRACKER_SCALE_LEARNING_RATE": 0.25,      # Learning rate for the track's adapting scale estimate
-    "TRACKER_ASSOCIATION_RADIUS": 1.0,        # Max distance between a track's prediction and a candidate for association
-    "TRACKER_ASSOCIATION_MIN_KPS": 3,         # Min shared keypoints to associate a track with a candidate
-    "TRACKER_CONTINUITY_BONUS": 500.0,        # Large bonus to a candidate's score if it matches an existing track
-    "TRACKER_ANATOMICAL_SCORE_ALPHA": 0.15,   # Smoothing factor for the track's score. 0 = no update, 1 = new value only
+    "TRACKER_SCALE_LEARNING_RATE": 0.25,      # Learning rate for the tracklet's adapting scale estimate
+    "TRACKER_ASSOCIATION_RADIUS": 1.0,        # Max distance between a tracklet's prediction and a candidate for association
+    "TRACKER_ASSOCIATION_MIN_KPS": 3,         # Min shared keypoints to associate a tracklet with a candidate
+    "TRACKER_CONTINUITY_BONUS": 500.0,        # Large bonus to a candidate's score if it matches an existing tracklet
+    "TRACKER_ANATOMICAL_SCORE_ALPHA": 0.15,   # Smoothing factor for the tracklet's score. 0 = no update, 1 = new value only
     "TRACKER_INFERRED_HEALTH_PENALTY": 0.05,  # Health reduction for an update based on an inferred point
     "TRACKER_HEALTH_DECAY_RATE": 0.98,        # Multiplicative decay of health per frame without an update
     
@@ -638,9 +638,9 @@ class AnatomyLearner:
         return self.current_stats
 
 
-class Track:
+class Tracklet:
     """
-    Represents a single tracked object (a skeleton)
+    Represents a single object (a skeleton) in a tracklet
     Manages state estimation (position, velocity, scale) using a Kalman Filter
 
     It can predict its future state and be updated with new measurements
@@ -648,17 +648,17 @@ class Track:
     """
 
     def __init__(self,
-            track_id:           int,
-            initial_skeleton:   AssembledSkeleton,
-            frame_idx:          int,
-            central_kp:         str):
+             tracklet_id:           int,
+             initial_skeleton:   AssembledSkeleton,
+             frame_idx:          int,
+             central_kp:         str):
 
-        self.id = track_id
+        self.id = tracklet_id
         self.age = 0
         self.time_since_update = 0
         self.last_update_frame = frame_idx
 
-        # Track health and score metrics
+        # Tracklet health and score metrics
         self.health = 1.0  # Running confidence metric (1.0 = high confidence)
         self.anatomical_integrity = initial_skeleton.score  # Exponential Moving Average of the skeleton score
 
@@ -712,7 +712,7 @@ class Track:
         self.kf.x[6] = self.skeleton.scale
 
     def predict(self, current_frame_idx: int):
-        """ Predicts the state of the track for the current frame """
+        """ Predicts the state of the tracklet for the current frame """
 
         # The number of prediction steps is how many frames we've coasted
         steps_to_predict = current_frame_idx - self.last_update_frame
@@ -726,7 +726,7 @@ class Track:
 
     def update(self, skeleton: AssembledSkeleton, frame_idx: int):
         """
-        Updates the track's state with a new skeleton measurement
+        Updates the tracklet's state with a new skeleton measurement
 
         If the central keypoint is missing, it attempts to infer its position using
         rigid alignment (Kabsch algorithm) before updating the Kalman Filter
@@ -744,7 +744,7 @@ class Track:
                 inferred = True
             else:
                 # if inference fails (too few points) we can't update the KF
-                # We still update the track's skeleton to the partial view, reset its age,
+                # We still update the tracklet's skeleton to the partial view, reset its age,
                 # but do *not* update health or score_ema, as it was not a full KF update
                 self.skeleton = skeleton
                 self.score = skeleton.score
@@ -775,7 +775,7 @@ class Track:
         # Update the smoothed score (EMA)
         self.anatomical_integrity = self.score_ema_alpha * skeleton.score + (1 - self.score_ema_alpha) * self.anatomical_integrity
 
-        # Update the track's health
+        # Update the tracklet's health
         if inferred:
             # The update was based on an inferred point, so it's a bit less certain...
             # so restore health, but with a lil penalty
@@ -1200,35 +1200,35 @@ class MultiObjectTracker:
 
         self.assembler = assembler
         self.frame_idx = -1
-        self.tracks: List[Track] = []
-        self.next_track_id = 0
+        self.tracklets: List[Tracklet] = []
+        self.next_tracklet_id = 0
         self.max_age = CONFIG['TRACKER_MAX_AGE']
 
     def update(self,
             reconstructed_data: dict,
             frame_idx:          int
-    ) -> List[Track]:
+    ) -> List[Tracklet]:
         """
         Processes a single frame using a 'Guided global assembly' workflow
 
-        By boosting scores of candidates that align with existing tracks, we guide the conflict
+        By boosting scores of candidates that align with existing tracklets, we guide the conflict
         resolution (MWIS) to favor solutions with high temporal continuity
         """
 
         self.frame_idx = frame_idx
 
         # Predict
-        for track in self.tracks:
-            track.predict(self.frame_idx)
+        for tracklet in self.tracklets:
+            tracklet.predict(self.frame_idx)
 
         # Generate all candidates
         candidates, points_map = self.assembler.generate_candidates(reconstructed_data)
         if not candidates:
-            self.prune_tracks()
-            return self.get_active_tracks()
+            self.prune_tracklets()
+            return self.get_active_tracklets()
 
         # Boost scores to guide assembly
-        # Bonus for candidates that align well with existing track predictions to bias the conflict resolution
+        # Bonus for candidates that align well with existing tracklet predictions to bias the conflict resolution
         # (in favor of temporal continuity)
         bonuses = self._calculate_association_bonuses(candidates, points_map)
 
@@ -1242,55 +1242,55 @@ class MultiObjectTracker:
         winning_skeletons = self.assembler.solve_conflicts(candidates, points_map)
 
         # Final association and update
-        if self.tracks and winning_skeletons:
+        if self.tracklets and winning_skeletons:
 
             # here we use the original (non-boosted) scores to ensure matching on pure geometry and anatomy
-            cost_matrix = self._build_final_assignment_cost_matrix(self.tracks, winning_skeletons)
-            track_inds, winner_inds = linear_sum_assignment(cost_matrix)
+            cost_matrix = self._build_final_assignment_cost_matrix(self.tracklets, winning_skeletons)
+            tracklet_inds, winner_inds = linear_sum_assignment(cost_matrix)
 
             matched_winner_indices = set()
-            for t_idx, w_idx in zip(track_inds, winner_inds):
+            for t_idx, w_idx in zip(tracklet_inds, winner_inds):
 
                 # association is only made if the cost not infinite
                 if cost_matrix[t_idx, w_idx] < 1e9:
-                    self.tracks[t_idx].update(skeleton=winning_skeletons[w_idx], frame_idx=self.frame_idx)
+                    self.tracklets[t_idx].update(skeleton=winning_skeletons[w_idx], frame_idx=self.frame_idx)
                     matched_winner_indices.add(w_idx)
         else:
             matched_winner_indices = set()
 
-        # Any winning skeleton that was not matched to an existing track is a new object
+        # Any winning skeleton that was not matched to an existing tracklet is a new object
         for i, skel in enumerate(winning_skeletons):
             if i not in matched_winner_indices and self.assembler.central_kp in skel.keypoints:
-                new_track = Track(self.next_track_id, skel, self.frame_idx, self.assembler.central_kp)
-                self.tracks.append(new_track)
-                self.next_track_id += 1
+                new_tracklet = Tracklet(self.next_tracklet_id, skel, self.frame_idx, self.assembler.central_kp)
+                self.tracklets.append(new_tracklet)
+                self.next_tracklet_id += 1
 
-        # Remove tracks that weren't updated in this frame and are too old
-        self.prune_tracks()
+        # Remove tracklets that weren't updated in this frame and are too old
+        self.prune_tracklets()
 
-        return self.get_active_tracks()
+        return self.get_active_tracklets()
 
-    def predict_only(self, frame_idx: int) -> List[Track]:
+    def predict_only(self, frame_idx: int) -> List[Tracklet]:
         """ Handles frames with no detections by only running the prediction step """
 
         self.frame_idx = frame_idx
 
-        for track in self.tracks:
-            track.predict(self.frame_idx)
+        for tracklet in self.tracklets:
+            tracklet.predict(self.frame_idx)
 
-        self.prune_tracks()
+        self.prune_tracklets()
 
-        return self.get_active_tracks()
+        return self.get_active_tracklets()
 
-    def get_active_tracks(self) -> List[Track]:
-        """ Returns a list of tracks that have been updated in the current frame """
-        return [t for t in self.tracks if t.time_since_update == 0]
+    def get_active_tracklets(self) -> List[Tracklet]:
+        """ Returns a list of tracklets that have been updated in the current frame """
+        return [t for t in self.tracklets if t.time_since_update == 0]
 
-    def prune_tracks(self):
-        """ Removes tracks that have been lost for too long or that are very uncertain """
+    def prune_tracklets(self):
+        """ Removes tracklets that have been lost for too long or that are very uncertain """
 
-        self.tracks = [
-            t for t in self.tracks
+        self.tracklets = [
+            t for t in self.tracklets
             if t.time_since_update <= self.max_age and not np.sum(t.uncertainty['position']) > CONFIG['TRACKER_UNCERTAINTY_THRESHOLD']
         ]
 
@@ -1300,10 +1300,10 @@ class MultiObjectTracker:
     ) -> np.ndarray:
         """
         Calculates a score bonus (0 to 1) for each candidate skeleton based on its
-        best possible alignment with any existing track's prediction
+        best possible alignment with any existing tracklet's prediction
         """
 
-        if not self.tracks or not candidates:
+        if not self.tracklets or not candidates:
             return np.zeros(len(candidates))
 
         bonuses = np.zeros(len(candidates))
@@ -1316,8 +1316,8 @@ class MultiObjectTracker:
                 continue
 
             max_bonus = 0.0
-            for track in self.tracks:
-                pred_pose = track.predicted_pose
+            for tracklet in self.tracklets:
+                pred_pose = tracklet.predicted_pose
 
                 if not pred_pose:
                     continue
@@ -1339,15 +1339,15 @@ class MultiObjectTracker:
         return bonuses
 
     def _build_final_assignment_cost_matrix(self,
-            tracks:     List[Track],
-            skeletons:  List[AssembledSkeleton]
-    ) -> np.ndarray:
+                                            tracklets:  List[Tracklet],
+                                            skeletons:  List[AssembledSkeleton]
+                                            ) -> np.ndarray:
         """ Builds the cost matrix for the final assignment via Hungarian algorithm """
 
-        cost_matrix = np.full((len(tracks), len(skeletons)), 1e9)
+        cost_matrix = np.full((len(tracklets), len(skeletons)), 1e9)
 
-        for i, track in enumerate(tracks):
-            pred_pose = track.predicted_pose
+        for i, tracklet in enumerate(tracklets):
+            pred_pose = tracklet.predicted_pose
 
             if not pred_pose:
                 continue
@@ -1410,7 +1410,7 @@ if __name__ == '__main__':
     all_frames = sorted(reconstructed_data_map.keys())
     min_frame, max_frame = all_frames[0], all_frames[-1]
 
-    all_tracked_skeletons = []
+    all_tracklets = []
 
     with alive_bar(title='Tracking Skeletons...', length=20, total=(max_frame - min_frame + 1), force_tty=True) as bar:
         for frame_idx in range(min_frame, max_frame + 1):
@@ -1421,21 +1421,32 @@ if __name__ == '__main__':
 
             # Run the tracker for the frame
             if frame_idx in reconstructed_data_map:
-                active_tracks = tracker.update(reconstructed_data_map[frame_idx], frame_idx)
+                active_tracklets = tracker.update(reconstructed_data_map[frame_idx], frame_idx)
             else:
-                active_tracks = tracker.predict_only(frame_idx)
+                active_tracklets = tracker.predict_only(frame_idx)
 
             # Feed the results back into the learner
-            for track in active_tracks:
+            for tracklet in active_tracklets:
                 # We only use skeletons from the current frame for learning
-                if track.last_update_frame == frame_idx:
-                    anatomy_learner.add_sample(track.skeleton)
+                if tracklet.last_update_frame == frame_idx:
+                    anatomy_learner.add_sample(tracklet.skeleton)
 
             # Convert dataclasses back to dicts for serialization
-            frame_skeletons = [track.skeleton.to_dict() for track in active_tracks]
-            for skel, track in zip(frame_skeletons, active_tracks):
-                skel['track_id'] = track.id
-            all_tracked_skeletons.append({"frame_idx": frame_idx, "skeletons": frame_skeletons})
+            frame_skeletons = []
+            for tracklet in active_tracklets:
+                skel_dict = tracklet.skeleton.to_dict()  # Add the skeleton
+
+                # Add the rich tracklet-level context
+                skel_dict['track_id'] = tracklet.id
+                skel_dict['track_health'] = tracklet.health
+                skel_dict['track_anatomical_integrity'] = tracklet.anatomical_integrity
+                skel_dict['track_uncertainty_pos'] = tracklet.uncertainty['position'].tolist()
+                skel_dict['track_predicted_pos'] = tracklet.predicted_position.tolist()
+                skel_dict['time_since_update'] = tracklet.time_since_update
+
+                frame_skeletons.append(skel_dict)
+
+            all_tracklets.append({"frame_idx": frame_idx, "skeletons": frame_skeletons})
 
             bar()
 
@@ -1444,8 +1455,8 @@ if __name__ == '__main__':
 
     # Save final results
 
-    output_file = 'final_tracked_skeletons.pkl'
+    output_file = 'final_tracklets.pkl'
     with open(output_file, 'wb') as f:
-        pickle.dump(all_tracked_skeletons, f)
+        pickle.dump(all_tracklets, f)
 
     print(f"Results saved to '{output_file}'")
