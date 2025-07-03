@@ -118,7 +118,7 @@ skeleton_input_path = folder / prefix / 'inputs' / 'tracking'
 _, bones = fileio.load_skeleton_SLEAP(skeleton_input_path, indices=False)
 volume_bounds = {'x': (-10.5, 13.0), 'y': (-21.0, 11.0), 'z': (180.0, 201.0)}
 
-with open('final_tracked_skeletons.pkl', 'rb') as f:
+with open('final_tracklets.pkl', 'rb') as f:
     all_tracked_skeletons = pickle.load(f)
 
 run_viewer(all_tracked_skeletons, bones, volume_bounds)
