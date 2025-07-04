@@ -3,8 +3,9 @@ import pickle
 import re
 import logging
 from dataclasses import dataclass, field
-from typing import Tuple, Union, Optional,  Dict, List, FrozenSet
+from typing import Tuple, Union, Optional, Dict, List, FrozenSet
 from collections import defaultdict
+from itertools import combinations
 from pathlib import Path
 import pandas as pd
 import networkx as nx
@@ -20,45 +21,45 @@ from mokap.utils import fileio
 from mokap.utils.geometry.fitting import find_rigid_transform
 
 
-# TODO: Profile the two solvers a bit more
-
-from pyscipopt import Model
-import cProfile
-import pstats
-
-def solve_mwis_SCIP(graph: nx.Graph) -> list[int]:
-    """ Solves the MWIS problem using the SCIP ILP solver """
-
-    model = Model("mwis")
-    model.hideOutput()
-
-    # Create a binary variable for each node in the graph
-    # The variable will be 1 if the node is in the solution, 0 otherwise
-    nodes = list(graph.nodes())
-    variables = {node: model.addVar(vtype="B", name=f"x_{node}") for node in nodes}
-
-    # Set the objective function: Maximize the sum of the weights of the selected nodes
-    objective_terms = [graph.nodes[node]['weight'] * variables[node] for node in nodes]
-    model.setObjective(sum(objective_terms), "maximize")
-
-    # Add constraints: For every edge (u, v) in the conflict graph, the two nodes
-    # cannot be chosen together. This is the "independent set" constraint
-    # x_u + x_v <= 1
-    for u, v in graph.edges():
-        model.addCons(variables[u] + variables[v] <= 1)
-
-    # Solve the model
-    model.optimize()
-
-    # Extract the solution
-    solution_nodes = []
-    if model.getStatus() == "optimal":
-        for node in nodes:
-            # Check if the variable is close to 1 in the solution
-            if model.getVal(variables[node]) > 0.99:
-                solution_nodes.append(node)
-
-    return solution_nodes
+# TODO: Profile the two MWIS solvers a bit more
+#
+# from pyscipopt import Model
+# import cProfile
+# import pstats
+#
+# def solve_mwis_SCIP(graph: nx.Graph) -> list[int]:
+#     """ Solves the MWIS problem using the SCIP ILP solver """
+#
+#     model = Model("mwis")
+#     model.hideOutput()
+#
+#     # Create a binary variable for each node in the graph
+#     # The variable will be 1 if the node is in the solution, 0 otherwise
+#     nodes = list(graph.nodes())
+#     variables = {node: model.addVar(vtype="B", name=f"x_{node}") for node in nodes}
+#
+#     # Set the objective function: Maximize the sum of the weights of the selected nodes
+#     objective_terms = [graph.nodes[node]['weight'] * variables[node] for node in nodes]
+#     model.setObjective(sum(objective_terms), "maximize")
+#
+#     # Add constraints: For every edge (u, v) in the conflict graph, the two nodes
+#     # cannot be chosen together. This is the "independent set" constraint
+#     # x_u + x_v <= 1
+#     for u, v in graph.edges():
+#         model.addCons(variables[u] + variables[v] <= 1)
+#
+#     # Solve the model
+#     model.optimize()
+#
+#     # Extract the solution
+#     solution_nodes = []
+#     if model.getStatus() == "optimal":
+#         for node in nodes:
+#             # Check if the variable is close to 1 in the solution
+#             if model.getVal(variables[node]) > 0.99:
+#                 solution_nodes.append(node)
+#
+#     return solution_nodes
 
 
 def solve_mwis_networkx(graph: nx.Graph) -> list[int]:
@@ -82,7 +83,6 @@ def solve_mwis_networkx(graph: nx.Graph) -> list[int]:
 
 logger = logging.getLogger(__name__)
 
-
 # Type aliases for clarity and type safety
 Bone = FrozenSet[str]
 PointNode = Tuple[str, int]
@@ -93,6 +93,7 @@ class PointObservation:
     """ Represents a single 3D point observation with its confidence """
     pos: np.ndarray
     conf: float = 1.0
+
 
 @dataclass
 class AssembledSkeleton:
@@ -112,15 +113,15 @@ class AssembledSkeleton:
             'tracklet_id': self.tracklet_id
         }
 
+
 @dataclass
 class CandidateSkeleton:
     """ Assembler's internal representation for a potential skeleton during the assembly process """
     nodes: FrozenSet[PointNode]  # a frozenset of (kp_name, point_index) tuples
     scale: float
-    anatomical_score: float
     competition_score: float
-
-
+    anatomical_score: float
+    constituent_indices: Optional[FrozenSet[int]] = None  # to track original fragments
 
 
 CONFIG = {
@@ -128,74 +129,68 @@ CONFIG = {
     # TODO: okay this dict is getting ridiculously big lol
 
     # --- Stats Bootstrapper parameters ---
-    "BOOTSTRAP_GENERIC_MAD_RATIO": 0.10,    # Generic MAD ratio to apply when bootstrapping from a simple prior or if data-driven MAD is zero
-    "BOOTSTRAP_MIN_SAMPLES": 20,            # Min samples needed to calculate data-driven stats for a bone
-    "BOOTSTRAP_MAX_BONE_LEN": 4.0,          # Max bone length for the simple greedy assembler used in bootstrapping
+    "BOOTSTRAP_GENERIC_MAD_RATIO": 0.10,
+    # Generic MAD ratio to apply when bootstrapping from a simple prior or if data-driven MAD is zero
+    "BOOTSTRAP_MIN_SAMPLES": 20,  # Min samples needed to calculate data-driven stats for a bone
+    "BOOTSTRAP_MAX_BONE_LEN": 4.0,  # Max bone length for the simple greedy assembler used in bootstrapping
 
     # --- Anatomy Learner parameters ---
-    "LEARNER_MIN_SAMPLES_FOR_UPDATE": 30,   # How many new high-quality skeleton measurements before re-calculating anatomy stats
+    "LEARNER_MIN_SAMPLES_FOR_UPDATE": 30,
+    # How many new high-quality skeleton measurements before re-calculating anatomy stats
     "LEARNER_MIN_SCORE_FOR_LEARNING": 5.0,  # Minimum score of a tracked skeleton to be used for learning
-    "LEARNER_MIN_REF_BONE_LEN": 1.0,        # Min plausible length of reference bone for learning
-    "LEARNER_MAX_REF_BONE_LEN": 15.0,       # Max plausible length of reference bone for learning
+    "LEARNER_MIN_REF_BONE_LEN": 1.0,  # Min plausible length of reference bone for learning
+    "LEARNER_MAX_REF_BONE_LEN": 15.0,  # Max plausible length of reference bone for learning
 
     # --- Assembler parameters ---
-    "ASSEMBLER_MIN_KPS_FOR_SKELETON": 3,        # Min keypoints to be considered a valid skeleton fragment
-    "ASSEMBLER_BONE_SCORE_MAD_THRESH": 5.0,     # How far a bone's length can deviate from expected (in MADs) before its score is zero
-    "ASSEMBLER_BONE_SCORE_MAD_EPSILON": 0.05,   # Small constant added to MAD for numerical stability
-    "ASSEMBLER_MIN_SANE_SCALE": 0.7,            # Min plausible scale estimate for a skeleton fragment
-    "ASSEMBLER_MAX_SANE_SCALE": 1.5,            # Max plausible scale estimate for a skeleton fragment
-    "ASSEMBLER_SCORE_DEBT_TOLERANCE": 10.0,     # How much of a score hit is it possible to take to add one more part
+    "ASSEMBLER_MIN_KPS_FOR_SKELETON": 3,  # Min keypoints to be considered a valid skeleton fragment
+    "ASSEMBLER_MIN_CENTRAL_ANCHORS": 2,  # Min keypoints to be considered anchors for seeding new skeletons
+    "ASSEMBLER_BONE_SCORE_MAD_THRESH": 5.0,
+    # How far a bone's length can deviate from expected (in MADs) before its score is zero
+    "ASSEMBLER_BONE_SCORE_MAD_EPSILON": 0.05,  # Small constant added to MAD for numerical stability
+    "ASSEMBLER_MIN_SANE_SCALE": 0.7,  # Min plausible scale estimate for a skeleton fragment
+    "ASSEMBLER_MAX_SANE_SCALE": 1.5,  # Max plausible scale estimate for a skeleton fragment
+    "ASSEMBLER_SCORE_DEBT_TOLERANCE": 10.0,  # How much of a score hit is it possible to take to add one more part
+
+    "ASSEMBLER_MERGE_SCALE_TOLERANCE": 0.075,
+    "ASSEMBLER_MERGE_LINKING_BONE_THRESHOLD": 90.0,
+    "ASSEMBLER_MIN_BONE_SCORE_FOR_FRAGMENT": 70.0,
+    "ASSEMBLER_HIGH_QUALITY_THRESHOLD": 90.0,
+    "ASSEMBLER_QUALITY_BONUS_FACTOR": 1.5,  # 50% boost
 
     # --- Conflict solver parameters ---
-    "CONFLICT_SOLVER_BROAD_RADIUS": 3.0,        # Skeletons with centroids further than this are assumed not to conflict
-    "CONFLICT_SOLVER_PROXIMITY_RADIUS": 0.25,   # Max distance to consider two corresponding keypoints 'the same'
+    "CONFLICT_SOLVER_BROAD_RADIUS": 3.0,  # Skeletons with centroids further than this are assumed not to conflict
+    "CONFLICT_SOLVER_SHARED_POINTS_TOLERANCE": 1,  # Max number of shared points before declaring a conflict
+    "CONFLICT_SOLVER_PROXIMITY_RADIUS": 0.25,  # Max distance to consider two corresponding keypoints 'the same'
     "CONFLICT_SOLVER_JACCARD_THRESHOLD": 0.85,  # Jaccard proximity threshold to consider two skeletons 'clones'
 
     # --- Tracker parameters ---
-    "TRACKER_MAX_AGE": 15,                    # How many frames a tracklet can coast without an update before being deleted
-    "TRACKER_UNCERTAINTY_THRESHOLD": 100,     # This is for variance of the position, so 100 is equivalent to a std dev of 10 units
-    "TRACKER_MIN_KPS_FOR_INFERENCE": 3,       # Min shared KPs needed to infer a missing central keypoint via alignment
-    "TRACKER_SCALE_LEARNING_RATE": 0.25,      # Learning rate for the tracklet's adapting scale estimate
-    "TRACKER_ASSOCIATION_RADIUS": 1.0,        # Max distance between a tracklet's prediction and a candidate for association
-    "TRACKER_ASSOCIATION_MIN_KPS": 3,         # Min shared keypoints to associate a tracklet with a candidate
-    "TRACKER_CONTINUITY_BONUS": 500.0,        # Large bonus to a candidate's score if it matches an existing tracklet
-    "TRACKER_ANATOMICAL_SCORE_ALPHA": 0.15,   # Smoothing factor for the tracklet's score. 0 = no update, 1 = new value only
+    "TRACKER_MAX_TRACKELT_AGE": 15,  # How many frames a tracklet can coast without an update before being deleted
+    "TRACKER_UNCERTAINTY_THRESHOLD": 100,
+    # This is for variance of the position, so 100 is equivalent to a std dev of 10 units
+    "TRACKER_MIN_KPS_FOR_INFERENCE": 3,  # Min shared KPs needed to infer a missing central keypoint via alignment
+    "TRACKER_SCALE_LEARNING_RATE": 0.25,  # Learning rate for the tracklet's adapting scale estimate
+    "TRACKER_ASSOCIATION_RADIUS": 1.0,  # Max distance between a tracklet's prediction and a candidate for association
+    "TRACKER_ASSOCIATION_MIN_KPS": 3,  # Min shared keypoints to associate a tracklet with a candidate
+    "TRACKER_CONTINUITY_BONUS": 500.0,  # Large bonus to a candidate's score if it matches an existing tracklet
+    "TRACKER_ANATOMICAL_SCORE_ALPHA": 0.15,
+    # Smoothing factor for the tracklet's score. 0 = no update, 1 = new value only
     "TRACKER_INFERRED_HEALTH_PENALTY": 0.05,  # Health reduction for an update based on an inferred point
-    "TRACKER_HEALTH_DECAY_RATE": 0.98,        # Multiplicative decay of health per frame without an update
-    
+    "TRACKER_HEALTH_DECAY_RATE": 0.98,  # Multiplicative decay of health per frame without an update
+
     # --- Cost function weights (for final assignment) ---
-    "COST_POSE_DISTANCE_WEIGHT": 0.9,       # Weights for the Hungarian algorithm cost matrix. Lower cost = better
-    "COST_SKELETON_SCORE_WEIGHT": -0.1,     # A higher intrinsic skeleton score should lower the cost (hence negative)
+    "COST_POSE_DISTANCE_WEIGHT": 0.9,  # Weights for the Hungarian algorithm cost matrix. Lower cost = better
+    "COST_SKELETON_SCORE_WEIGHT": -0.1,  # A higher intrinsic skeleton score should lower the cost (hence negative)
 
     # --- Kalman Filter parameters ---
-    "KF_PROCESS_NOISE_POS": 0.1,            # Process noise for position (assumes random acceleration). Higher = less smooth
-    "KF_PROCESS_NOISE_SCALE": 0.01,         # Process noise for scale
-    "KF_MEASUREMENT_NOISE_POS": 5.0,        # Measurement noise for position (reflects 3D reconstruction uncertainty)
-    "KF_MEASUREMENT_NOISE_SCALE": 0.25,     # Measurement noise for scale
-    "KF_INIT_COV_VEL": 1.0,                 # Initial covariance for velocity
-    "KF_INIT_COV_SCALE": 1.0,               # Initial covariance for scale
-    "KF_INFERENCE_UNCERTAINTY_FACTOR": 2.0, # Multiplier for measurement noise when a keypoint position is inferred, not measured
+    "KF_PROCESS_NOISE_POS": 0.1,  # Process noise for position (assumes random acceleration). Higher = less smooth
+    "KF_PROCESS_NOISE_SCALE": 0.01,  # Process noise for scale
+    "KF_MEASUREMENT_NOISE_POS": 5.0,  # Measurement noise for position (reflects 3D reconstruction uncertainty)
+    "KF_MEASUREMENT_NOISE_SCALE": 0.25,  # Measurement noise for scale
+    "KF_INIT_COV_VEL": 1.0,  # Initial covariance for velocity
+    "KF_INIT_COV_SCALE": 1.0,  # Initial covariance for scale
+    "KF_INFERENCE_UNCERTAINTY_FACTOR": 2.0,
+    # Multiplier for measurement noise when a keypoint position is inferred, not measured
 }
-
-# TODO: move this to the statsbootstraper
-def create_symmetry_map(symmetry_groups: List[Tuple[str, str]]) -> Dict[str, str]:
-    """
-    Creates a map from a keypoint to a canonical symmetrical name
-    eg {'left_eye': 'eye', 'right_eye': 'eye'}
-    """
-    sym_map = {}
-    for group in symmetry_groups:
-        if not group: continue
-        canonical_name = group[0].replace('left_', '').replace('right_', '')
-        for kp_name in group:
-            sym_map[kp_name] = canonical_name
-    return sym_map
-
-def get_side(kp_name: str) -> Optional[str]:
-    """ Returns 'left', 'right', or None if the side is not specified """
-    if kp_name.lower().startswith('left'): return 'left'
-    if kp_name.lower().startswith('right'): return 'right'
-    return None
 
 
 class StatsBootstrapper:
@@ -204,16 +199,16 @@ class StatsBootstrapper:
     """
 
     def __init__(self,
-                 output_path:       Union[str, Path],
-                 bones_list:        List[Tuple[str, str]],
-                 symmetry_map:      Optional[List[Tuple[str, str]]] = None,
-                 prior_stats_path:  Optional[Union[str, Path]] = None,
-                 bootstrap_data:    Optional[List[Dict]] = None
-                 ):
+            output_path:        Union[str, Path],
+            bones_list:         List[Tuple[str, str]],
+            symmetry_map:       Optional[List[Tuple[str, str]]] = None,
+            prior_stats_path:   Optional[Union[str, Path]] = None,
+            bootstrap_data:     Optional[List[Dict]] = None
+         ):
 
         self.bones_list: List[Bone] = [frozenset(b) for b in bones_list]
 
-        # Build skeleton graph once for degree calculations
+        # Build skeleton graph for degree calculations
         # TODO: This is also done in the skeleton assembler, that's a bit redundant
         self._skeleton_graph = nx.Graph()
         self._skeleton_graph.add_edges_from([tuple(b) for b in self.bones_list])
@@ -226,8 +221,30 @@ class StatsBootstrapper:
         self.delimiter_regex = re.compile(r'[-;, ]')
 
         if symmetry_map is not None:
-            self.symmetry_map = create_symmetry_map(symmetry_map)
+            self.symmetry_map = self.create_symmetry_map(symmetry_map)
             logger.info(f"Symmetry map created for {len(self.symmetry_map)} keypoints.")
+
+    def create_symmetry_map(self, symmetry_groups: List[Tuple[str, str]]) -> Dict[str, str]:
+        """
+        Creates a map from a keypoint to a canonical symmetrical name
+        eg {'left_eye': 'eye', 'right_eye': 'eye'}
+        """
+        sym_map = {}
+        for group in symmetry_groups:
+            if not group: continue
+            canonical_name = group[0].replace('left_', '').replace('right_', '')
+            for kp_name in group:
+                sym_map[kp_name] = canonical_name
+        return sym_map
+
+    def get_side(self, kp_name: str) -> Optional[str]:
+        """ Returns 'left', 'right', or None if the side is not specified """
+        # TODO: This is a very lame way to check
+        if 'left' in kp_name.lower():
+            return 'left'
+        if 'right' in kp_name.lower():
+            return 'right'
+        return None
 
     def get_initial_stats(self) -> Dict:
         """
@@ -250,7 +267,7 @@ class StatsBootstrapper:
             with open(self.output_path, 'r') as f:
                 stats = json.load(f)
 
-            return self._validate_and_normalize_stats(stats) # always validate pre-existing files
+            return self._validate_and_normalize_stats(stats)  # always validate pre-existing files
 
         # try to bootstrap from data
         if self.bootstrap_data:
@@ -261,7 +278,8 @@ class StatsBootstrapper:
 
             return stats
 
-        raise ValueError('[ERROR] Could not obtain stats. No prior file provided, no existing stats file found, and no bootstrap data given.')
+        raise ValueError(
+            '[ERROR] Could not obtain stats. No prior file provided, no existing stats file found, and no bootstrap data given.')
 
     def _get_most_stable_bone(self, available_bones: set[Bone]) -> Bone:
         """
@@ -297,7 +315,8 @@ class StatsBootstrapper:
         parts = [str(p).strip() for p in self.delimiter_regex.split(bone_name) if str(p).strip()]
 
         if len(parts) != 2:
-            raise ValueError(f"Could not parse bone name '{bone_name}'. Expected two keypoints separated by a delimiter.")
+            raise ValueError(
+                f"Could not parse bone name '{bone_name}'. Expected two keypoints separated by a delimiter.")
 
         return frozenset(parts)
 
@@ -344,7 +363,7 @@ class StatsBootstrapper:
             return bone
 
         # Check if they belong to the same side (or neither has a side)
-        side1, side2 = get_side(kp1), get_side(kp2)
+        side1, side2 = self.get_side(kp1), self.get_side(kp2)
 
         if side1 is not None and side2 is not None and side1 != side2:
             # This is a cross-body bone (eg left_hip to right_hip), do not normalize it
@@ -363,7 +382,7 @@ class StatsBootstrapper:
 
         ref_bone = self._get_most_stable_bone(set(parsed_bones_data.keys()))
         ref_bone_len = parsed_bones_data[ref_bone]
-        
+
         if ref_bone_len <= 0:
             raise ValueError(f"Reference bone '{' - '.join(ref_bone)}' has a non-positive length ({ref_bone_len}).")
 
@@ -371,7 +390,7 @@ class StatsBootstrapper:
         generic_mad_ratio = CONFIG["BOOTSTRAP_GENERIC_MAD_RATIO"]
         for name, length in parsed_bones_data.items():
             median_ratio = length / ref_bone_len
-            bone_key = ';'.join(sorted(list(name)))     # we want to serialize with consistent sorting
+            bone_key = ';'.join(sorted(list(name)))  # we want to serialize with consistent sorting
             bones_ratios[bone_key] = {
                 'median_ratio': float(median_ratio),
                 'mad_ratio': float(median_ratio * generic_mad_ratio)  # Default MAD
@@ -399,17 +418,19 @@ class StatsBootstrapper:
 
         # Now check for missing MAD values
         for bone_key, bone_stats in stats['bones_ratios'].items():
-            if 'mad_ratio' not in bone_stats or not np.isfinite(bone_stats['mad_ratio']) or bone_stats['mad_ratio'] == 0:
+            if 'mad_ratio' not in bone_stats or not np.isfinite(bone_stats['mad_ratio']) or bone_stats[
+                'mad_ratio'] == 0:
                 bone_stats['mad_ratio'] = float(bone_stats['median_ratio'] * generic_mad_ratio)
                 updated = True
 
         if updated:
-            logger.debug(f"Standardized bone names and/or added missing MAD values using generic {generic_mad_ratio * 100:.1f}% ratio.")
+            logger.debug(
+                f"Standardized bone names and/or added missing MAD values using generic {generic_mad_ratio * 100:.1f}% ratio.")
             self._save_stats(stats)
 
         return stats
 
-    def _greedy_assembler(self, frame_3d_data:  Dict) -> List[dict]:
+    def _greedy_assembler(self, frame_3d_data: Dict) -> List[dict]:
         """ Simplified assembler for bootstrapping stats. Builds skeletons greedily from the central keypoint """
 
         if 'points' not in frame_3d_data or not frame_3d_data['points']:
@@ -619,7 +640,8 @@ class AnatomyLearner:
         new_bones_ratios = {
             ';'.join(sorted(list(b))): {'median_ratio': float(np.median(r)),
                                         'mad_ratio': float(median_abs_deviation(r))}
-            for b, r in self.bones_ratios.items() if len(r) > 50    # Only well-observed bones. TODO: maybe this could be added to config dict
+            for b, r in self.bones_ratios.items() if len(r) > 50
+            # Only well-observed bones. TODO: maybe this could be added to config dict
         }
 
         if not new_bones_ratios:  # not enough data yet so we stick to old stats
@@ -648,10 +670,11 @@ class Tracklet:
     """
 
     def __init__(self,
-             tracklet_id:           int,
-             initial_skeleton:   AssembledSkeleton,
-             frame_idx:          int,
-             central_kp:         str):
+            tracklet_id:        int,
+            initial_skeleton:   AssembledSkeleton,
+            frame_idx:          int,
+            central_kp:         str
+        ):
 
         self.id = tracklet_id
         self.age = 0
@@ -662,7 +685,7 @@ class Tracklet:
         self.health = 1.0  # Running confidence metric (1.0 = high confidence)
         self.anatomical_integrity = initial_skeleton.score  # Exponential Moving Average of the skeleton score
 
-        self.anatomical_acore_alpha = CONFIG['TRACKER_ANATOMICAL_SCORE_ALPHA']
+        self.anatomical_score_alpha = CONFIG['TRACKER_ANATOMICAL_SCORE_ALPHA']
         self.inferred_health_penalty = CONFIG['TRACKER_INFERRED_HEALTH_PENALTY']
         self.health_decay_rate = CONFIG['TRACKER_HEALTH_DECAY_RATE']
 
@@ -680,9 +703,9 @@ class Tracklet:
 
         dt = 1.0  # Time step
 
-        self.kf.F = np.array([[1.0, 0.0, 0.0,  dt, 0.0, 0.0, 0.0],
-                              [0.0, 1.0, 0.0, 0.0,  dt, 0.0, 0.0],
-                              [0.0, 0.0, 1.0, 0.0, 0.0,  dt, 0.0],
+        self.kf.F = np.array([[1.0, 0.0, 0.0, dt, 0.0, 0.0, 0.0],
+                              [0.0, 1.0, 0.0, 0.0, dt, 0.0, 0.0],
+                              [0.0, 0.0, 1.0, 0.0, 0.0, dt, 0.0],
                               [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
                               [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
                               [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
@@ -764,7 +787,7 @@ class Tracklet:
         # so we tell this to the KF by temporarily increasing its measurement noise
         if inferred:
             original_R = self.kf.R.copy()
-            self.kf.R[:3, :3] *= self.inference_uncertainty_factor # only increase position uncertainty
+            self.kf.R[:3, :3] *= self.inference_uncertainty_factor  # only increase position uncertainty
             self.kf.update(measurement)
             self.kf.R = original_R  # and restore for the next update
         else:
@@ -773,7 +796,8 @@ class Tracklet:
         # Update health and score metrics after a successful KF update
 
         # Update the smoothed anatomical score
-        self.anatomical_integrity = self.anatomical_acore_alpha * skeleton.score + (1 - self.anatomical_acore_alpha) * self.anatomical_integrity
+        self.anatomical_integrity = self.anatomical_score_alpha * skeleton.score + (
+                    1 - self.anatomical_score_alpha) * self.anatomical_integrity
 
         # Update the tracklet's health
         if inferred:
@@ -881,37 +905,107 @@ class SkeletonAssembler:
 
         self._skeleton_graph = skeleton_graph
 
-        # Get keypoints degrees, and determine which is the central, which are anchors
+        # Get keypoint degrees to determine topology
         degrees = dict(self._skeleton_graph.degree())
+        self.leaf_nodes = {node for node, degree in degrees.items() if degree == 1}
 
-        leaf_nodes = {node for node, degree in degrees.items() if degree == 1}
-        all_kps = set(degrees.keys())
+        non_leaf_nodes = set(degrees.keys()) - self.leaf_nodes
+        self.central_anchors = set()
+        self.secondary_anchors = set()
 
-        self.anchor_keypoints = all_kps - leaf_nodes
-        logger.debug(f"Found {len(self.anchor_keypoints)} anchor keypoints: {sorted(list(self.anchor_keypoints))}")
+        if non_leaf_nodes:
+            sorted_anchors = sorted(list(non_leaf_nodes), key=lambda node: degrees[node], reverse=True)
+            min_central_count = CONFIG["ASSEMBLER_MIN_CENTRAL_ANCHORS"]
+            self.central_anchors = set(sorted_anchors[:min_central_count])
+            self.secondary_anchors = non_leaf_nodes - self.central_anchors
+
+        print(f"Central Anchors: {sorted(list(self.central_anchors))}")
+        print(f"Secondary Anchors: {sorted(list(self.secondary_anchors))}")
+        print(f"Leaf Nodes: {sorted(list(self.leaf_nodes))}")
 
         self.central_kp = max(degrees, key=degrees.get)
         logger.debug(f"Assembler determined central keypoint: '{self.central_kp}'")
 
+    # == PUBLIC METHODS ==
+
     def update_bone_stats(self, new_stats: dict):
         """ Allows the assembler's anatomical model to be updated on the fly """
+
         self.reference_bone: Bone = frozenset(new_stats['reference_bone'])
         self.median_ref_len = new_stats['median_reference_length']
         self.bones_ratios = {frozenset(k.split(';')): v for k, v in new_stats['bones_ratios'].items()}
 
-    def generate_candidates(self,
-            reconstructed_data: dict
-    ) -> Tuple[List[CandidateSkeleton], Dict[PointNode, PointObservation]]:
+    def assemble_frame(self,
+            reconstructed_data:     dict
+        ) -> Tuple[List[CandidateSkeleton], Dict[PointNode, PointObservation]]:
         """
-        Generates all plausible skeleton candidates from all valid anchor seeds
-        It purposefully allows for redundant candidates which are then resolved globally by 'solve_conflicts'
+        Main assembly entry point. Generates initial fragments and then creates all
+        plausible merge hypotheses without committing to them
+        """
+
+        # Generate small, high-confidence initial fragments
+        initial_fragments, points_map = self._generate_candidates(reconstructed_data)
+        if not initial_fragments:
+            return [], {}
+
+        # Generate all plausible merges between initial fragments (but keep initial fragments)
+        merge_hypotheses = self._generate_merge_hypotheses(initial_fragments, points_map)
+
+        # Return the complete set of hypotheses for the global solver
+        all_hypotheses = initial_fragments + merge_hypotheses
+
+        logger.debug(
+            f"Assembler created {len(initial_fragments)} initial fragments and {len(merge_hypotheses)} merge hypotheses.")
+        return all_hypotheses, points_map
+
+    def _generate_merge_hypotheses(self,
+            fragments:      List[CandidateSkeleton],
+            points_map:     Dict[PointNode, PointObservation]
+        ) -> List[CandidateSkeleton]:
+        """
+        Generates all plausible merge hypotheses from a list of fragments without committing to any single merge.
+        It is stateless (returns only the new, merged skeletons)
+        """
+
+        if len(fragments) < 2:
+            return []
+
+        # Each initial fragment is its own constituent part
+        for i, frag in enumerate(fragments):
+            # we use index i as a unique identifier for each initial fragment
+            frag.constituent_indices = frozenset([i])
+
+        merge_hypotheses = []
+
+        # consider every possible pair of initial fragments for merging
+        for i, j in combinations(range(len(fragments)), 2):
+            skel_A, skel_B = fragments[i], fragments[j]
+
+            # attempt to merge the two fragments
+            merged_candidate = self._attempt_merge(skel_A, skel_B, points_map)
+
+            if merged_candidate:
+                # th emerged candidate's identity is the union of the parent fragments' IDs
+                merged_candidate.constituent_indices = skel_A.constituent_indices.union(skel_B.constituent_indices)
+                merge_hypotheses.append(merged_candidate)
+
+        # TODO: could add a second layer of merging here by calling this function recursively on 'merge_hypotheses'...
+
+        return merge_hypotheses
+
+    # == PRIVATE HELPER METHODS ==
+
+    def _generate_candidates(self,
+            reconstructed_data: dict
+        ) -> Tuple[List[CandidateSkeleton], Dict[PointNode, PointObservation]]:
+        """
+        Generates all plausible skeleton candidates by exhaustively seeding from all anchor and leaf points.
+        This creates the necessary redundancy for the downstream solver
         """
 
         if 'points' not in reconstructed_data or not reconstructed_data['points']:
             return [], {}
 
-        # points_map is an internal standardized representation of the point soup
-        # that simplifies the greedy growth algorithm. It maps (kp_name, index) to {pos, conf}
         points_map = {
             (kp_name, i): PointObservation(pos=points[i], conf=confs[i])
             for kp_name, (points, confs) in reconstructed_data['points'].items()
@@ -919,201 +1013,362 @@ class SkeletonAssembler:
         }
         if not points_map: return [], {}
 
-        # We only seed skeletons from non-leaf keypoints
-        anchor_nodes = [node for node in points_map if node[0] in self.anchor_keypoints]
         candidate_skeletons = []
 
-        # For every anchor node in the frame, try to grow a skeleton
-        for point in anchor_nodes:
-            candidate = self._grow_skeleton(point, points_map)
+        all_seed_nodes = list(points_map.keys())
+
+        # used_as_seed is used to avoid starting a full growth from every single point in a large fragment
+        # (which would be redundant). Only one point in a component should be used to seed
+        used_as_seed = set()
+
+        # Grow full skeletons from any anchor point
+        all_anchor_types = self.central_anchors.union(self.secondary_anchors)
+        anchor_seed_nodes = [node for node in all_seed_nodes if node[0] in all_anchor_types]
+
+        for seed_node in anchor_seed_nodes:
+            if seed_node in used_as_seed:
+                continue
+
+            candidate = self._grow_skeleton(
+                seed_node,
+                points_map,
+                score_debt_tol=CONFIG["ASSEMBLER_SCORE_DEBT_TOLERANCE"]
+            )
+
             if candidate:
                 candidate_skeletons.append(candidate)
+                # Mark all nodes in the discovered fragment as 'used for seeding'
+                for node in candidate.nodes:
+                    used_as_seed.add(node)
 
+        # Find any remaining isolated 2-point leaf fragments that weren't part of a larger growth
+        # TODO: should it be more than 2?
+        leaf_seed_nodes = [node for node in all_seed_nodes if node[0] in self.leaf_nodes]
+        for seed_node in leaf_seed_nodes:
+            if seed_node in used_as_seed:
+                continue
+
+            fragment = self._find_leaf_fragment(seed_node, points_map)
+            if fragment:
+                candidate_skeletons.append(fragment)
+                # mark these two nodes as used as well
+                for node in fragment.nodes:
+                    used_as_seed.add(node)
+
+        logger.debug(f"Generated {len(candidate_skeletons)} initial candidates for this frame.")
         return candidate_skeletons, points_map
 
-    def solve_conflicts(self,
-            candidates:     List[CandidateSkeleton],
+    def _attempt_merge(self,
+            skel_A:         CandidateSkeleton,
+            skel_B:         CandidateSkeleton,
             points_map:     Dict[PointNode, PointObservation]
-    ) -> List[AssembledSkeleton]:
-        """ Solves for the best set of non-conflicting skeletons using MWIS """
+         ) -> Optional[CandidateSkeleton]:
+        """
+        Attempts to merge two disjoint fragments into a larger skeleton
 
-        if not candidates:
-            return []
+        1. Ensures fragments are fully disjoint (no shared points or keypoint types)
+        2. Checks for "clone" fragments using Jaccard similarity on keypoint positions
+        3. Verifies scale consistency
+        4. Finds the best high-quality 'linking' bone between fragments
+        5. Validates this link using a 'shared neighbour' graph heuristic
+        """
 
-        # Build conflict graph where nodes are skeletons and edges represent a conflict
-        conflict_graph = nx.Graph()
-        for i, candidate_skel in enumerate(candidates):
-            weight = max(0, int(candidate_skel.competition_score * 100))
-            conflict_graph.add_node(i, weight=weight)
+        # Pre-check 1: must be fully disjoint
+        if not skel_A.nodes.isdisjoint(skel_B.nodes):
+            return None
 
-        # Precompute centroids and build the KDtree
-        centroids = np.array([
-            np.mean([points_map[node].pos for node in cand.nodes], axis=0) if cand.nodes else np.array([np.nan] * 3)
-            for cand in candidates
-        ])
-        valid_indices = np.where(~np.isnan(centroids).any(axis=1))[0]
+        kps_A = {node[0] for node in skel_A.nodes}
+        kps_B = {node[0] for node in skel_B.nodes}
+        if not kps_A.isdisjoint(kps_B):
+            return None
 
-        if len(valid_indices) < 2:  # not enough valid skeletons to have conflicts
-            winner_indices = valid_indices
-        else:
-            tree = cKDTree(centroids[valid_indices])
-            potential_pairs = tree.query_pairs(r=CONFIG["CONFLICT_SOLVER_BROAD_RADIUS"], output_type='set')
+        # Pre-check 2: handle clones with Jaccard score
+        common_kps = kps_A.intersection(kps_B)
+        if common_kps:
+            # this block should theoretically not be reached due to the check above but it's a good safeguard
+            proximal_intersection = 0
+            kps_map_A = {node[0]: points_map[node].pos for node in skel_A.nodes}
+            kps_map_B = {node[0]: points_map[node].pos for node in skel_B.nodes}
 
-            # Perform detailed narrow phase checks only on pairs that are close to each other
-            for i_local, j_local in potential_pairs:
-                i, j = valid_indices[i_local], valid_indices[j_local]
-                cand_i, cand_j = candidates[i], candidates[j]
+            for name in common_kps:
+                if np.linalg.norm(kps_map_A[name] - kps_map_B[name]) < CONFIG["CONFLICT_SOLVER_PROXIMITY_RADIUS"]:
+                    proximal_intersection += 1
 
-                # Direct point sharing conflict
-                if not cand_i.nodes.isdisjoint(cand_j.nodes):
+            union_size = len(kps_A.union(kps_B))
+            jaccard_prox = proximal_intersection / union_size if union_size > 0 else 0
 
-                    logger.debug(
-                        f"  - Conflict (Shared Points): Skel {i} vs {j}. "
-                        f"Shared: {set(cand_i.nodes) & set(cand_j.nodes)}"
-                    )
+            if jaccard_prox > CONFIG["CONFLICT_SOLVER_JACCARD_THRESHOLD"]:
+                # they are not merge candidates, they are conflicting clones
+                return None
 
-                    conflict_graph.add_edge(i, j)
-                    continue
+        # Scale consistency
+        if abs(skel_A.scale - skel_B.scale) > CONFIG["ASSEMBLER_MERGE_SCALE_TOLERANCE"]:
+            return None
+        combined_scale = (skel_A.scale + skel_B.scale) / 2.0
 
-                # Jaccard proximity conflict
-                kps_i = {node[0]: points_map[node].pos for node in cand_i.nodes}
-                kps_j = {node[0]: points_map[node].pos for node in cand_j.nodes}
-                common = kps_i.keys() & kps_j.keys()
-                union = kps_i.keys() | kps_j.keys()
+        # Find a high quailty linking bone
+        best_link_score = -1.0
+        best_linking_bone = None
 
-                if not union:
-                    continue
+        combined_kps_map = {node[0]: points_map[node].pos for node in skel_A.nodes.union(skel_B.nodes)}
+        combined_nodes = skel_A.nodes.union(skel_B.nodes)
 
-                proximal_intersection = sum(
-                    1 for name in common if np.linalg.norm(kps_i[name] - kps_j[name]
-                                                           ) < CONFIG["CONFLICT_SOLVER_PROXIMITY_RADIUS"])
+        for kp_a in kps_A:
+            for kp_b in kps_B:
+                bone = frozenset((kp_a, kp_b))
+                if bone in self.bones_ratios:
+                    score = self._score_bone(bone, combined_kps_map, points_map, combined_nodes, combined_scale)
+                    if score > best_link_score:
+                        best_link_score = score
+                        best_linking_bone = bone
 
-                if proximal_intersection / len(union) > CONFIG["CONFLICT_SOLVER_JACCARD_THRESHOLD"]:
-                    logger.debug(f"  - Conflict (Proximity): Skel {i} vs {j}. Jaccard: {proximal_intersection:.2f}")
-                    conflict_graph.add_edge(i, j)
+        # Check if the best link we found is good enough to justify a merge
+        if best_link_score < CONFIG["ASSEMBLER_MERGE_LINKING_BONE_THRESHOLD"]:
+            return None
 
-            # The Maximum Weight Independent Set (MWIS) of the conflict graph is the set of
-            # non-conflicting skeletons with the maximum total score. This is equivalent to
-            # finding the max weight clique in the complement graph
+        # Shared neighbour check
+        kp_a_name, kp_b_name = tuple(best_linking_bone)
+        neighbors_of_a = set(self._skeleton_graph.neighbors(kp_a_name))
+        neighbors_of_b = set(self._skeleton_graph.neighbors(kp_b_name))
 
-            # winner_indices = solve_mwis_networkx(conflict_graph)
-            winner_indices = solve_mwis_SCIP(conflict_graph)
+        shared_neighbors = neighbors_of_a.intersection(neighbors_of_b)
+        shared_neighbors.discard(kp_a_name)
+        shared_neighbors.discard(kp_b_name)
 
-        final_skeletons = [
-            AssembledSkeleton(
-                keypoints={node[0]: points_map[node].pos for node in candidates[i].nodes},
-                point_indices={node[0]: node[1] for node in candidates[i].nodes},
-                score=candidates[i].anatomical_score,
-                scale=candidates[i].scale
+        if not any(n in kps_A or n in kps_B for n in shared_neighbors):
+            # island-to-island link with no existing anchor point
+            # It's the signature of a pathological merge. Reject it.
+            return None
+
+        # Merge is valid
+        merged_nodes = skel_A.nodes.union(skel_B.nodes)
+
+        # Estimate the new average score for the merged object
+        avg_score_A = skel_A.anatomical_score / len(skel_A.nodes) if skel_A.nodes else 0
+        avg_score_B = skel_B.anatomical_score / len(skel_B.nodes) if skel_B.nodes else 0
+        num_bones_A = max(1, len(skel_A.nodes) - 1)
+        num_bones_B = max(1, len(skel_B.nodes) - 1)
+
+        new_total_score = (avg_score_A * num_bones_A) + (avg_score_B * num_bones_B) + best_link_score
+        new_num_bones = num_bones_A + num_bones_B + 1
+        new_avg_score = new_total_score / new_num_bones
+
+        # Use the standard factory to create the final candidate
+        return self._create_candidate(merged_nodes, new_avg_score, combined_scale)
+
+    def _create_candidate(self,
+            nodes:      FrozenSet[PointNode],
+            avg_score:  float,
+            scale:      float
+        ) -> CandidateSkeleton:
+        """ Factory function to create a CandidateSkeleton object """
+
+        if avg_score <= 0:
+            # this can happen if the fragment is nonsensical
+            # so we return a candidate with a score of 0
+            return CandidateSkeleton(
+                nodes=nodes,
+                competition_score=0.0,
+                anatomical_score=0.0,
+                scale=scale
             )
-            for i in winner_indices
-        ]
 
-        logger.debug(
-            f"Conflict resolution complete. Selected {len(winner_indices)} skeletons from {len(candidates)} candidates."
+        num_nodes = len(nodes)
+
+        size_bonus_multiplier = num_nodes
+        base_score = avg_score * size_bonus_multiplier
+
+        # quality-over-quantity boost for exceptionally well-formed skeletons
+        # (his helps high-quality fragments to punch above their weight in the conflict resolution stage)
+        quality_bonus = 0.0
+
+        high_quality_thresh = CONFIG["ASSEMBLER_HIGH_QUALITY_THRESHOLD"]
+        quality_bonus_factor = CONFIG["ASSEMBLER_QUALITY_BONUS_FACTOR"]
+
+        if avg_score > high_quality_thresh:
+            # The bonus is a percentage of the base score
+            quality_bonus = base_score * (quality_bonus_factor - 1.0)
+
+        # The final 'competition score' (used by MWIS) is the sum of the base score and all bonuses
+        competition_score = base_score + quality_bonus
+
+        # The 'anatomical_score' reflects the pure anatomical fit multiplied by size
+        # This is useful for the AnatomyLearner and for diagnostics
+        anatomical_score = avg_score * num_nodes
+
+        return CandidateSkeleton(
+            nodes=nodes,
+            competition_score=competition_score,
+            anatomical_score=anatomical_score,
+            scale=scale
         )
 
-        return final_skeletons
+    def _find_leaf_fragment(self,
+            leaf_node:      PointNode,
+            points_map:     Dict[PointNode, PointObservation]
+        ) -> Optional[CandidateSkeleton]:
+        """ lightweight method to find the single best 2-point fragment starting from a leaf node """
+
+        leaf_kp_name = leaf_node[0]
+
+        # a leaf has only one neighbor in the skeleton graph
+        try:
+            parent_kp_name = next(self._skeleton_graph.neighbors(leaf_kp_name))
+        except StopIteration:
+            # this shouldn't happen if the skeleton graph is correct, but as a safeguard:
+            return None
+
+        # Find all available points of the parent type
+        parent_candidates = [node for node in points_map if node[0] == parent_kp_name]
+        if not parent_candidates:
+            return None
+
+        best_parent_node = None
+        best_bone_score = -1.0
+
+        # Iterate through potential parents to find the one that forms the best single bone
+        for parent_cand_node in parent_candidates:
+            kps = {leaf_kp_name: points_map[leaf_node].pos, parent_kp_name: points_map[parent_cand_node].pos}
+            nodes = frozenset([leaf_node, parent_cand_node])
+
+            # We need to estimate scale even for a 2-point fragment
+            # This is a bit of a chicken-and-egg problem but we can use a quick estimate
+            scale = self._get_skeleton_scale(kps)
+            if not (CONFIG["ASSEMBLER_MIN_SANE_SCALE"] < scale < CONFIG["ASSEMBLER_MAX_SANE_SCALE"]):
+                continue
+
+            bone = frozenset((leaf_kp_name, parent_kp_name))
+            score = self._score_bone(bone, kps, points_map, nodes, scale)
+
+            if score > best_bone_score:
+                best_bone_score = score
+                best_parent_node = parent_cand_node
+
+        # Check if the best connection we found is good enough
+        if best_parent_node and best_bone_score > CONFIG["ASSEMBLER_MIN_BONE_SCORE_FOR_FRAGMENT"]:
+            fragment_nodes = frozenset([leaf_node, best_parent_node])
+
+            final_scale = self._get_skeleton_scale({n[0]: points_map[n].pos for n in fragment_nodes})
+
+            # Use the factory function to create the candidate with proper competition scoring
+            return self._create_candidate(fragment_nodes, best_bone_score, final_scale)
+
+        return None
 
     def _grow_skeleton(self,
             anchor_node:    PointNode,
-            points_map:     Dict[PointNode, PointObservation]
-    ) -> Optional[CandidateSkeleton]:
-        """ Grows a single skeleton candidate from an anchor point using a holistic score """
+            points_map:     Dict[PointNode, PointObservation],
+            score_debt_tol: float
+        ) -> Optional[CandidateSkeleton]:
+        """ Grows a single skeleton candidate from an anchor point """
 
-        # Build a KD-Tree for spatial lookups
+        # KDTree for fast spatial lookups
         all_nodes_list = list(points_map.keys())
         all_positions = np.array([points_map[node].pos for node in all_nodes_list])
-        if all_positions.shape[0] == 0:
-            return None
+        if all_positions.shape[0] == 0: return None
         kdtree = cKDTree(all_positions)
 
-        # Map keypoint names to the indices in all_nodes_list for quick lookup
-        kp_to_indices = defaultdict(list)
-        for i, node in enumerate(all_nodes_list):
-            kp_to_indices[node[0]].append(i)
-
-        # generous radius based on the reference anatomy
-        # TODO: use a value derived from the anatomy learner
         max_bone_len = self.median_ref_len * CONFIG["BOOTSTRAP_MAX_BONE_LEN"]
 
+        # initialisation
         current_nodes = {anchor_node}
         current_kps = {anchor_node[0]: points_map[anchor_node].pos}
-
-        # Initialize score tracking
-        total_bone_score = 0.0
+        total_bone_score_sum = 0.0
         num_bones = 0
 
         while True:
-            current_kp_names = {node[0] for node in current_nodes}
+            # Find all valid keypoints that could connect to the current skeleton
+            # using topology (skeleton graph) and spatial proximity (KDTree)
 
-            # Find candidates using topology and spatial proximity
+            current_kp_names = {node[0] for node in current_nodes}
             nodes_to_evaluate = set()
             for node_in_skel in current_nodes:
-                # Find neighboring keypoint types from the skeleton graph
-                neighbor_kp_types = {
-                    n for n in self._skeleton_graph.neighbors(node_in_skel[0]) if n not in current_kp_names
-                }
+                neighbor_kp_types = {n for n in self._skeleton_graph.neighbors(node_in_skel[0]) if
+                                     n not in current_kp_names}
+                if not neighbor_kp_types: continue
 
-                if not neighbor_kp_types:
-                    continue
-
-                # Query the KD-Tree for nearby points
                 center_pos = points_map[node_in_skel].pos
                 nearby_indices = kdtree.query_ball_point(center_pos, r=max_bone_len)
-
-                # Filter these nearby points to be of the correct type and not already in the skeleton
                 for idx in nearby_indices:
                     cand_node = all_nodes_list[idx]
                     if cand_node[0] in neighbor_kp_types:
                         nodes_to_evaluate.add(cand_node)
 
             if not nodes_to_evaluate:
+                break  # no more valid connections found
+
+            # Calculate scale once per growth step
+            current_step_scale = self._get_skeleton_scale(current_kps)
+            if not (CONFIG["ASSEMBLER_MIN_SANE_SCALE"] < current_step_scale < CONFIG["ASSEMBLER_MAX_SANE_SCALE"]):
+                # current skeleton has a bad scale so, abort
                 break
 
+            current_avg_score = (total_bone_score_sum / num_bones) if num_bones > 0 else 0
+            current_base_score = current_avg_score * len(current_nodes)
+            current_quality_bonus = 0.0
+
+            if current_avg_score > CONFIG["ASSEMBLER_HIGH_QUALITY_THRESHOLD"]:
+                current_quality_bonus = current_base_score * (CONFIG["ASSEMBLER_QUALITY_BONUS_FACTOR"] - 1.0)
+            current_growth_score = current_base_score + current_quality_bonus
+
+            # Evaluate each potential extension
             best_extension = None
             best_new_growth_score = -float('inf')
 
-            # Evaluate each potential extension incrementally
             for cand_node in nodes_to_evaluate:
-                # Estimate new scale if we were to add this node
+
+                # Calculate the score contribution of only the new bones this candidate would form
+                cand_kp_name = cand_node[0]
                 temp_kps = current_kps.copy()
-                temp_kps[cand_node[0]] = points_map[cand_node].pos
-                new_scale = self._get_skeleton_scale(temp_kps)
+                temp_kps[cand_kp_name] = points_map[cand_node].pos
+                new_scale = current_step_scale
 
-                if not (CONFIG["ASSEMBLER_MIN_SANE_SCALE"] < new_scale < CONFIG["ASSEMBLER_MAX_SANE_SCALE"]):
-                    continue
-
-                # Calculate the score contribution of the new bones
                 new_bone_score_sum = 0
                 new_bone_count = 0
                 for existing_node in current_nodes:
-
                     bone = frozenset((cand_node[0], existing_node[0]))
-
-                    if bone in self.bones_list:
-                        # Create a temporary map of nodes and keypoints for scoring
+                    if bone in self.bones_ratios:
                         temp_nodes = frozenset(current_nodes | {cand_node})
                         score = self._score_bone(bone, temp_kps, points_map, temp_nodes, new_scale)
-
-                        if score < -500:  # abort if any new bone is impossible
+                        if score < -500:  # An impossible bone was formed.
                             new_bone_score_sum = -float('inf')
                             break
-
                         new_bone_score_sum += score
                         new_bone_count += 1
 
                 if new_bone_count == 0 or new_bone_score_sum == -float('inf'):
                     continue
 
-                # New holistic score if this node is added
-                new_total_score = total_bone_score + new_bone_score_sum
+                # Calculate the potential new holistic competition score
                 new_total_bones = num_bones + new_bone_count
-                new_avg_score = new_total_score / new_total_bones
+                new_total_score_sum = total_bone_score_sum + new_bone_score_sum
+                new_avg_score = new_total_score_sum / new_total_bones
 
-                # The growth score must include the size bonus
-                new_growth_score = new_avg_score * (len(current_nodes) + 1)
+                new_num_nodes = len(current_nodes) + 1
+                new_base_score = new_avg_score * new_num_nodes
 
+                # new_quality_bonus = 0.0
+                # if new_avg_score > CONFIG["ASSEMBLER_HIGH_QUALITY_THRESHOLD"]:
+                #     new_quality_bonus = new_base_score * (CONFIG["ASSEMBLER_QUALITY_BONUS_FACTOR"] - 1.0)
+
+                # Calculate a smooth quality bonus
+                bonus_factor = CONFIG["ASSEMBLER_QUALITY_BONUS_FACTOR"] - 1.0
+
+                # Map average score to a 0-1 range, starting from a baseline (like 75) up to 100
+                # Skeletons with avg score below 75 get no bonus.
+                baseline_quality = 75.0
+                quality_range = 100.0 - baseline_quality
+
+                # Normalized quality (0 to 1, clamped)
+                normalized_quality = max(0, (new_avg_score - baseline_quality) / quality_range)
+
+                # The bonus is the base score times the bonus factor, scaled by the normalized quality
+                new_quality_bonus = new_base_score * bonus_factor * normalized_quality
+
+                # final score to compare for the growth decision
+                new_growth_score = new_base_score + new_quality_bonus
+
+                # Keep track of the best extension found so far
                 if new_growth_score > best_new_growth_score:
                     best_new_growth_score = new_growth_score
                     best_extension = {
@@ -1122,37 +1377,33 @@ class SkeletonAssembler:
                         "bone_count_increase": new_bone_count
                     }
 
-            current_avg_score = (total_bone_score / num_bones) if num_bones > 0 else 0
-            current_growth_score = current_avg_score * len(current_nodes)
-
-            # If the best new score is better or not much worse, grow
-            if best_extension and best_new_growth_score > (current_growth_score - CONFIG["ASSEMBLER_SCORE_DEBT_TOLERANCE"]):
+            # Make the growth decision (ompare the best potential new score with the current score)
+            if best_extension and best_new_growth_score > (current_growth_score - score_debt_tol):
+                # Yep, it's a good move. Accept growth.
                 best_node = best_extension["node"]
-
                 current_nodes.add(best_node)
                 current_kps[best_node[0]] = points_map[best_node].pos
-
-                total_bone_score += best_extension["score_contribution"]
+                total_bone_score_sum += best_extension["score_contribution"]
                 num_bones += best_extension["bone_count_increase"]
-
             else:
-                break  # stop growth
+                # Nope, best potential growth is not good enough. Stop.
+                break
 
+        # Finalise and return the grown skeleton
         if len(current_nodes) < CONFIG["ASSEMBLER_MIN_KPS_FOR_SKELETON"]:
             return None
 
-        final_avg_score = (total_bone_score / num_bones) if num_bones > 0 else 0.0
+        final_avg_score = (total_bone_score_sum / num_bones) if num_bones > 0 else 0.0
         if final_avg_score <= 0:
             return None
 
-        return CandidateSkeleton(
-            nodes=frozenset(current_nodes),
-            competition_score=final_avg_score * len(current_nodes),
-            anatomical_score=final_avg_score * len(current_nodes),
-            scale=self._get_skeleton_scale(current_kps)
-        )
+        final_scale = self._get_skeleton_scale(current_kps)
 
-    def _get_skeleton_scale(self, keypoints: Dict[str, np.ndarray]) -> float:
+        return self._create_candidate(frozenset(current_nodes), final_avg_score, final_scale)
+
+    def _get_skeleton_scale(self,
+            keypoints:  Dict[str, np.ndarray]
+        ) -> float:
         """ Estimates the scale of a (possibly partial) skeleton relative to the reference stats """
 
         scales = []
@@ -1174,7 +1425,8 @@ class SkeletonAssembler:
             return 1.0
 
         # Filter out absurd scale values before taking the median
-        sane_scales = [s for s in scales if CONFIG["ASSEMBLER_MIN_SANE_SCALE"] <= s <= CONFIG["ASSEMBLER_MAX_SANE_SCALE"]]
+        sane_scales = [s for s in scales if
+                       CONFIG["ASSEMBLER_MIN_SANE_SCALE"] <= s <= CONFIG["ASSEMBLER_MAX_SANE_SCALE"]]
 
         return float(np.median(sane_scales)) if sane_scales else 1.0
 
@@ -1184,7 +1436,7 @@ class SkeletonAssembler:
             points_map:     Dict[PointNode, PointObservation],
             nodes:          FrozenSet[PointNode],
             scale:          float
-    ) -> float:
+        ) -> float:
         """ Scores a single bone based on its length conformity to the stats (adjusted for scale) """
 
         if bone not in self.bones_ratios:
@@ -1227,10 +1479,9 @@ class SkeletonAssembler:
 
         return length_score * confidence_score
 
+
 class MultiObjectTracker:
-    """
-    Main class for tracking multiple skeletons over time
-    """
+    """ Main class for tracking multiple skeletons over time """
 
     def __init__(self, assembler: SkeletonAssembler):
 
@@ -1238,70 +1489,71 @@ class MultiObjectTracker:
         self.frame_idx = -1
         self.tracklets: List[Tracklet] = []
         self.next_tracklet_id = 0
-        self.max_age = CONFIG['TRACKER_MAX_AGE']
+        self.max_age = CONFIG['TRACKER_MAX_TRACKELT_AGE']
 
     def update(self,
             reconstructed_data: dict,
             frame_idx:          int
-    ) -> List[Tracklet]:
-        """
-        Processes a single frame using a 'Guided global assembly' workflow
-
-        By boosting scores of candidates that align with existing tracklets, we guide the conflict
-        resolution (MWIS) to favor solutions with high temporal continuity
-        """
+        ) -> List[Tracklet]:
+        """ Processes a single frame using 'Hypothesize-and-Solve' workflow """
 
         self.frame_idx = frame_idx
 
-        # Predict
+        # Predict forward state of existing tracklets
         for tracklet in self.tracklets:
             tracklet.predict(self.frame_idx)
 
-        # Generate all candidates
-        candidates, points_map = self.assembler.generate_candidates(reconstructed_data)
-        if not candidates:
+        # Generate all initial fragments from the 3D point soup and merge hypotheses from the assembler
+        all_candidates, points_map = self.assembler.assemble_frame(reconstructed_data)
+        if not all_candidates:
             self.prune_tracklets()
             return self.get_active_tracklets()
 
-        # Boost scores to guide assembly
-        # Bonus for candidates that align well with existing tracklet predictions to bias the conflict resolution
-        # (in favor of temporal continuity)
-        bonuses = self._calculate_association_bonuses(candidates, points_map)
+        # Apply temporal guidance: boost scores of candidates that match tracklets
+        bonuses = self._calculate_association_bonuses(all_candidates, points_map)
+        for i, cand in enumerate(all_candidates):
+            cand.competition_score += bonuses[i] * CONFIG["TRACKER_CONTINUITY_BONUS"]
 
-        for i, candidate_skel in enumerate(candidates):
-            # The score attribute is the boosted score used for conflict resolution
-            candidate_skel.competition_score += bonuses[i] * CONFIG["TRACKER_CONTINUITY_BONUS"]
+        # Build a conflict graph that includes spatial conflicts and hierarchical conflicts (merge vs. its parts)
+        conflict_graph = self._build_conflict_graph(all_candidates, points_map)
 
-        # Conflict resolution
-        # Run the conflict solver on the complete (score-boosted) set of candidates
-        # This is where clones are detected and eliminated via MWIS (before any assignments are made)
-        winning_skeletons = self.assembler.solve_conflicts(candidates, points_map)
+        # Solve for the globally optimal set of skeletons using MWIS
+        # winner_indices = solve_mwis_SCIP(conflict_graph)
+        winner_indices = solve_mwis_networkx(conflict_graph)
 
-        # Final association and update
+        winning_skeletons = [
+            AssembledSkeleton(
+                keypoints={node[0]: points_map[node].pos for node in all_candidates[i].nodes},
+                point_indices={node[0]: node[1] for node in all_candidates[i].nodes},
+                score=all_candidates[i].anatomical_score,
+                scale=all_candidates[i].scale
+            )
+            for i in winner_indices
+        ]
+        logger.debug(
+            f"Conflict resolution selected {len(winner_indices)} skeletons from {len(all_candidates)} total candidates.")
+
+        # Associate winning skeletons with tracklets and update state
         if self.tracklets and winning_skeletons:
-
-            # here we use the original (non-boosted) scores to ensure matching on pure geometry and anatomy
             cost_matrix = self._build_final_assignment_cost_matrix(self.tracklets, winning_skeletons)
             tracklet_inds, winner_inds = linear_sum_assignment(cost_matrix)
 
             matched_winner_indices = set()
             for t_idx, w_idx in zip(tracklet_inds, winner_inds):
-
-                # association is only made if the cost not infinite
                 if cost_matrix[t_idx, w_idx] < 1e9:
                     self.tracklets[t_idx].update(skeleton=winning_skeletons[w_idx], frame_idx=self.frame_idx)
                     matched_winner_indices.add(w_idx)
         else:
             matched_winner_indices = set()
 
-        # Any winning skeleton that was not matched to an existing tracklet is a new object
+        # Create new tracklets for unmatched skeletons
         for i, skel in enumerate(winning_skeletons):
             if i not in matched_winner_indices and self.assembler.central_kp in skel.keypoints:
                 new_tracklet = Tracklet(self.next_tracklet_id, skel, self.frame_idx, self.assembler.central_kp)
                 self.tracklets.append(new_tracklet)
                 self.next_tracklet_id += 1
 
-        # Remove tracklets that weren't updated in this frame and are too old
+        # Prune old/lost tracklets
         self.prune_tracklets()
 
         return self.get_active_tracklets()
@@ -1327,13 +1579,69 @@ class MultiObjectTracker:
 
         self.tracklets = [
             t for t in self.tracklets
-            if t.time_since_update <= self.max_age and not np.sum(t.uncertainty['position']) > CONFIG['TRACKER_UNCERTAINTY_THRESHOLD']
+            if t.time_since_update <= self.max_age and not np.sum(t.uncertainty['position']) > CONFIG[
+                'TRACKER_UNCERTAINTY_THRESHOLD']
         ]
 
+    def _build_conflict_graph(self,
+            candidates:     List[CandidateSkeleton],
+            points_map:     Dict[PointNode, PointObservation]
+        ) -> nx.Graph:
+        """ Builds a conflict graph with both spatial and hierarchical conflicts """
+
+        conflict_graph = nx.Graph()
+        num_candidates = len(candidates)
+
+        for i, cand in enumerate(candidates):
+            weight = max(0, int(cand.competition_score * 100))
+            conflict_graph.add_node(i, weight=weight)
+
+        # Pre-calculate centroids for spatial checks
+        centroids = np.array([
+            np.mean([points_map[node].pos for node in cand.nodes], axis=0) if cand.nodes else np.array([np.nan] * 3)
+            for cand in candidates
+        ])
+
+        for i, j in combinations(range(num_candidates), 2):
+            cand_i, cand_j = candidates[i], candidates[j]
+
+            # Hierarchical conflict: if one candidate is composed of the other, they conflict
+            if cand_i.constituent_indices and cand_j.constituent_indices:
+                if cand_j.constituent_indices.issubset(cand_i.constituent_indices) or \
+                        cand_i.constituent_indices.issubset(cand_j.constituent_indices):
+                    conflict_graph.add_edge(i, j)
+                    continue
+
+            # Spatial Conflict (direct point sharing)
+            shared_nodes = cand_i.nodes.intersection(cand_j.nodes)
+            if len(shared_nodes) > CONFIG["CONFLICT_SOLVER_SHARED_POINTS_TOLERANCE"]:
+                conflict_graph.add_edge(i, j)
+                continue
+
+            # Spatial Conflict (proximity)
+            # Only check this if centroids are close
+            dist_sq = np.sum((centroids[i] - centroids[j]) ** 2)
+            if dist_sq < CONFIG["CONFLICT_SOLVER_BROAD_RADIUS"] ** 2:
+                kps_i = {node[0]: points_map[node].pos for node in cand_i.nodes}
+                kps_j = {node[0]: points_map[node].pos for node in cand_j.nodes}
+                common = kps_i.keys() & kps_j.keys()
+                union = kps_i.keys() | kps_j.keys()
+                if not union:
+                    continue
+
+                proximal_intersection = sum(
+                    1 for name in common if
+                    np.linalg.norm(kps_i[name] - kps_j[name]) < CONFIG["CONFLICT_SOLVER_PROXIMITY_RADIUS"]
+                )
+                if proximal_intersection / len(union) > CONFIG["CONFLICT_SOLVER_JACCARD_THRESHOLD"]:
+                    conflict_graph.add_edge(i, j)
+
+        return conflict_graph
+
     def _calculate_association_bonuses(self,
-            candidates: List[CandidateSkeleton],
-            points_map: Dict[PointNode, PointObservation]
-    ) -> np.ndarray:
+            candidates:     List[CandidateSkeleton],
+            points_map:     Dict[PointNode, PointObservation]
+        ) -> np.ndarray:
         """
         Calculates a score bonus (0 to 1) for each candidate skeleton based on its
         best possible alignment with any existing tracklet's prediction
@@ -1343,7 +1651,6 @@ class MultiObjectTracker:
             return np.zeros(len(candidates))
 
         bonuses = np.zeros(len(candidates))
-        sigma = CONFIG["TRACKER_ASSOCIATION_RADIUS"]
 
         for j, cand_skel in enumerate(candidates):
             skel_kps = {node[0]: points_map[node].pos for node in cand_skel.nodes}
@@ -1363,10 +1670,10 @@ class MultiObjectTracker:
                     continue
 
                 # Calculate mean squared distance between common keypoints
-                mean_dist_sq = sum(np.sum((pred_pose[kp] - skel_kps[kp])**2) for kp in common_kps) / len(common_kps)
+                mean_dist_sq = sum(np.sum((pred_pose[kp] - skel_kps[kp]) ** 2) for kp in common_kps) / len(common_kps)
 
                 # Gaussian bonus falls off as distance increases
-                bonus = np.exp(-0.5 * mean_dist_sq / (sigma**2))
+                bonus = np.exp(-0.5 * mean_dist_sq / (CONFIG["TRACKER_ASSOCIATION_RADIUS"] ** 2))
                 if bonus > max_bonus:
                     max_bonus = bonus
 
@@ -1375,9 +1682,9 @@ class MultiObjectTracker:
         return bonuses
 
     def _build_final_assignment_cost_matrix(self,
-                                            tracklets:  List[Tracklet],
-                                            skeletons:  List[AssembledSkeleton]
-                                            ) -> np.ndarray:
+            tracklets:  List[Tracklet],
+            skeletons:  List[AssembledSkeleton]
+        ) -> np.ndarray:
         """ Builds the cost matrix for the final assignment via Hungarian algorithm """
 
         cost_matrix = np.full((len(tracklets), len(skeletons)), 1e9)
@@ -1394,7 +1701,7 @@ class MultiObjectTracker:
                 if len(common_kps) < CONFIG["TRACKER_ASSOCIATION_MIN_KPS"]:
                     continue
 
-                mean_dist_sq = sum(np.sum((pred_pose[kp] - skel.keypoints[kp])**2)
+                mean_dist_sq = sum(np.sum((pred_pose[kp] - skel.keypoints[kp]) ** 2)
                                    for kp in common_kps) / len(common_kps)
 
                 if mean_dist_sq > CONFIG["TRACKER_ASSOCIATION_RADIUS"] ** 2:
@@ -1413,18 +1720,19 @@ if __name__ == '__main__':
 
     folder = Path().home() / 'Desktop' / '3d_ant_data'
     prefix = '240905-1616'
+    session = 22
 
     stats_output_file = 'normalized_bone_stats.json'
     # prior_stats_file = Path().home() / 'Desktop' / 'bone_lengths.csv'
     prior_stats_file = None
 
     # Data for bootstrapping
-    reconstructed_points_file = 'reconstructed_points.pkl'
-    skeleton_input_path = folder / prefix / 'inputs' / 'tracking'
+    points_soup_file = f'points_soup_session{session}.pkl'
+    skeleton_input_file = folder / prefix / 'inputs' / 'tracking'
 
     # Load data
-    all_reconstructed_points = pickle.load(open(reconstructed_points_file, 'rb'))
-    keypoints, bones, symmetry = fileio.load_skeleton_SLEAP(skeleton_input_path, symmetry=True)
+    points_soup = pickle.load(open(points_soup_file, 'rb'))
+    keypoints, bones, symmetry = fileio.load_skeleton_SLEAP(skeleton_input_file, symmetry=True)
 
     # Get Anatomical stats
     bootstrapper = StatsBootstrapper(
@@ -1432,7 +1740,7 @@ if __name__ == '__main__':
         bones_list=bones,
         symmetry_map=symmetry,
         prior_stats_path=prior_stats_file,
-        bootstrap_data=all_reconstructed_points
+        bootstrap_data=points_soup
     )
     bone_stats = bootstrapper.get_initial_stats()
 
@@ -1442,11 +1750,11 @@ if __name__ == '__main__':
     tracker = MultiObjectTracker(assembler=assembler)
 
     # Run tracking pipeline
-    reconstructed_data_map = {item['frame_idx']: item for item in all_reconstructed_points}
+    reconstructed_data_map = {item['frame_idx']: item for item in points_soup}
     all_frames = sorted(reconstructed_data_map.keys())
     min_frame, max_frame = all_frames[0], all_frames[-1]
 
-    tracked_skeletons = []
+    all_tracklets = []
 
     with alive_bar(title='Tracking Skeletons...', length=20, total=(max_frame - min_frame + 1), force_tty=True) as bar:
         for frame_idx in range(min_frame, max_frame + 1):
@@ -1482,17 +1790,15 @@ if __name__ == '__main__':
 
                 frame_skeletons.append(skel_dict)
 
-            tracked_skeletons.append({"frame_idx": frame_idx, "skeletons": frame_skeletons})
+            all_tracklets.append({"frame_idx": frame_idx, "skeletons": frame_skeletons})
 
             bar()
 
     print("Tracking complete.")
 
-
     # Save final results
-
     output_file = 'final_tracklets.pkl'
     with open(output_file, 'wb') as f:
-        pickle.dump(tracked_skeletons, f)
+        pickle.dump(all_tracklets, f)
 
     print(f"Results saved to '{output_file}'")

@@ -24,12 +24,12 @@ def draw_skeletons(frame_data: dict, bones: list, ax: plt.Axes):
             if kp1_name in keypoints and kp2_name in keypoints:
                 p1 = keypoints[kp1_name]
                 p2 = keypoints[kp2_name]
-                line, = ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]], color=color, alpha=0.8, lw=2)
+                line, = ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]], color=color, alpha=1.0, lw=2)
                 artists.append(line)
 
         # keypoints
         points_arr = np.array(list(keypoints.values()))
-        scatter = ax.scatter(points_arr[:, 0], points_arr[:, 1], points_arr[:, 2], c=[color], s=10, alpha=0.8)
+        scatter = ax.scatter(points_arr[:, 0], points_arr[:, 1], points_arr[:, 2], c=[color], s=10, alpha=1.0)
         artists.append(scatter)
 
         # track ID
@@ -42,7 +42,7 @@ def draw_skeletons(frame_data: dict, bones: list, ax: plt.Axes):
     return artists
 
 
-def run_viewer(all_tracked_skeletons, bones, volume_bounds):
+def run_viewer(all_tracked_skeletons, bones, volume_bounds, floor_z=None):
 
     try:
         plt.rcParams['keymap.forward'].remove('right')
@@ -69,8 +69,16 @@ def run_viewer(all_tracked_skeletons, bones, volume_bounds):
     x_range = abs(ax.get_xlim()[1] - ax.get_xlim()[0])
     y_range = abs(ax.get_ylim()[1] - ax.get_ylim()[0])
     z_range = abs(ax.get_zlim()[1] - ax.get_zlim()[0])
+
     ax.set_box_aspect([x_range, y_range, z_range])
     ax.view_init(elev=20., azim=-70)
+
+    if floor_z is not None:
+        # Plot floor
+        xx, yy = np.meshgrid(np.linspace(*volume_bounds['x'], 10),
+                             np.linspace(*volume_bounds['y'], 10))
+        zz = np.full_like(xx, floor_z)
+        ax.plot_surface(xx, yy, zz, alpha=0.2, color='white')
 
     # Slider and event handling
     frame_slider = Slider(ax=slider_ax, label='Frame', valmin=0, valmax=num_frames - 1, valinit=0, valstep=1)
@@ -119,6 +127,16 @@ _, bones = fileio.load_skeleton_SLEAP(skeleton_input_path, indices=False)
 volume_bounds = {'x': (-10.5, 13.0), 'y': (-21.0, 11.0), 'z': (180.0, 201.0)}
 
 with open('final_tracklets.pkl', 'rb') as f:
-    all_tracked_skeletons = pickle.load(f)
+    tracked_skeletons = pickle.load(f)
 
-run_viewer(all_tracked_skeletons, bones, volume_bounds)
+# all_Zs = []
+# for frame in tracked_skeletons:
+#     for skel in frame['skeletons']:
+#         max_z = np.max(np.stack(list(skel['keypoints'].values()), axis=1), axis=1)[2]
+#         all_Zs.append(float(max_z))
+#
+# hist, bin_edges = np.histogram(all_Zs, bins=1000)
+# peak_bin_index = np.argmax(hist)
+# floor_z = 0.5 * (bin_edges[peak_bin_index] + bin_edges[peak_bin_index + 1])
+
+run_viewer(tracked_skeletons, bones, volume_bounds, floor_z=None)
