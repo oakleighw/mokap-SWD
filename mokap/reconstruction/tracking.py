@@ -5,7 +5,6 @@ import logging
 from dataclasses import dataclass, field
 from typing import Tuple, Union, Optional,  Dict, List, FrozenSet
 from collections import defaultdict
-from itertools import combinations
 from pathlib import Path
 import pandas as pd
 import networkx as nx
@@ -117,9 +116,10 @@ class AssembledSkeleton:
 class CandidateSkeleton:
     """ Assembler's internal representation for a potential skeleton during the assembly process """
     nodes: FrozenSet[PointNode]  # a frozenset of (kp_name, point_index) tuples
-    score: float
     scale: float
-    original_score: float
+    anatomical_score: float
+    competition_score: float
+
 
 
 
@@ -133,7 +133,7 @@ CONFIG = {
     "BOOTSTRAP_MAX_BONE_LEN": 4.0,          # Max bone length for the simple greedy assembler used in bootstrapping
 
     # --- Anatomy Learner parameters ---
-    "LEARNER_MIN_SAMPLES_FOR_UPDATE": 100,  # How many new high-quality skeleton measurements before re-calculating anatomy stats
+    "LEARNER_MIN_SAMPLES_FOR_UPDATE": 30,   # How many new high-quality skeleton measurements before re-calculating anatomy stats
     "LEARNER_MIN_SCORE_FOR_LEARNING": 5.0,  # Minimum score of a tracked skeleton to be used for learning
     "LEARNER_MIN_REF_BONE_LEN": 1.0,        # Min plausible length of reference bone for learning
     "LEARNER_MAX_REF_BONE_LEN": 15.0,       # Max plausible length of reference bone for learning
@@ -662,7 +662,7 @@ class Tracklet:
         self.health = 1.0  # Running confidence metric (1.0 = high confidence)
         self.anatomical_integrity = initial_skeleton.score  # Exponential Moving Average of the skeleton score
 
-        self.score_ema_alpha = CONFIG['TRACKER_ANATOMICAL_SCORE_ALPHA']
+        self.anatomical_acore_alpha = CONFIG['TRACKER_ANATOMICAL_SCORE_ALPHA']
         self.inferred_health_penalty = CONFIG['TRACKER_INFERRED_HEALTH_PENALTY']
         self.health_decay_rate = CONFIG['TRACKER_HEALTH_DECAY_RATE']
 
@@ -772,8 +772,8 @@ class Tracklet:
 
         # Update health and score metrics after a successful KF update
 
-        # Update the smoothed score (EMA)
-        self.anatomical_integrity = self.score_ema_alpha * skeleton.score + (1 - self.score_ema_alpha) * self.anatomical_integrity
+        # Update the smoothed anatomical score
+        self.anatomical_integrity = self.anatomical_acore_alpha * skeleton.score + (1 - self.anatomical_acore_alpha) * self.anatomical_integrity
 
         # Update the tracklet's health
         if inferred:
@@ -904,10 +904,9 @@ class SkeletonAssembler:
     ) -> Tuple[List[CandidateSkeleton], Dict[PointNode, PointObservation]]:
         """
         Generates all plausible skeleton candidates from all valid anchor seeds
-
-        It does *not* consume points, allowing for redundant candidates which are then resolved
-        globally by `solve_conflicts`
+        It purposefully allows for redundant candidates which are then resolved globally by 'solve_conflicts'
         """
+
         if 'points' not in reconstructed_data or not reconstructed_data['points']:
             return [], {}
 
@@ -944,7 +943,7 @@ class SkeletonAssembler:
         # Build conflict graph where nodes are skeletons and edges represent a conflict
         conflict_graph = nx.Graph()
         for i, candidate_skel in enumerate(candidates):
-            weight = max(0, int(candidate_skel.score * 100))
+            weight = max(0, int(candidate_skel.competition_score * 100))
             conflict_graph.add_node(i, weight=weight)
 
         # Precompute centroids and build the KDtree
@@ -1004,7 +1003,7 @@ class SkeletonAssembler:
             AssembledSkeleton(
                 keypoints={node[0]: points_map[node].pos for node in candidates[i].nodes},
                 point_indices={node[0]: node[1] for node in candidates[i].nodes},
-                score=candidates[i].original_score,
+                score=candidates[i].anatomical_score,
                 scale=candidates[i].scale
             )
             for i in winner_indices
@@ -1148,8 +1147,8 @@ class SkeletonAssembler:
 
         return CandidateSkeleton(
             nodes=frozenset(current_nodes),
-            score=final_avg_score * len(current_nodes),
-            original_score=final_avg_score * len(current_nodes),
+            competition_score=final_avg_score * len(current_nodes),
+            anatomical_score=final_avg_score * len(current_nodes),
             scale=self._get_skeleton_scale(current_kps)
         )
 
@@ -1271,7 +1270,7 @@ class MultiObjectTracker:
 
         for i, candidate_skel in enumerate(candidates):
             # The score attribute is the boosted score used for conflict resolution
-            candidate_skel.score += bonuses[i] * CONFIG["TRACKER_CONTINUITY_BONUS"]
+            candidate_skel.competition_score += bonuses[i] * CONFIG["TRACKER_CONTINUITY_BONUS"]
 
         # Conflict resolution
         # Run the conflict solver on the complete (score-boosted) set of candidates
@@ -1447,7 +1446,7 @@ if __name__ == '__main__':
     all_frames = sorted(reconstructed_data_map.keys())
     min_frame, max_frame = all_frames[0], all_frames[-1]
 
-    all_tracklets = []
+    tracked_skeletons = []
 
     with alive_bar(title='Tracking Skeletons...', length=20, total=(max_frame - min_frame + 1), force_tty=True) as bar:
         for frame_idx in range(min_frame, max_frame + 1):
@@ -1483,7 +1482,7 @@ if __name__ == '__main__':
 
                 frame_skeletons.append(skel_dict)
 
-            all_tracklets.append({"frame_idx": frame_idx, "skeletons": frame_skeletons})
+            tracked_skeletons.append({"frame_idx": frame_idx, "skeletons": frame_skeletons})
 
             bar()
 
@@ -1494,6 +1493,6 @@ if __name__ == '__main__':
 
     output_file = 'final_tracklets.pkl'
     with open(output_file, 'wb') as f:
-        pickle.dump(all_tracklets, f)
+        pickle.dump(tracked_skeletons, f)
 
     print(f"Results saved to '{output_file}'")
