@@ -1,28 +1,43 @@
 import logging
-import pickle
+from functools import partial
+from dataclasses import dataclass, field
 from pathlib import Path
+import jax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
-from typing import Optional, Dict, Tuple, List, Callable
+from typing import Optional, Dict, Tuple, List
 import numpy as np
-from itertools import product
 import networkx as nx
 from networkx.algorithms.clique import find_cliques
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse import csr_matrix
 from sklearn.cluster import DBSCAN
-import pandas as pd
-from alive_progress import alive_bar
+import polars as pl
 from mokap.utils import fileio
 from mokap.utils.geometry.fitting import bundle_intersection_AABB
 from mokap.utils.geometry.projective import (
-    undistort_points, back_projection, triangulate_points_from_projections, project_points, project_to_multiple_cameras
+    undistort_points, back_projection, triangulate_points_from_projections, project_points,
+    project_to_multiple_cameras, undistort_multiple
 )
 from mokap.utils.geometry.transforms import (
     extrinsics_matrix, projection_matrix, invert_rtvecs, extmat_to_rtvecs, invert_extrinsics_matrix
 )
 
+
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class ReconstructedPoint:
+    """ A single 3D point from the soup """
+
+    uid: int
+    name: str
+    position: ArrayLike
+    confidence: float
+
+    # List of (camera_index, detection_index_in_that_camera)
+    contributing_views: List[Tuple[int, int]] = field(default_factory=list)
 
 
 class Reconstructor:
@@ -42,20 +57,10 @@ class Reconstructor:
     """
 
     def __init__(self,
-                 camera_parameters: Dict,
-                 volume_bounds: Dict,
-                 config: Optional[Dict] = None
-                 ):
-        """
-        Initializes the Reconstructor
-
-        Args:
-            camera_parameters: A dictionary where keys are camera names and values are dicts
-                               containing 'camera_matrix', 'dist_coeffs', 'rvec', 'tvec'
-            volume_bounds: A dictionary defining the 3D volume of interest,
-                           e.g., {'x': (min, max), 'y': (min, max), 'z': (min, max)}.
-            config: An optional dictionary of tuning parameters
-        """
+            camera_parameters:  Dict,
+            volume_bounds:      Dict,
+            config:             Optional[Dict] = None
+        ):
         self.camera_names = sorted(camera_parameters.keys())
         self.num_cams = len(self.camera_names)
         self.volume_bounds = volume_bounds
@@ -96,16 +101,24 @@ class Reconstructor:
         self.aabb_min = jnp.array([val[0] for val in self.volume_bounds.values()])
         self.aabb_max = jnp.array([val[1] for val in self.volume_bounds.values()])
 
+        # Templates to avoid instanciating thousands of new jax arrays
+        # for a single missing detection in one camera
+        self._single_empty = (jnp.empty((0, 2), dtype=jnp.float32), np.array([], dtype=np.float32))
+        # for a keypoint that is completely missing in a frame
+        self._per_cam_empty = [self._single_empty] * self.num_cams
+        # for a non-detected keypoint in 3D
+        self._point3d_empty = jnp.empty((0, 3), dtype=jnp.float32)
+
     def reconstruct_frame(self,
-                          df_frame: pd.DataFrame,
-                          keypoint_names: List[str]
-                          ) -> Dict[str, Tuple[jnp.ndarray, np.ndarray]]:
+            df_frame:           pl.DataFrame,
+            keypoint_names:     List[str]
+        ) -> Dict[str, Tuple[jnp.ndarray, np.ndarray]]:
         """
         Reconstructs all keypoints for a single frame
 
         Args:
-            df_frame: A pandas DataFrame containing 2D detections for a single frame
-            keypoint_names: A list of keypoint names (columns in the DataFrame) to reconstruct
+            df_frame: A polars dataframe containing 2D detections for a single frame
+            keypoint_names: A list of keypoint names to reconstruct
 
         Returns:
             A dictionary where keys are keypoint names and values are a tuple of:
@@ -144,18 +157,9 @@ class Reconstructor:
                               ) -> Tuple[ArrayLike, np.ndarray]:
         """ Orchestrates the full reconstruction pipeline for a single keypoint """
 
-        cost_matrix_cache = {}
-
-        def get_cached_cost_mat(i: int, j: int) -> jnp.ndarray:
-            # ensure i < j for cache consistency
-            if i > j: i, j = j, i
-            if (i, j) not in cost_matrix_cache:
-                cost_matrix_cache[(i, j)] = self._compute_cost_matrix(points_per_cam[i], points_per_cam[j], i, j)
-            return cost_matrix_cache[(i, j)]
-
         # Step 1: Generate all plausible 3D point hypotheses
         all_pts, all_groups, view_counts, summed_confs, all_errors = self._generate_hypotheses(
-            points_per_cam, confs_per_cam, get_cached_cost_mat
+            points_per_cam, confs_per_cam
         )
 
         if all_pts.shape[0] == 0:
@@ -169,39 +173,45 @@ class Reconstructor:
         return jnp.array(final_pts), np.array(final_confs)
 
     def _generate_hypotheses(self,
-                             points_per_cam: List[jnp.ndarray],
-                             confs_per_cam: List[np.ndarray],
-                             _cost_mat_getter: Callable[[int, int], jnp.ndarray]
-                             ) -> Tuple[jnp.ndarray, list, list, list, list]:
+            points_per_cam:     List[jnp.ndarray],
+            confs_per_cam:      List[np.ndarray],
+        ) -> Tuple[jnp.ndarray, list, list, list, list]:
         """
         First pass of reconstruction: generates all plausible 3D points (hypotheses)
         from the 2D detections without resolving conflicts
         """
 
-        groups = self._group_points(points_per_cam, _cost_mat_getter)
+        groups = self._group_points(points_per_cam)
         M = len(groups)
         if M == 0:
-            return jnp.empty((0, 3)), [], [], [], []
+            return self._point3d_empty, [], [], [], []
 
-        # Triangulate all groups
+        # Create flat index arrays for all detections across all groups
+        group_indices = np.array([m for m, g in enumerate(groups) for _ in g])
+        cam_indices_src = np.array([cam_idx for g in groups for cam_idx, _ in g])
+        det_indices_src = np.array([det_idx for g in groups for _, det_idx in g])
 
+        # Gather the data in a flat format
+        # TODO: a better structure here would be padded numpy arrays, but this requires knowing the maximum number
+        #  of instances of any keypoint in the full video.
+        flat_points = np.vstack([points_per_cam[c][d] for c, d in zip(cam_indices_src, det_indices_src)])
+        flat_confs = np.array([confs_per_cam[c][d] for c, d in zip(cam_indices_src, det_indices_src)])
+
+        # destination indices to scatter the data to
+        dest_indices = (cam_indices_src, group_indices)
+
+        # Initialize target arrays and scatter the data
         matched_uvs = np.full((self.num_cams, M, 2), np.nan, dtype=np.float32)
-        # Create a weights matrix for triangulation
         triangulation_weights = np.zeros((self.num_cams, M), dtype=np.float32)
 
-        for m, group in enumerate(groups):
-            for cam_idx, det_idx in group:
-                matched_uvs[cam_idx, m] = points_per_cam[cam_idx][det_idx]
-                # Populate the weights matrix with the 2D confidence
-                triangulation_weights[cam_idx, m] = confs_per_cam[cam_idx][det_idx]
+        matched_uvs[dest_indices] = flat_points
+        triangulation_weights[dest_indices] = flat_confs
 
-        undistorted_matched_uvs = jnp.full_like(matched_uvs, jnp.nan)
-        for c in range(self.num_cams):
-            uvs_c = matched_uvs[c, :, :]
-            valid_mask = ~np.isnan(uvs_c[:, 0])
-            if np.any(valid_mask):
-                ud_chunk = undistort_points(jnp.array(uvs_c[valid_mask]), self.all_K[c], self.all_D[c])
-                undistorted_matched_uvs = undistorted_matched_uvs.at[c, valid_mask, :].set(ud_chunk)
+        undistorted_matched_uvs = undistort_multiple(
+            matched_uvs,
+            self.all_K,
+            self.all_D
+        )
 
         points3d = triangulate_points_from_projections(
             points2d=undistorted_matched_uvs,
@@ -245,30 +255,33 @@ class Reconstructor:
         # Check against reprojection threshold
         repro_ok_mask = reprojection_errors < self.config['repro_thresh']
 
+        # Calculate view counts and summed confs for all hypotheses
+        all_view_counts = jnp.sum(original_visibility_mask, axis=0)
+        all_summed_confs = jnp.sum(jnp.where(original_visibility_mask, triangulation_weights, 0), axis=0)
+
         # Combine all masks to get the final list of valid hypotheses
         final_valid_mask = valid_triangulation_mask & repro_ok_mask & has_views_mask
 
         # Apply the final mask to get the outputs
-        valid_indices = np.array(jnp.where(final_valid_mask)[0])
-        valid_groups = [groups[i] for i in valid_indices]
+        valid_indices = jnp.where(final_valid_mask)[0]  # Keep as a JAX array for now
+        valid_groups = [groups[i] for i in valid_indices.tolist()]
 
-        # Calculate view count and summed confidence for each valid hypothesis
-        view_counts = [len(g) for g in valid_groups]
-        summed_confs = [
-            sum(confs_per_cam[cam_idx][det_idx] for cam_idx, det_idx in g)
-            for g in valid_groups
-        ]
-        errors = list(np.array(reprojection_errors)[valid_indices])
+        # Index into the pre-computed arrays to return results
+        view_counts = all_view_counts[valid_indices].tolist()
+        summed_confs = all_summed_confs[valid_indices].tolist()
+        errors = reprojection_errors[valid_indices].tolist()
+
+        # TODO: Ideally, jitting this whole thing and always returning padded arrays would be much faster...
 
         return points3d[valid_indices], valid_groups, view_counts, summed_confs, errors
 
     def _filter_hypotheses(self,
-                           points3d: np.ndarray,
-                           view_counts: List[int],
-                           summed_confs: List[float],
-                           errors: List[float],
-                           groups: List[List[Tuple[int, int]]]
-                           ) -> Tuple[np.ndarray, List, List]:
+            points3d:       np.ndarray,
+            view_counts:    List[int],
+            summed_confs:   List[float],
+            errors:         List[float],
+            groups:         List[List[Tuple[int, int]]]
+        ) -> Tuple[np.ndarray, List, List]:
         """
         Second pass: Filters and resolves 3D point candidates using a multi-stage,
         evidence-based process (MWIS -> Safe geometric merging)
@@ -391,31 +404,61 @@ class Reconstructor:
     # --------------------------------------------------------------------------
 
     def _prepare_data(self,
-                      df_frame: pd.DataFrame,
-                      keypoint_names: List[str]
-                      ) -> Dict[str, List[Tuple[jnp.ndarray, np.ndarray]]]:
-        """ Extracts and formats 2D detections from a DataFrame for a single frame """
-        # TODO: The structure of the df might change anyway so this ultimately won't be needed
+            df_frame:           pl.DataFrame,
+            keypoint_names:     List[str]
+        ) -> Dict[str, List[Tuple[jnp.ndarray, np.ndarray]]]:
+        """ Extracts and formats 2D detections from a flat Polars DataFrame for a single frame """
 
         detections_by_keypoint = {}
+
+        # input df_frame is already filtered for a single frame, but we can group by keypoint
+        # to process all data for a given keypoint at once
+        grouped_by_kp = df_frame.group_by('keypoint')
+
+        kp_dfs = {kp_name[0]: group_df for kp_name, group_df in grouped_by_kp}  # group_by returns keys as tuples!!!
         for kp_name in keypoint_names:
             dets_per_cam_list = []
+
+            # check if this keypoint had any detections in this frame
+            if kp_name not in kp_dfs:
+                # if not, fill with empty arrays for all cameras
+                detections_by_keypoint[kp_name] = self._per_cam_empty
+                continue
+
+            # if the keypoint exists get its data
+            df_kp = kp_dfs[kp_name]
+            cam_data = (
+                df_kp.group_by("camera")
+                .agg(
+                    pl.col("x"),
+                    pl.col("y"),
+                    pl.col("score"),
+                )
+                .to_dict(as_series=False)
+            )
+
+            # create a mapping for fast lookup
+            cam_data_map = {cam: i for i, cam in enumerate(cam_data["camera"])}
+
             for cam_name in self.camera_names:
-                try:
-                    df_cam = df_frame.loc[cam_name]
-                    # Ensure the keypoint exists as a column level
-                    if kp_name in df_cam.columns.get_level_values(0):
-                        valid_detections = df_cam[kp_name].dropna()
-                        points = jnp.array(valid_detections[['x', 'y']].values, dtype=jnp.float32)
-                        confs = np.array(valid_detections['score'].values, dtype=np.float32)
-                        dets_per_cam_list.append((points, confs))
-                    else:
-                        dets_per_cam_list.append((jnp.empty((0, 2), dtype=jnp.float32), np.array([])))
-                except (KeyError, AttributeError):
-                    dets_per_cam_list.append((jnp.empty((0, 2), dtype=jnp.float32), np.array([])))
+                if cam_name in cam_data_map:
+                    idx = cam_data_map[cam_name]
+
+                    points_list = np.column_stack([cam_data['x'][idx], cam_data['y'][idx]])
+                    confs_list = cam_data['score'][idx]
+                    points = jnp.array(points_list, dtype=jnp.float32)
+                    confs = np.array(confs_list, dtype=np.float32)
+
+                    dets_per_cam_list.append((points, confs))
+                else:
+                    # this camera had no detections for this keypoint in this frame
+                    dets_per_cam_list.append(self._single_empty)
+
             detections_by_keypoint[kp_name] = dets_per_cam_list
+
         return detections_by_keypoint
 
+    @partial(jax.jit, static_argnums=(0, 3, 4))
     def _compute_cost_matrix(self,
                              dets_i: jnp.ndarray,
                              dets_j: jnp.ndarray,
@@ -427,8 +470,6 @@ class Reconstructor:
         """
 
         Ni, Nj = dets_i.shape[0], dets_j.shape[0]
-        if Ni == 0 or Nj == 0:
-            return jnp.empty((Ni, Nj), dtype=jnp.float32)
 
         # Get camera parameters
         K_i, D_i, E_i = self.all_K[i], self.all_D[i], self.all_E[i]
@@ -490,12 +531,8 @@ class Reconstructor:
 
         return final_costs
 
-    def _group_points(self,
-                      dets_per_cam: list,
-                      _cost_mat_getter: Callable[[int, int], jnp.ndarray]
-                      ) -> list:
+    def _group_points(self, dets_per_cam: list) -> list:
         """ Groups 2D detections using a graph-based approach with maximal cliques """
-
         if sum(d.shape[0] for d in dets_per_cam) < self.config['min_views']:
             return []
 
@@ -506,7 +543,9 @@ class Reconstructor:
         source_indices, target_indices = [], []
         for i in range(self.num_cams):
             for j in range(i + 1, self.num_cams):
-                cost_mat = _cost_mat_getter(i, j)
+                if num_dets_per_cam[i] == 0 or num_dets_per_cam[j] == 0:
+                    continue
+                cost_mat = self._compute_cost_matrix(dets_per_cam[i], dets_per_cam[j], i, j)
                 if cost_mat.size == 0: continue
                 match_rows, match_cols = np.where(np.array(cost_mat) < self.config['T_epi'])
                 source_indices.extend((offsets[i] + match_rows).tolist())
@@ -522,38 +561,53 @@ class Reconstructor:
         all_final_groups = []
         processed_groups = set()
 
+        def unflatten(idx):
+            cam_idx = np.searchsorted(offsets, idx, side='right') - 1
+            return int(cam_idx), int(idx - offsets[cam_idx])
+
         for i in range(n_components):
             component_indices = np.where(labels == i)[0]
             if len(component_indices) < self.config['min_views']: continue
 
-            def unflatten(idx):
-                cam_idx = np.searchsorted(offsets, idx, side='right') - 1
-                return int(cam_idx), int(idx - offsets[cam_idx])
-
             subgraph_adj = adj_matrix[component_indices, :][:, component_indices]
             component_graph = nx.from_scipy_sparse_array(subgraph_adj)
-
             cliques = find_cliques(component_graph)
 
             for clique_local_indices in cliques:
-                clique_global_indices = [component_indices[k] for k in clique_local_indices]
-                if len(clique_global_indices) < self.config['min_views']: continue
+                if len(clique_local_indices) < self.config['min_views']: continue
 
-                dets_by_cam_in_clique = {}
-                for node_idx in clique_global_indices:
-                    cam_idx, det_idx = unflatten(node_idx)
-                    if cam_idx not in dets_by_cam_in_clique:
-                        dets_by_cam_in_clique[cam_idx] = []
-                    dets_by_cam_in_clique[cam_idx].append((cam_idx, det_idx))
+                # Build a small "conflict graph" for this clique
+                # Nodes are the original (cam_idx, det_idx) tuples
+                # An edge connects two detections if they are from the same camera
+                clique_nodes = [unflatten(component_indices[k]) for k in clique_local_indices]
 
-                if len(dets_by_cam_in_clique) < self.config['min_views']: continue
+                # Check that we have enough distinct cameras in this clique
+                if len(set(cam_idx for cam_idx, det_idx in clique_nodes)) < self.config['min_views']:
+                    continue
 
-                for group_tuple in product(*dets_by_cam_in_clique.values()):
-                    group = sorted(list(group_tuple))
+                conflict_graph = nx.Graph()
+                for n1_idx, node1 in enumerate(clique_nodes):
+                    conflict_graph.add_node(node1)
+
+                    for n2_idx in range(n1_idx + 1, len(clique_nodes)):
+                        node2 = clique_nodes[n2_idx]
+                        # If camera index is the same, they are in conflict
+                        if node1[0] == node2[0]:
+                            conflict_graph.add_edge(node1, node2)
+
+                # Find all maximal independent sets of the conflict graph
+                # An independent set has no edges, meaning it contains at most one detection per camera.
+                complement_g = nx.complement(conflict_graph)
+
+                for group in find_cliques(complement_g):
+
                     if len(group) >= self.config['min_views']:
-                        frozen_group = frozenset(group)
+                        # the clique in the complement graph is a valid group
+                        sorted_group = sorted(group)
+                        frozen_group = frozenset(sorted_group)
+
                         if frozen_group not in processed_groups:
-                            all_final_groups.append(group)
+                            all_final_groups.append(sorted_group)
                             processed_groups.add(frozen_group)
 
         return all_final_groups
@@ -617,8 +671,9 @@ if __name__ == '__main__':
     prefix = '240905-1616'
     session = 22
 
-    df = fileio.load_session(folder / prefix / 'inputs' / 'tracking', session=session)
-    df = df.reorder_levels(['camera', 'track', 'frame']).sort_index()
+    df = fileio.load_session(folder / prefix / 'inputs' / 'tracking', session=session, use_polars=True)
+    grouped_by_frame = df.group_by('frame', maintain_order=True)
+    nb_frames = df.select(pl.col('frame').n_unique()).item()
 
     cal_data = fileio.read_parameters(folder / prefix / 'calibration')
     keypoints, bones = fileio.load_skeleton_SLEAP(folder / prefix / 'inputs' / 'tracking', indices=False)
@@ -638,43 +693,17 @@ if __name__ == '__main__':
         config=reconstructor_config
     )
 
-    # # Run on the specific debug frame
-    # DEBUG_FRAME = 926
-    # df_frame = df.loc[pd.IndexSlice[:, :, DEBUG_FRAME], :]
-    #
-    # reconstructed_3d = reconstructor.reconstruct_frame(
-    #     df_frame=df_frame,
-    #     keypoint_names=keypoints
-    # )
-    #
-    # print("\nFinal Reconstruction Results")
-    # total_points = sum(points.shape[0] for points, confs in reconstructed_3d.values())
-    # for name, (points, confs) in reconstructed_3d.items():
-    #     if points.shape[0] > 0:
-    #         print(f"  {name}: {points.shape[0]} points reconstructed")
+    # Run on the specific debug frame
+    DEBUG_FRAME = 926
+    df_frame = df.filter(pl.col('frame') == DEBUG_FRAME)
 
-    all_reconstructed_points = []
-    all_frames = df.index.get_level_values('frame').unique()
+    reconstructed_3d = reconstructor.reconstruct_frame(
+        df_frame=df_frame,
+        keypoint_names=keypoints
+    )
 
-    with alive_bar(title='Reconstruction...', total=len(all_frames), length=20, force_tty=True) as bar:
-        for frame_idx in all_frames:
-            try:
-                df_frame = df.loc[pd.IndexSlice[:, :, frame_idx], :]
-            except KeyError:
-                continue
-
-            # Reconstruct all points for the frame
-            reconstructed_3d = reconstructor.reconstruct_frame(
-                df_frame=df_frame,
-                keypoint_names=keypoints
-            )
-
-            frame_data = {
-                "frame_idx": frame_idx,
-                "points": reconstructed_3d
-            }
-            all_reconstructed_points.append(frame_data)
-            bar()
-
-    out_file = folder / prefix / 'outputs' / 'tracking' / f'points_soup_session{session}.pkl'
-    pickle.dump(all_reconstructed_points, open(out_file, 'wb'))
+    print("\nFinal Reconstruction Results")
+    total_points = sum(points.shape[0] for points, confs in reconstructed_3d.values())
+    for name, (points, confs) in reconstructed_3d.items():
+        if points.shape[0] > 0:
+            print(f"  {name}: {points.shape[0]} points reconstructed")

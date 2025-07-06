@@ -1726,11 +1726,10 @@ if __name__ == '__main__':
     # prior_stats_file = Path().home() / 'Desktop' / 'bone_lengths.csv'
     prior_stats_file = None
 
-    # Data for bootstrapping
-    points_soup_file = f'points_soup_session{session}.pkl'
+    # Load data
+    points_soup_file = folder / prefix / 'outputs' / 'tracking' / f'points_soup_session{session}.pkl'
     skeleton_input_file = folder / prefix / 'inputs' / 'tracking'
 
-    # Load data
     points_soup = pickle.load(open(points_soup_file, 'rb'))
     keypoints, bones, symmetry = fileio.load_skeleton_SLEAP(skeleton_input_file, symmetry=True)
 

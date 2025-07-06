@@ -5,7 +5,7 @@ from typing import Dict, Tuple, List
 import numpy as np
 from itertools import product
 from functools import lru_cache
-import pandas as pd
+import polars as pl
 import cv2
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
@@ -226,16 +226,17 @@ if __name__ == '__main__':
     DEBUG_KEYPOINT = 'neck'
     DEBUG_CAM_I, DEBUG_CAM_J = 0, 3
 
-    df = fileio.load_session(folder / prefix / 'inputs' / 'tracking', session=session)
-    df = df.reorder_levels(['camera', 'track', 'frame']).sort_index()
+    df = fileio.load_session(folder / prefix / 'inputs' / 'tracking', session=session, use_polars=True)
+    grouped_by_frame = df.group_by('frame', maintain_order=True)
+
     cal_data = fileio.read_parameters(folder / prefix / 'calibration')
     keypoints, bones = fileio.load_skeleton_SLEAP(folder / prefix / 'inputs' / 'tracking', indices=False)
 
     volume_bounds = {'x': (-10.5, 13.0), 'y': (-21.0, 11.0), 'z': (180.0, 201.0)}
 
-    cameras_names = sorted(df.index.get_level_values('camera').unique())
+    camera_names = df["camera"].unique().sort().to_list()
     videos_paths = list((folder / prefix / 'sources').glob(f'*session{session}.mp4'))
-    images = get_frames(videos_paths, cameras_names, DEBUG_FRAME)
+    images = get_frames(videos_paths, camera_names, DEBUG_FRAME)
 
     reconstructor_config = {
         'repro_thresh': 10.0,
@@ -247,7 +248,8 @@ if __name__ == '__main__':
     reconstructor = Reconstructor(camera_parameters=cal_data, volume_bounds=volume_bounds, config=reconstructor_config)
     viz = ReconstructorVisualizer(reconstructor)
 
-    df_frame = df.loc[pd.IndexSlice[:, :, DEBUG_FRAME], :]
+    df_frame = df.filter(pl.col('frame') == DEBUG_FRAME)
+
     detections_by_keypoint = reconstructor._prepare_data(df_frame, [DEBUG_KEYPOINT])
     dets_per_cam = detections_by_keypoint[DEBUG_KEYPOINT]
     points_per_cam = [d[0] for d in dets_per_cam]
@@ -268,7 +270,7 @@ if __name__ == '__main__':
     viz.plot_epipolar_segments(
         dets_i=dets_per_cam[DEBUG_CAM_I][0],
         dets_j=dets_per_cam[DEBUG_CAM_J][0],
-        img_j=images[cameras_names[DEBUG_CAM_J]],
+        img_j=images[camera_names[DEBUG_CAM_J]],
         cam_idx_i=DEBUG_CAM_I,
         cam_idx_j=DEBUG_CAM_J
     )
@@ -279,14 +281,8 @@ if __name__ == '__main__':
     # ==========================================================================
     print("\n--- LEVEL 3.1: Analyzing Initial Hypotheses (Single-Pass) ---")
 
-    # Get the raw, unfiltered hypotheses by calling the internal generation method
-    @lru_cache(maxsize=None)
-    def get_cost_mat(i, j):
-        return reconstructor._compute_cost_matrix(points_per_cam[i], points_per_cam[j], i, j)
-
-
     raw_pts, raw_groups, raw_view_counts, raw_summed_confs, raw_errors = reconstructor._generate_hypotheses(
-        points_per_cam, confs_per_cam, get_cost_mat
+        points_per_cam, confs_per_cam
     )
     print(f"Found {raw_pts.shape[0]} initial point hypotheses.")
 
@@ -323,7 +319,7 @@ if __name__ == '__main__':
     fig = plt.figure(figsize=(15, 15))
     ax = fig.add_subplot(111, projection='3d')
     ax = plot_cameras_3d(reconstructor.rvecs_c2w, reconstructor.tvecs_c2w, reconstructor.all_K, reconstructor.all_D,
-                         cameras_names=cameras_names,
+                         cameras_names=camera_names,
                          # trust_volume=volume_bounds,
                          ax=ax)
 
