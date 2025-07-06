@@ -1,7 +1,7 @@
 import pickle
 from pathlib import Path
 from joblib import Parallel, delayed
-from mokap.reconstruction.reconstruction import Reconstructor
+from mokap.reconstruction.reconstruction import Reconstructor, SoupPoint
 from mokap.utils import fileio
 
 
@@ -14,17 +14,15 @@ def reconstruct_batch(batch_of_groups, keypoints, camera_parameters, volume_boun
         config=config
     )
 
-    results = []
-    for frame_idx, df_frame in batch_of_groups:
-        reconstructed_3d = reconstructor.reconstruct_frame(
+    soup_batch = {}
+    for ftuple, df_frame in batch_of_groups:
+        reconstructed_points = reconstructor.reconstruct_frame(
             df_frame=df_frame,
             keypoint_names=keypoints
         )
-        results.append({
-            "frame_idx": frame_idx[0],
-            "points": reconstructed_3d
-        })
-    return results
+        soup_batch[ftuple[0]] = reconstructed_points
+
+    return soup_batch
 
 
 if __name__ == '__main__':
@@ -70,12 +68,14 @@ if __name__ == '__main__':
         ) for batch in frame_batches
     )
 
-    # Flatten the list of lists and sort by frame index
-    points_soup = sorted(
-        [item for sublist in results_list for item in sublist],
-        key=lambda x: x['frame_idx']
-    )
+    points_by_frame = {}
+    for batch_dict in results_list:
+        points_by_frame.update(batch_dict)
 
-    out_file = folder / prefix / 'outputs' / 'tracking' / f'points_soup_session{session}.pkl'
-    pickle.dump(points_soup, open(out_file, 'wb'))
+    out_file = folder / prefix / 'outputs' / f'points_soup_session{session}.pkl'
+    out_file.parent.mkdir(parents=True, exist_ok=True)
+
+    with open(out_file, 'wb') as f:
+        pickle.dump(points_by_frame, f)
+
     print(f"Reconstruction complete. Points soup saved to {out_file}")

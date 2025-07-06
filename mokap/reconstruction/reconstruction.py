@@ -1,6 +1,6 @@
 import logging
 from functools import partial
-from dataclasses import dataclass, field
+from dataclasses import dataclass
 from pathlib import Path
 import jax
 import jax.numpy as jnp
@@ -15,29 +15,23 @@ from sklearn.cluster import DBSCAN
 import polars as pl
 from mokap.utils import fileio
 from mokap.utils.geometry.fitting import bundle_intersection_AABB
-from mokap.utils.geometry.projective import (
-    undistort_points, back_projection, triangulate_points_from_projections, project_points,
-    project_to_multiple_cameras, undistort_multiple
-)
-from mokap.utils.geometry.transforms import (
-    extrinsics_matrix, projection_matrix, invert_rtvecs, extmat_to_rtvecs, invert_extrinsics_matrix
-)
+from mokap.utils.geometry.projective import (undistort_points, back_projection, triangulate_points_from_projections,
+                                             project_points, project_to_multiple_cameras, undistort_multiple)
+from mokap.utils.geometry.transforms import (extrinsics_matrix, projection_matrix, invert_rtvecs,
+                                             extmat_to_rtvecs, invert_extrinsics_matrix)
 
 
 logger = logging.getLogger(__name__)
 
 
 @dataclass
-class ReconstructedPoint:
-    """ A single 3D point from the soup """
-
-    uid: int
-    name: str
-    position: ArrayLike
-    confidence: float
-
-    # List of (camera_index, detection_index_in_that_camera)
-    contributing_views: List[Tuple[int, int]] = field(default_factory=list)
+class SoupPoint:
+    """ A single reconstructed 3D point """
+    frame_idx: int          # frame index
+    idx: int                # keypoint's unique index within the frame
+    keypoint_type: str
+    position: ArrayLike     # x, y, z
+    confidence: float       # aggregated confidence from reconstruction
 
 
 class Reconstructor:
@@ -112,7 +106,7 @@ class Reconstructor:
     def reconstruct_frame(self,
             df_frame:           pl.DataFrame,
             keypoint_names:     List[str]
-        ) -> Dict[str, Tuple[jnp.ndarray, np.ndarray]]:
+        ) -> List[SoupPoint]:
         """
         Reconstructs all keypoints for a single frame
 
@@ -121,12 +115,18 @@ class Reconstructor:
             keypoint_names: A list of keypoint names to reconstruct
 
         Returns:
-            A dictionary where keys are keypoint names and values are a tuple of:
-            - (N, 3) JAX array of final 3D points
-            - (N,) NumPy array of confidence scores for each point
+            A list of ReconstructedPoint objects, for all successfully
+            reconstructed 3D points in the frame
         """
 
-        reconstructed_data = {}
+        if df_frame.is_empty():
+            return []
+
+        # all rows in df_frame are for the same frame, so we can extract it once
+        frame_index = df_frame.select(pl.col("frame")).item(0, 0)
+
+        reconstructed_points = []
+        point_id_counter = 0
         detections_by_keypoint = self._prepare_data(df_frame, keypoint_names)
 
         for kp_name, dets_per_cam in detections_by_keypoint.items():
@@ -134,18 +134,29 @@ class Reconstructor:
             points_per_cam = [d[0] for d in dets_per_cam]
             confs_per_cam = [d[1] for d in dets_per_cam]
 
-            logging.debug(f"Reconstructing '{kp_name}'...")
+            logging.debug(f"Reconstructing '{kp_name}' for frame {frame_index}...")
             if sum(d.shape[0] for d in points_per_cam) < self.config['min_views']:
                 logging.debug("  -> Not enough detections to reconstruct")
-                reconstructed_data[kp_name] = (jnp.empty((0, 3)), np.array([]))
                 continue
 
+            # Internal reconstruction still uses high-performance arrays
             final_pts, final_confs = self._reconstruct_keypoint(points_per_cam, confs_per_cam)
 
-            reconstructed_data[kp_name] = (final_pts, final_confs)
-            logging.debug(f"  -> Found {final_pts.shape[0]} instances")
+            logging.debug(f"  -> Found {final_pts.shape[0]} instances of '{kp_name}'")
 
-        return reconstructed_data
+            # Convert the array-based results into ReconstructedPoint objects
+            for i in range(final_pts.shape[0]):
+                point = SoupPoint(
+                    frame_idx=frame_index,
+                    idx=point_id_counter,
+                    keypoint_type=kp_name,
+                    position=np.array(final_pts[i]),
+                    confidence=float(final_confs[i])
+                )
+                reconstructed_points.append(point)
+                point_id_counter += 1
+
+        return reconstructed_points
 
     # --------------------------------------------------------------------------
     # Core reconstruction pipeline
@@ -664,6 +675,7 @@ class Reconstructor:
 
 
 if __name__ == '__main__':
+    from collections import defaultdict
 
     # mini debug script to reconstruct 1 frame
 
@@ -697,13 +709,25 @@ if __name__ == '__main__':
     DEBUG_FRAME = 926
     df_frame = df.filter(pl.col('frame') == DEBUG_FRAME)
 
-    reconstructed_3d = reconstructor.reconstruct_frame(
+    points_list = reconstructor.reconstruct_frame(
         df_frame=df_frame,
         keypoint_names=keypoints
     )
 
-    print("\nFinal Reconstruction Results")
-    total_points = sum(points.shape[0] for points, confs in reconstructed_3d.values())
-    for name, (points, confs) in reconstructed_3d.items():
-        if points.shape[0] > 0:
-            print(f"  {name}: {points.shape[0]} points reconstructed")
+    print(f"Total points reconstructed in frame {DEBUG_FRAME}: {len(points_list)}\n")
+    if points_list:
+
+        points_by_type = defaultdict(list)
+        for pt in points_list:
+            points_by_type[pt.keypoint_type].append(pt)
+
+        for kp_type, points in points_by_type.items():
+            print(f"Keypoint Type: '{kp_type}' ({len(points)} instances)")
+            for point in points:
+                pos_str = f"[{point.position[0]:.2f}, {point.position[1]:.2f}, {point.position[2]:.2f}]"
+                print(
+                    f"  - ID: {point.idx:<4} | "
+                    f"Frame: {point.frame_idx:<5} | "
+                    f"Position: {pos_str:<25} | "
+                    f"Confidence: {point.confidence:.4f}"
+                )
