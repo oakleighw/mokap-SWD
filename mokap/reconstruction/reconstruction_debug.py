@@ -1,22 +1,21 @@
+from collections import defaultdict
 from pathlib import Path
 import jax.numpy as jnp
 from jax.typing import ArrayLike
 from typing import Dict, Tuple, List
 import numpy as np
 from itertools import product
-from functools import lru_cache
 import polars as pl
 import cv2
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.spatial.distance import cdist
-
 from mokap.utils import fileio
 from mokap.utils.geometry.fitting import bundle_intersection_AABB
 from mokap.utils.geometry.projective import undistort_points, back_projection, project_points, project_to_multiple_cameras
 from mokap.utils.geometry.transforms import extrinsics_matrix, extmat_to_rtvecs
 from mokap.utils.visualisation import plot_cameras_3d, plot_points_3d, CUSTOM_COLORS
-from mokap.reconstruction.reconstruction import Reconstructor
+from mokap.reconstruction.reconstruction import Reconstructor, SoupPoint
 
 
 class ReconstructorVisualizer:
@@ -171,22 +170,35 @@ class ReconstructorVisualizer:
         fig.legend(handles, labels, loc='upper right', bbox_to_anchor=(1.0, 0.95))
         plt.show()
 
-    def plot_reconstructed_skeletons(self, reconstructed_data: Dict, bones: List[Tuple[str, str]], ax: Axes3D,
+    def plot_reconstructed_skeletons(self, points_list: List[SoupPoint], bones: List[Tuple[str, str]], ax: Axes3D,
                                      color_map: str = 'tab20', bone_color: str = 'gray', **kwargs):
         """ Plots the full reconstructed skeletons using a super basic greedy nearest-neighbor approach for bones """
+
+        if not points_list:
+            return
+
+        # 1. Pre-process the list of SoupPoint objects into a more usable dictionary
+        #    mapping keypoint names to stacked NumPy arrays of 3D positions.
+        points_by_kp = defaultdict(list)
+        for pt in points_list:
+            points_by_kp[pt.keypoint_type].append(pt.position)
+
+        reconstructed_data = {
+            kp: np.stack(pos_list) for kp, pos_list in points_by_kp.items()
+        }
 
         keypoint_names = list(reconstructed_data.keys())
         colors = plt.get_cmap(color_map, len(keypoint_names))
 
         for i, kp_name in enumerate(keypoint_names):
-            points, _ = reconstructed_data.get(kp_name, (jnp.empty((0, 3)), np.array([])))
+            points = reconstructed_data.get(kp_name, np.empty((0, 3)))
             if points.shape[0] > 0:
                 plot_points_3d(points3d=points, color=colors(i), label=kp_name, ax=ax, **kwargs)
 
         plotted_bone_label = False
         for kp_a, kp_b in bones:
-            pts_a, _ = reconstructed_data.get(kp_a, (None, None))
-            pts_b, _ = reconstructed_data.get(kp_b, (None, None))
+            pts_a = reconstructed_data.get(kp_a)
+            pts_b = reconstructed_data.get(kp_b)
             if pts_a is None or pts_b is None or pts_a.shape[0] == 0 or pts_b.shape[0] == 0: continue
 
             dist_matrix = cdist(pts_a, pts_b)
@@ -198,8 +210,9 @@ class ReconstructorVisualizer:
                 plotted_bone_label = True
 
         handles, labels = ax.get_legend_handles_labels()
-        by_label = dict(zip(labels, handles))
-        ax.legend(by_label.values(), by_label.keys(), loc='upper left')
+        if labels:
+            by_label = dict(zip(labels, handles))
+            ax.legend(by_label.values(), by_label.keys(), loc='upper left')
 
 
 def get_frames(videos_paths, cameras_names, frame: int) -> Dict[str, np.ndarray]:
@@ -311,9 +324,9 @@ if __name__ == '__main__':
     #  LEVEL 4: FINAL RECONSTRUCTION & SKELETON PLOTTING
     # ==========================================================================
     print("\n--- LEVEL 4: Visualizing Final Filtered Reconstruction ---")
-    reconstructed_3d = reconstructor.reconstruct_frame(df_frame=df_frame, keypoint_names=keypoints)
+    points_list = reconstructor.reconstruct_frame(df_frame=df_frame, keypoint_names=keypoints)
 
-    total_points = sum(points.shape[0] for points, confs in reconstructed_3d.values())
+    total_points = len(points_list)
     print(f"Final reconstruction found {total_points} total points across all keypoints.")
 
     fig = plt.figure(figsize=(15, 15))
@@ -323,6 +336,6 @@ if __name__ == '__main__':
                          # trust_volume=volume_bounds,
                          ax=ax)
 
-    viz.plot_reconstructed_skeletons(reconstructed_3d, bones, ax=ax)
+    viz.plot_reconstructed_skeletons(points_list, bones, ax=ax)
     ax.set_title(f"Final Reconstructed Skeletons for Frame {DEBUG_FRAME}")
     plt.show()

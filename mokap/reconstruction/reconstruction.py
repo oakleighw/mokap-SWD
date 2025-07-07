@@ -95,13 +95,12 @@ class Reconstructor:
         self.aabb_min = jnp.array([val[0] for val in self.volume_bounds.values()])
         self.aabb_max = jnp.array([val[1] for val in self.volume_bounds.values()])
 
-        # Templates to avoid instanciating thousands of new jax arrays
-        # for a single missing detection in one camera
-        self._single_empty = (jnp.empty((0, 2), dtype=jnp.float32), np.array([], dtype=np.float32))
-        # for a keypoint that is completely missing in a frame
-        self._per_cam_empty = [self._single_empty] * self.num_cams
-        # for a non-detected keypoint in 3D
-        self._point3d_empty = jnp.empty((0, 3), dtype=jnp.float32)
+        # Empty arrays to avoid instanciating thousands of new ones
+        self._empty_score_np = np.array((0,), dtype=np.float32)
+        self._empty_score_jax = jnp.array((0,), dtype=jnp.float32)
+        self._empty_point2d_jax = jnp.empty((0, 2), dtype=jnp.float32)
+        self._empty_point3d_np = np.empty((0, 3), dtype=np.float32)
+        self._empty_point3d_jax = jnp.empty((0, 3), dtype=jnp.float32)
 
     def reconstruct_frame(self,
             df_frame:           pl.DataFrame,
@@ -126,10 +125,10 @@ class Reconstructor:
         frame_index = df_frame.select(pl.col("frame")).item(0, 0)
 
         reconstructed_points = []
-        point_id_counter = 0
         detections_by_keypoint = self._prepare_data(df_frame, keypoint_names)
 
         for kp_name, dets_per_cam in detections_by_keypoint.items():
+            point_id_counter = 0
 
             points_per_cam = [d[0] for d in dets_per_cam]
             confs_per_cam = [d[1] for d in dets_per_cam]
@@ -139,18 +138,17 @@ class Reconstructor:
                 logging.debug("  -> Not enough detections to reconstruct")
                 continue
 
-            # Internal reconstruction still uses high-performance arrays
             final_pts, final_confs = self._reconstruct_keypoint(points_per_cam, confs_per_cam)
 
             logging.debug(f"  -> Found {final_pts.shape[0]} instances of '{kp_name}'")
 
-            # Convert the array-based results into ReconstructedPoint objects
+            # Convert the array-based results into SoupPoint objects
             for i in range(final_pts.shape[0]):
                 point = SoupPoint(
                     frame_idx=frame_index,
                     idx=point_id_counter,
                     keypoint_type=kp_name,
-                    position=np.array(final_pts[i]),
+                    position=final_pts[i],
                     confidence=float(final_confs[i])
                 )
                 reconstructed_points.append(point)
@@ -163,39 +161,40 @@ class Reconstructor:
     # --------------------------------------------------------------------------
 
     def _reconstruct_keypoint(self,
-                              points_per_cam: List[jnp.ndarray],
-                              confs_per_cam: List[np.ndarray]
-                              ) -> Tuple[ArrayLike, np.ndarray]:
+            points_per_cam: List[jnp.ndarray],
+            confs_per_cam:  List[jnp.ndarray]
+        ) -> Tuple[np.ndarray, np.ndarray]:
         """ Orchestrates the full reconstruction pipeline for a single keypoint """
 
         # Step 1: Generate all plausible 3D point hypotheses
-        all_pts, all_groups, view_counts, summed_confs, all_errors = self._generate_hypotheses(
+        all_pts_jax, all_groups, view_counts, summed_confs, all_errors = self._generate_hypotheses(
             points_per_cam, confs_per_cam
         )
 
-        if all_pts.shape[0] == 0:
-            return jnp.empty((0, 3)), np.array([])
+        if all_pts_jax.shape[0] == 0:
+            return self._empty_point3d_np, self._empty_score_np
 
         # Step 2: Filter hypotheses to resolve conflicts and merge redundancies
         final_pts, _, final_confs = self._filter_hypotheses(
-            all_pts, view_counts, summed_confs, all_errors, all_groups
+            all_pts_jax, view_counts, summed_confs, all_errors, all_groups
         )
 
-        return jnp.array(final_pts), np.array(final_confs)
+        return final_pts, final_confs
 
     def _generate_hypotheses(self,
             points_per_cam:     List[jnp.ndarray],
-            confs_per_cam:      List[np.ndarray],
-        ) -> Tuple[jnp.ndarray, list, list, list, list]:
+            confs_per_cam:      List[jnp.ndarray],
+        ) -> Tuple[jnp.ndarray, List[List[Tuple[int, int]]], jnp.ndarray, jnp.ndarray, jnp.ndarray]:
         """
         First pass of reconstruction: generates all plausible 3D points (hypotheses)
         from the 2D detections without resolving conflicts
         """
 
         groups = self._group_points(points_per_cam)
+
         M = len(groups)
         if M == 0:
-            return self._point3d_empty, [], [], [], []
+            return self._empty_point3d_jax, [], self._empty_score_jax, self._empty_score_jax, self._empty_score_jax
 
         # Create flat index arrays for all detections across all groups
         group_indices = np.array([m for m, g in enumerate(groups) for _ in g])
@@ -205,18 +204,14 @@ class Reconstructor:
         # Gather the data in a flat format
         # TODO: a better structure here would be padded numpy arrays, but this requires knowing the maximum number
         #  of instances of any keypoint in the full video.
-        flat_points = np.vstack([points_per_cam[c][d] for c, d in zip(cam_indices_src, det_indices_src)])
-        flat_confs = np.array([confs_per_cam[c][d] for c, d in zip(cam_indices_src, det_indices_src)])
+        flat_points_list = [points_per_cam[c][d] for c, d in zip(cam_indices_src, det_indices_src)]
+        flat_confs_list = [confs_per_cam[c][d] for c, d in zip(cam_indices_src, det_indices_src)]
+        flat_points = jnp.array(flat_points_list)
+        flat_confs = jnp.array(flat_confs_list)
 
-        # destination indices to scatter the data to
         dest_indices = (cam_indices_src, group_indices)
-
-        # Initialize target arrays and scatter the data
-        matched_uvs = np.full((self.num_cams, M, 2), np.nan, dtype=np.float32)
-        triangulation_weights = np.zeros((self.num_cams, M), dtype=np.float32)
-
-        matched_uvs[dest_indices] = flat_points
-        triangulation_weights[dest_indices] = flat_confs
+        matched_uvs = jnp.full((self.num_cams, M, 2), jnp.nan, dtype=jnp.float32).at[dest_indices].set(flat_points)
+        triangulation_weights = jnp.zeros((self.num_cams, M), dtype=jnp.float32).at[dest_indices].set(flat_confs)
 
         undistorted_matched_uvs = undistort_multiple(
             matched_uvs,
@@ -227,7 +222,7 @@ class Reconstructor:
         points3d = triangulate_points_from_projections(
             points2d=undistorted_matched_uvs,
             P_mats=self.all_P,
-            weights=jnp.array(triangulation_weights)
+            weights=triangulation_weights
         )
 
         # Check for valid triangulation points (not nans)
@@ -261,55 +256,54 @@ class Reconstructor:
 
         # Add a mask to prevent points with 0 valid views from passing
         has_views_mask = num_views > 0
-        reprojection_errors = sum_of_errors / jnp.maximum(num_views, 1)
+        reproj_errors = sum_of_errors / jnp.maximum(num_views, 1)
 
         # Check against reprojection threshold
-        repro_ok_mask = reprojection_errors < self.config['repro_thresh']
+        repro_ok_mask = reproj_errors < self.config['repro_thresh']
 
         # Calculate view counts and summed confs for all hypotheses
-        all_view_counts = jnp.sum(original_visibility_mask, axis=0)
-        all_summed_confs = jnp.sum(jnp.where(original_visibility_mask, triangulation_weights, 0), axis=0)
+        view_counts = jnp.sum(original_visibility_mask, axis=0)
+        summed_confs = jnp.sum(jnp.where(original_visibility_mask, triangulation_weights, 0), axis=0)
 
         # Combine all masks to get the final list of valid hypotheses
         final_valid_mask = valid_triangulation_mask & repro_ok_mask & has_views_mask
 
         # Apply the final mask to get the outputs
-        valid_indices = jnp.where(final_valid_mask)[0]  # Keep as a JAX array for now
-        valid_groups = [groups[i] for i in valid_indices.tolist()]
+        valid_indices = jnp.where(final_valid_mask)[0]
+        if valid_indices.shape[0] == 0:
+            return self._empty_point3d_jax, [], self._empty_score_jax, self._empty_score_jax, self._empty_score_jax
 
-        # Index into the pre-computed arrays to return results
-        view_counts = all_view_counts[valid_indices].tolist()
-        summed_confs = all_summed_confs[valid_indices].tolist()
-        errors = reprojection_errors[valid_indices].tolist()
+        # Groups remain a list of lists because they are ragged
+        valid_groups = [groups[i] for i in valid_indices.tolist()]
 
         # TODO: Ideally, jitting this whole thing and always returning padded arrays would be much faster...
 
-        return points3d[valid_indices], valid_groups, view_counts, summed_confs, errors
+        return (points3d[valid_indices], valid_groups, view_counts[valid_indices],
+                summed_confs[valid_indices], reproj_errors[valid_indices])
 
     def _filter_hypotheses(self,
-            points3d:       np.ndarray,
-            view_counts:    List[int],
-            summed_confs:   List[float],
-            errors:         List[float],
+            points3d:       jnp.ndarray,
+            view_counts:    jnp.ndarray,
+            summed_confs:   jnp.ndarray,
+            errors:         jnp.ndarray,
             groups:         List[List[Tuple[int, int]]]
-        ) -> Tuple[np.ndarray, List, List]:
+        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """
         Second pass: Filters and resolves 3D point candidates using a multi-stage,
         evidence-based process (MWIS -> Safe geometric merging)
         """
+
         num_points = points3d.shape[0]
         if num_points == 0:
-            return np.empty((0, 3)), [], []
-
-        cfg = self.config
+            return self._empty_point3d_np, self._empty_score_np, self._empty_score_np
 
         # Calculate scores
-        float_scores = np.array([
-            (vc * cfg['view_count_weight'])  # reward for view count
-            + (sc * cfg['detection_confidence_weight'])  # reward for 2D confidence
-            - (e * cfg['repro_error_weight'])  # penalty for error
-            for vc, sc, e in zip(view_counts, summed_confs, errors)
-        ])
+        float_scores = (
+                (view_counts * self.config['view_count_weight'])    # reward for view count
+                + (summed_confs * self.config['detection_confidence_weight'])   # reward for 2D confidence
+                - (errors * self.config['repro_error_weight'])   # penalty for error
+        )
+
         groups_as_sets = [set(g) for g in groups]
 
         # The max_weight_clique algorithm requires non-negative integer weights
@@ -345,20 +339,22 @@ class Reconstructor:
         node_weights = {i: int(integer_scores[i]) for i in range(num_points)}
         nx.set_node_attributes(complement_graph, node_weights, name='weight')
 
-        winner_indices, _ = nx.algorithms.clique.max_weight_clique(complement_graph, weight='weight')
+        winner_indices_list, _ = nx.algorithms.clique.max_weight_clique(complement_graph, weight='weight')
 
-        if not winner_indices:
-            return np.empty((0, 3)), [], []
+        if not winner_indices_list:
+            return self._empty_point3d_np, self._empty_score_np, self._empty_score_np
 
-        # we use the original float scores for the subsequent merging step
-        winner_points_3d = points3d[np.array(winner_indices)]
+        winner_indices = np.array(winner_indices_list)
+
+        # we know which points we need so we can convert back to numpy for sklearn
+        winner_points_3d = np.asarray(points3d[winner_indices])
         winner_scores = float_scores[winner_indices]
         winner_groups_original = [groups[i] for i in winner_indices]
 
         if winner_points_3d.shape[0] == 0:
-            return np.empty((0, 3)), [], []
+            return self._empty_point3d_np, self._empty_score_np, self._empty_score_np
 
-        clustering = DBSCAN(eps=cfg['cluster_radius'], min_samples=1).fit(winner_points_3d)
+        clustering = DBSCAN(eps=self.config['cluster_radius'], min_samples=1).fit(winner_points_3d)
         labels = clustering.labels_
 
         final_points, final_groups, final_scores = [], [], []
@@ -372,7 +368,7 @@ class Reconstructor:
             local_indices_in_cluster = np.where(labels == current_label)[0]
 
             should_merge = False
-            if cfg['filter_method'] == 'average' and len(local_indices_in_cluster) > 1:
+            if self.config['filter_method'] == 'average' and len(local_indices_in_cluster) > 1:
 
                 # Merge if points are geometrically close AND are competing hypotheses for the same thing
                 original_indices = [winner_indices[k] for k in local_indices_in_cluster]
@@ -382,13 +378,13 @@ class Reconstructor:
                     sets_to_compare = [groups_as_sets[k] for k in original_indices]
                     avg_jaccard = self._calculate_average_jaccard(sets_to_compare)
 
-                    if avg_jaccard > cfg['jaccard_threshold_for_merge']:
+                    if avg_jaccard > self.config['jaccard_threshold_for_merge']:
                         should_merge = True
 
             if should_merge:
                 cluster_pts = winner_points_3d[local_indices_in_cluster]
-                cluster_scores = winner_scores[local_indices_in_cluster]
-                weights = self._softmax_weights(cluster_scores, cfg['softmax_temperature'])
+                cluster_scores = np.asarray(winner_scores[local_indices_in_cluster])
+                weights = self._softmax_weights(cluster_scores, self.config['softmax_temperature'])
                 averaged_point = np.sum(cluster_pts * weights[:, np.newaxis], axis=0)
 
                 best_in_cluster_idx = local_indices_in_cluster[np.argmax(cluster_scores)]
@@ -404,20 +400,24 @@ class Reconstructor:
 
             processed_local_indices.update(local_indices_in_cluster)
 
+        final_points = np.asarray(final_points, dtype=np.float32)
+        final_groups = np.asarray(final_groups, dtype=object)
+        final_scores = np.asarray(final_scores, dtype=np.float32)
+
         # Step 3: Optional - Aggressive disjoint point merging
-        if cfg['enable_disjoint_merge'] and len(final_points) > 1:
+        if self.config['enable_disjoint_merge'] and len(final_points) > 1:
             final_points, final_groups, final_scores = self._proximity_merging(
-                np.array(final_points), final_groups, np.array(final_scores), cfg['disjoint_merge_radius']
+                final_points, final_groups, final_scores, self.config['disjoint_merge_radius']
             )
 
-        return np.array(final_points), final_groups, list(final_scores)
+        return final_points, final_groups, final_scores
 
     # --------------------------------------------------------------------------
 
     def _prepare_data(self,
             df_frame:           pl.DataFrame,
             keypoint_names:     List[str]
-        ) -> Dict[str, List[Tuple[jnp.ndarray, np.ndarray]]]:
+        ) -> Dict[str, List[Tuple[jnp.ndarray, jnp.ndarray]]]:
         """ Extracts and formats 2D detections from a flat Polars DataFrame for a single frame """
 
         detections_by_keypoint = {}
@@ -433,7 +433,7 @@ class Reconstructor:
             # check if this keypoint had any detections in this frame
             if kp_name not in kp_dfs:
                 # if not, fill with empty arrays for all cameras
-                detections_by_keypoint[kp_name] = self._per_cam_empty
+                detections_by_keypoint[kp_name] = [(self._empty_point2d_jax, self._empty_score_jax)] * self.num_cams
                 continue
 
             # if the keypoint exists get its data
@@ -455,15 +455,15 @@ class Reconstructor:
                 if cam_name in cam_data_map:
                     idx = cam_data_map[cam_name]
 
-                    points_list = np.column_stack([cam_data['x'][idx], cam_data['y'][idx]])
-                    confs_list = cam_data['score'][idx]
-                    points = jnp.array(points_list, dtype=jnp.float32)
-                    confs = np.array(confs_list, dtype=np.float32)
+                    points_np = np.column_stack([cam_data['x'][idx], cam_data['y'][idx]])
+                    confs_np = np.array(cam_data['score'][idx])
+                    points_jax = jnp.array(points_np, dtype=jnp.float32)
+                    confs_jax = jnp.array(confs_np, dtype=jnp.float32)
 
-                    dets_per_cam_list.append((points, confs))
+                    dets_per_cam_list.append((points_jax, confs_jax))
                 else:
                     # this camera had no detections for this keypoint in this frame
-                    dets_per_cam_list.append(self._single_empty)
+                    dets_per_cam_list.append((self._empty_point2d_jax, self._empty_score_jax))
 
             detections_by_keypoint[kp_name] = dets_per_cam_list
 
@@ -471,11 +471,11 @@ class Reconstructor:
 
     @partial(jax.jit, static_argnums=(0, 3, 4))
     def _compute_cost_matrix(self,
-                             dets_i: jnp.ndarray,
-                             dets_j: jnp.ndarray,
-                             i: int,
-                             j: int
-                             ) -> jnp.ndarray:
+            dets_i: jnp.ndarray,
+            dets_j: jnp.ndarray,
+            i:      int,
+            j:      int
+        ) -> jnp.ndarray:
         """
         Computes a cost matrix using epipolar segments, constrained by the Volume of Trust
         """
@@ -542,23 +542,28 @@ class Reconstructor:
 
         return final_costs
 
-    def _group_points(self, dets_per_cam: list) -> list:
+    def _group_points(self, dets_per_cam: List[jnp.ndarray]) -> List:
         """ Groups 2D detections using a graph-based approach with maximal cliques """
+
         if sum(d.shape[0] for d in dets_per_cam) < self.config['min_views']:
             return []
 
-        num_dets_per_cam = [d.shape[0] for d in dets_per_cam]
-        offsets = np.concatenate(([0], np.cumsum(num_dets_per_cam)[:-1]))
-        total_dets = sum(num_dets_per_cam)
+        nb_dets_per_cam = [d.shape[0] for d in dets_per_cam]
+        offsets = np.concatenate(([0], np.cumsum(nb_dets_per_cam)[:-1]))
+        total_dets = sum(nb_dets_per_cam)
 
         source_indices, target_indices = [], []
         for i in range(self.num_cams):
             for j in range(i + 1, self.num_cams):
-                if num_dets_per_cam[i] == 0 or num_dets_per_cam[j] == 0:
+
+                if nb_dets_per_cam[i] == 0 or nb_dets_per_cam[j] == 0:
                     continue
+
                 cost_mat = self._compute_cost_matrix(dets_per_cam[i], dets_per_cam[j], i, j)
-                if cost_mat.size == 0: continue
-                match_rows, match_cols = np.where(np.array(cost_mat) < self.config['T_epi'])
+                if cost_mat.size == 0:
+                    continue
+
+                match_rows, match_cols = np.where(np.asarray(cost_mat) < self.config['T_epi'])
                 source_indices.extend((offsets[i] + match_rows).tolist())
                 target_indices.extend((offsets[j] + match_cols).tolist())
 
@@ -624,7 +629,12 @@ class Reconstructor:
         return all_final_groups
 
     @staticmethod
-    def _proximity_merging(points, groups, scores, radius):
+    def _proximity_merging(
+            points: ArrayLike,
+            groups: ArrayLike,
+            scores: ArrayLike,
+            radius: float
+        ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
         """ Merges (aggressively) geometrically close points, keeping the best one """
 
         if points.shape[0] < 2:
@@ -632,6 +642,7 @@ class Reconstructor:
 
         clustering = DBSCAN(eps=radius, min_samples=1).fit(points)
         labels = clustering.labels_
+
         final_points, final_groups, final_scores = [], [], []
 
         for label in np.unique(labels):
@@ -642,7 +653,7 @@ class Reconstructor:
             final_groups.append(groups[best_global_idx])
             final_scores.append(scores[best_global_idx])
 
-        return np.array(final_points), final_groups, np.array(final_scores)
+        return np.asarray(final_points), np.asarray(final_groups), np.asarray(final_scores)
 
     @staticmethod
     def _softmax_weights(scores: np.ndarray, temperature: float) -> np.ndarray:
