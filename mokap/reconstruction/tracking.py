@@ -22,6 +22,9 @@ from mokap.utils.geometry.fitting import find_rigid_transform
 from mokap.reconstruction.reconstruction import SoupPoint
 
 
+logger = logging.getLogger(__name__)
+
+
 # TODO: Profile the two MWIS solvers a bit more
 #
 # from pyscipopt import Model
@@ -81,8 +84,53 @@ def solve_mwis_networkx(graph: nx.Graph) -> list[int]:
     winner_indices, _ = nx.algorithms.clique.max_weight_clique(complement_graph, weight='weight')
     return winner_indices
 
+# TODO: move this to utils
+def create_canonical_map(keypoint_names: List[str], symmetry_map: Optional[List[Tuple[str, str]]]) -> Dict[str, str]:
+    """
+    Creates a map from each keypoint name to a generalized "canonical type"
+    This is used to assign per-type Kalman Filter parameters:
+    {'leg_f_L1': 'legf1', 'leg_f_R2': 'legf2', 'thorax': 'thorax'}
 
-logger = logging.getLogger(__name__)
+    Args:
+        keypoint_names: The full list of keypoint names
+        symmetry_map: (Optional) a list of tuples, where each tuple is a symmetric pair of names
+
+    Returns:
+        A dictionary mapping each keypoint name to its canonical type string
+    """
+    canonical_map = {}
+    names_delimiter_regex = re.compile(r'[-_. ]')
+
+    # Process symmetric pairs first
+    if symmetry_map:
+        for name1, name2 in symmetry_map:
+            prefix, suffix = common_prefix_suffix(name1, name2)
+
+            # The part of the string that is different is the side identifier
+            side1 = name1[len(prefix):len(name1) - len(suffix)]
+
+            # The canonical name is the original name without the side identifier and cleaned up
+            canonical_name = name1.replace(side1, '')
+            canonical_name = names_delimiter_regex.sub('', canonical_name).lower()
+
+            canonical_map[name1] = canonical_name
+            canonical_map[name2] = canonical_name
+
+    # any remaining non-symmetric keypoints
+    for kp_name in keypoint_names:
+        if kp_name not in canonical_map:
+            # The canonical name is just the name itself, cleaned up
+            canonical_name = names_delimiter_regex.sub('', kp_name).lower()
+            canonical_map[kp_name] = canonical_name
+
+    logger.debug("Generated Canonical Keypoint Map for Smoother:")
+    unique_types = sorted(list(set(canonical_map.values())))
+    logger.debug(f"  -> Found types: {unique_types}")
+    example_kp = keypoint_names[2]
+    logger.debug(f"  -> Example: '{example_kp}' maps to '{canonical_map.get(example_kp)}'")
+
+    return canonical_map
+
 
 # Type alias for clarity and type safety
 Bone = FrozenSet[str]
@@ -200,6 +248,11 @@ class StatsBootstrapper:
          ):
 
         self.bones_list: List[Bone] = [frozenset(b) for b in bones_list]
+        if not self.bones_list:
+            raise ValueError("Cannot initialize StatsBootstrapper with an empty bone list.")
+
+        keypoints = {kp for bone in self.bones_list for kp in bone}
+        keypoints = sorted(list(keypoints))
 
         # Build skeleton graph for degree calculations
         # TODO: This is also done in the skeleton assembler, that's a bit redundant
@@ -212,73 +265,19 @@ class StatsBootstrapper:
         self.bootstrap_data = bootstrap_data
 
         self.json_delimiter_regex = re.compile(r'[-;, ]')
-        self.names_delimiter_regex = re.compile(r'[-_. ]')
 
-        # these will be populated by the symmetry logic
-        self.canonical_map: dict[str, str] = {}
-        self.side_identifiers: dict[str, str] = {}
-
-        if symmetry_map:
-            self._create_symmetry_map(symmetry_map)
-            print(f"Adaptive symmetry maps created for {len(self.canonical_map)} keypoints.")
-
-    def _create_symmetry_map(self, symmetry_groups: List[Tuple[str, str]]):
-        """ creates maps for canonical names and side identifiers """
-
-        for group in symmetry_groups:
-            if not group or len(group) != 2:
-                # not part of a symmetry, skip
-                continue
-
-            name1, name2 = group
-            prefix, suffix = common_prefix_suffix(name1, name2)
-
-            # The part of the string that is different is the side identifier
-            side1 = name1[len(prefix):len(name1) - len(suffix)]
-            side2 = name2[len(prefix):len(name2) - len(suffix)]
-
-            # the canonical name is what's the same between the two
-            canonical_name = name1.replace(side1, '')
-            canonical_name = self.names_delimiter_regex.sub('', canonical_name)
-
-            if not side1 or not side2:
-                # there's no distinguishing part so they are probably not a L/R pair
-                # they are mappped to a shared canonical name but they won't have a 'side'
-                print(
-                    f"Symmetry pair ('{name1}', '{name2}') has no clear distinguishing part. Using '{canonical_name}' as canonical.")
-                self.canonical_map[name1] = canonical_name
-                self.canonical_map[name2] = canonical_name
-                continue
-
-            self.canonical_map[name1] = canonical_name
-            self.canonical_map[name2] = canonical_name
-            self.side_identifiers[name1] = side1
-            self.side_identifiers[name2] = side2
-
-            print(
-                f"Symmetry mapping: ('{name1}', '{name2}') -> canonical: '{canonical_name}', sides: ('{side1}', '{side2}')")
+        # Create the canonical map
+        self.canonical_map = create_canonical_map(keypoints, symmetry_map)
 
     def _symmetrise_bone_names(self, bone: Bone) -> Bone:
         """ Normalizes a bone's keypoint names using the canonical map """
 
-        if not self.canonical_map:
-            return bone
+        kp1_orig, kp2_orig = tuple(bone)
 
-        kp1, kp2 = tuple(bone)
+        kp1_canon = self.canonical_map.get(kp1_orig, kp1_orig)
+        kp2_canon = self.canonical_map.get(kp2_orig, kp2_orig)
 
-        # Check if both keypoints are part of the symmetry definition
-        if kp1 not in self.canonical_map or kp2 not in self.canonical_map:
-            return bone
-
-        # Check if they belong to different sides
-        side1 = self.side_identifiers.get(kp1)
-        side2 = self.side_identifiers.get(kp2)
-        if side1 is not None and side2 is not None and side1 != side2:
-            # this is a cross-body bone (left_hip to right_hip) so do not normalise it
-            return bone
-
-        # normalize to canonical names
-        return frozenset((self.canonical_map[kp1], self.canonical_map[kp2]))
+        return frozenset((kp1_canon, kp2_canon))
 
     def get_initial_stats(self) -> Dict:
         """
@@ -718,9 +717,9 @@ class Tracklet:
 
         dt = 1.0  # Time step
 
-        self.kf.F = np.array([[1.0, 0.0, 0.0, dt, 0.0, 0.0, 0.0],
-                              [0.0, 1.0, 0.0, 0.0, dt, 0.0, 0.0],
-                              [0.0, 0.0, 1.0, 0.0, 0.0, dt, 0.0],
+        self.kf.F = np.array([[1.0, 0.0, 0.0,  dt, 0.0, 0.0, 0.0],
+                              [0.0, 1.0, 0.0, 0.0,  dt, 0.0, 0.0],
+                              [0.0, 0.0, 1.0, 0.0, 0.0,  dt, 0.0],
                               [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
                               [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
                               [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
@@ -1767,7 +1766,7 @@ if __name__ == '__main__':
     frames_indices = sorted(points_soup.keys())
     min_frame, max_frame = frames_indices[0], frames_indices[-1]
 
-    all_tracklets = []
+    tracklets_by_id = defaultdict(list)
 
     with alive_bar(title='Tracking Skeletons...', length=20, total=(max_frame - min_frame + 1), force_tty=True) as bar:
         for frame_idx in range(min_frame, max_frame + 1):
@@ -1789,11 +1788,8 @@ if __name__ == '__main__':
                     anatomy_learner.add_sample(tracklet.skeleton)
 
             # Convert dataclasses back to dicts for serialization
-            frame_skeletons = []
             for tracklet in active_tracklets:
-                skel_dict = tracklet.skeleton.to_dict()  # Add the skeleton
-
-                # Add the rich tracklet-level context
+                skel_dict = tracklet.skeleton.to_dict()
                 skel_dict['track_id'] = tracklet.id
                 skel_dict['track_health'] = tracklet.health
                 skel_dict['track_anatomical_integrity'] = tracklet.anatomical_integrity
@@ -1801,17 +1797,20 @@ if __name__ == '__main__':
                 skel_dict['track_predicted_pos'] = tracklet.predicted_position.tolist()
                 skel_dict['time_since_update'] = tracklet.time_since_update
 
-                frame_skeletons.append(skel_dict)
+                # add the frame_idx to the skeleton dict
+                skel_dict['frame_idx'] = frame_idx
 
-            all_tracklets.append({"frame_idx": frame_idx, "skeletons": frame_skeletons})
+                tracklets_by_id[tracklet.id].append(skel_dict)
 
             bar()
 
     print("Tracking complete.")
 
-    # Save final results
+    # Save final results (tracklet-centric format)
     output_file = folder / prefix / 'outputs' / f'tracklets_session{session}.pkl'
+    output_file.parent.mkdir(parents=True, exist_ok=True)
+
     with open(output_file, 'wb') as f:
-        pickle.dump(all_tracklets, f)
+        pickle.dump(dict(tracklets_by_id), f)
 
     print(f"Results saved to '{output_file}'")
