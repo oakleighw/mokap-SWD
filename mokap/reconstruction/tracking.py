@@ -536,8 +536,8 @@ class StatsBootstrapper:
         # We need to map original degrees to canonical degrees
         # (a canonical kp's degree is the sum of degrees of its original constituent parts)
         for kp, deg in self._degrees.items():
-            if self.symmetry_map and kp in self.symmetry_map:
-                canonical_degrees[self.symmetry_map[kp]] += deg
+            if self.canonical_map and kp in self.canonical_map:
+                canonical_degrees[self.canonical_map[kp]] += deg
             else:
                 canonical_degrees[kp] += deg
 
