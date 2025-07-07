@@ -17,7 +17,7 @@ from scipy.linalg import block_diag
 from scipy.optimize import linear_sum_assignment
 from scipy.stats import median_abs_deviation
 from scipy.spatial import cKDTree
-from mokap.utils import fileio
+from mokap.utils import fileio, common_prefix_suffix
 from mokap.utils.geometry.fitting import find_rigid_transform
 from mokap.reconstruction.reconstruction import SoupPoint
 
@@ -211,33 +211,74 @@ class StatsBootstrapper:
         self.prior_path = Path(prior_stats_path) if prior_stats_path else None
         self.bootstrap_data = bootstrap_data
 
-        self.delimiter_regex = re.compile(r'[-;, ]')
+        self.json_delimiter_regex = re.compile(r'[-;, ]')
+        self.names_delimiter_regex = re.compile(r'[-_. ]')
 
-        if symmetry_map is not None:
-            self.symmetry_map = self.create_symmetry_map(symmetry_map)
-            logger.info(f"Symmetry map created for {len(self.symmetry_map)} keypoints.")
+        # these will be populated by the symmetry logic
+        self.canonical_map: dict[str, str] = {}
+        self.side_identifiers: dict[str, str] = {}
 
-    def create_symmetry_map(self, symmetry_groups: List[Tuple[str, str]]) -> Dict[str, str]:
-        """
-        Creates a map from a keypoint to a canonical symmetrical name
-        eg {'left_eye': 'eye', 'right_eye': 'eye'}
-        """
-        sym_map = {}
+        if symmetry_map:
+            self._create_symmetry_map(symmetry_map)
+            print(f"Adaptive symmetry maps created for {len(self.canonical_map)} keypoints.")
+
+    def _create_symmetry_map(self, symmetry_groups: List[Tuple[str, str]]):
+        """ creates maps for canonical names and side identifiers """
+
         for group in symmetry_groups:
-            if not group: continue
-            canonical_name = group[0].replace('left_', '').replace('right_', '')
-            for kp_name in group:
-                sym_map[kp_name] = canonical_name
-        return sym_map
+            if not group or len(group) != 2:
+                # not part of a symmetry, skip
+                continue
 
-    def get_side(self, kp_name: str) -> Optional[str]:
-        """ Returns 'left', 'right', or None if the side is not specified """
-        # TODO: This is a very lame way to check
-        if 'left' in kp_name.lower():
-            return 'left'
-        if 'right' in kp_name.lower():
-            return 'right'
-        return None
+            name1, name2 = group
+            prefix, suffix = common_prefix_suffix(name1, name2)
+
+            # The part of the string that is different is the side identifier
+            side1 = name1[len(prefix):len(name1) - len(suffix)]
+            side2 = name2[len(prefix):len(name2) - len(suffix)]
+
+            # the canonical name is what's the same between the two
+            canonical_name = name1.replace(side1, '')
+            canonical_name = self.names_delimiter_regex.sub('', canonical_name)
+
+            if not side1 or not side2:
+                # there's no distinguishing part so they are probably not a L/R pair
+                # they are mappped to a shared canonical name but they won't have a 'side'
+                print(
+                    f"Symmetry pair ('{name1}', '{name2}') has no clear distinguishing part. Using '{canonical_name}' as canonical.")
+                self.canonical_map[name1] = canonical_name
+                self.canonical_map[name2] = canonical_name
+                continue
+
+            self.canonical_map[name1] = canonical_name
+            self.canonical_map[name2] = canonical_name
+            self.side_identifiers[name1] = side1
+            self.side_identifiers[name2] = side2
+
+            print(
+                f"Symmetry mapping: ('{name1}', '{name2}') -> canonical: '{canonical_name}', sides: ('{side1}', '{side2}')")
+
+    def _symmetrise_bone_names(self, bone: Bone) -> Bone:
+        """ Normalizes a bone's keypoint names using the canonical map """
+
+        if not self.canonical_map:
+            return bone
+
+        kp1, kp2 = tuple(bone)
+
+        # Check if both keypoints are part of the symmetry definition
+        if kp1 not in self.canonical_map or kp2 not in self.canonical_map:
+            return bone
+
+        # Check if they belong to different sides
+        side1 = self.side_identifiers.get(kp1)
+        side2 = self.side_identifiers.get(kp2)
+        if side1 is not None and side2 is not None and side1 != side2:
+            # this is a cross-body bone (left_hip to right_hip) so do not normalise it
+            return bone
+
+        # normalize to canonical names
+        return frozenset((self.canonical_map[kp1], self.canonical_map[kp2]))
 
     def get_initial_stats(self) -> Dict:
         """
@@ -305,7 +346,7 @@ class StatsBootstrapper:
         return best_bone
 
     def _parse_bone_name(self, bone_name: str) -> Bone:
-        parts = [str(p).strip() for p in self.delimiter_regex.split(bone_name) if str(p).strip()]
+        parts = [str(p).strip() for p in self.json_delimiter_regex.split(bone_name) if str(p).strip()]
 
         if len(parts) != 2:
             raise ValueError(
@@ -342,28 +383,6 @@ class StatsBootstrapper:
         self._save_stats(stats)
 
         return stats
-
-    def _symmetrise_bone_names(self, bone: Bone) -> Bone:
-        """ Normalizes a bone's keypoint names using the symmetry map """
-
-        if not self.symmetry_map:
-            return bone
-
-        kp1, kp2 = tuple(bone)
-
-        # Check if both keypoints are part of the symmetry definition
-        if kp1 not in self.symmetry_map or kp2 not in self.symmetry_map:
-            return bone
-
-        # Check if they belong to the same side (or neither has a side)
-        side1, side2 = self.get_side(kp1), self.get_side(kp2)
-
-        if side1 is not None and side2 is not None and side1 != side2:
-            # This is a cross-body bone (eg left_hip to right_hip), do not normalize it
-            return bone
-
-        # Normalize to canonical names
-        return frozenset((self.symmetry_map[kp1], self.symmetry_map[kp2]))
 
     def _normalize_lengths(self, bones_data: Dict[str, float]) -> Dict:
         """ Normalises a dictionary of bone lengths using a reference bone """
