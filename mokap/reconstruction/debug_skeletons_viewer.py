@@ -166,8 +166,8 @@ if __name__ == '__main__':
     _, bones = fileio.load_skeleton_SLEAP(skeleton_input_path, indices=False)
     volume_bounds = {'x': (-10.5, 13.0), 'y': (-21.0, 11.0), 'z': (180.0, 201.0)}
 
-    # data_to_view = folder / prefix / 'outputs' / f'tracklets_session{session}.pkl'
-    data_to_view = folder / prefix / 'outputs' / f'smoothed_tracks_session{session}.pkl'
+    data_to_view = folder / prefix / 'outputs' / f'tracklets_session{session}.pkl'
+    # data_to_view = folder / prefix / 'outputs' / f'smoothed_tracks_session{session}.pkl'
 
     print(f"Loading data from: {data_to_view.name}")
     with open(data_to_view, 'rb') as f:

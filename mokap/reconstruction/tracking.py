@@ -143,7 +143,7 @@ class AssembledSkeleton:
     score: float
     scale: float
     point_indices: Dict[str, int] = field(default_factory=dict)
-    tracklet_id: int = -1
+    track_id: int = -1
 
     def to_dict(self) -> dict:
         return {
@@ -151,7 +151,7 @@ class AssembledSkeleton:
             'score': self.score,
             'scale': self.scale,
             'point_indices': self.point_indices,
-            'tracklet_id': self.tracklet_id
+            'track_id': self.track_id
         }
 
 
@@ -684,13 +684,13 @@ class Tracklet:
     """
 
     def __init__(self,
-            tracklet_id:        int,
+            track_id:        int,
             initial_skeleton:   AssembledSkeleton,
             frame_idx:          int,
             central_kp:         str
         ):
 
-        self.id = tracklet_id
+        self.track_id = track_id
         self.age = 0
         self.time_since_update = 0
         self.last_update_frame = frame_idx
@@ -1496,7 +1496,7 @@ class MultiObjectTracker:
         self.assembler = assembler
         self.frame_idx = -1
         self.tracklets: List[Tracklet] = []
-        self.next_tracklet_id = 0
+        self.next_track_id = 0
         self.max_age = CONFIG['TRACKER_MAX_TRACKELT_AGE']
 
     def update(self,
@@ -1557,9 +1557,9 @@ class MultiObjectTracker:
         # Create new tracklets for unmatched skeletons
         for i, skel in enumerate(winning_skeletons):
             if i not in matched_winner_indices and self.assembler.central_kp in skel.keypoints:
-                new_tracklet = Tracklet(self.next_tracklet_id, skel, self.frame_idx, self.assembler.central_kp)
+                new_tracklet = Tracklet(self.next_track_id, skel, self.frame_idx, self.assembler.central_kp)
                 self.tracklets.append(new_tracklet)
-                self.next_tracklet_id += 1
+                self.next_track_id += 1
 
         # Prune old/lost tracklets
         self.prune_tracklets()
@@ -1790,7 +1790,7 @@ if __name__ == '__main__':
             # Convert dataclasses back to dicts for serialization
             for tracklet in active_tracklets:
                 skel_dict = tracklet.skeleton.to_dict()
-                skel_dict['track_id'] = tracklet.id
+                skel_dict['track_id'] = tracklet.track_id
                 skel_dict['track_health'] = tracklet.health
                 skel_dict['track_anatomical_integrity'] = tracklet.anatomical_integrity
                 skel_dict['track_uncertainty_pos'] = tracklet.uncertainty['position'].tolist()
@@ -1800,7 +1800,7 @@ if __name__ == '__main__':
                 # add the frame_idx to the skeleton dict
                 skel_dict['frame_idx'] = frame_idx
 
-                tracklets_by_id[tracklet.id].append(skel_dict)
+                tracklets_by_id[tracklet.track_id].append(skel_dict)
 
             bar()
 
