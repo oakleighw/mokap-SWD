@@ -1794,6 +1794,7 @@ if __name__ == '__main__':
                 skel_dict['track_health'] = tracklet.health
                 skel_dict['track_anatomical_integrity'] = tracklet.anatomical_integrity
                 skel_dict['track_uncertainty_pos'] = tracklet.uncertainty['position'].tolist()
+                skel_dict['track_velocity'] = tracklet.kf.x[3:6].flatten().tolist()
                 skel_dict['track_predicted_pos'] = tracklet.predicted_position.tolist()
                 skel_dict['time_since_update'] = tracklet.time_since_update
 
