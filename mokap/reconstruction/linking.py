@@ -756,7 +756,7 @@ class TrackletLinker:
         return chains
 
 
-def load_tracklets_from_file(track_data: Dict[int, List[Dict]], config: LinkerConfig) -> Dict[int, TrackletData]:
+def load_tracklets(track_data: Dict[int, List[Dict]], config: LinkerConfig) -> Dict[int, TrackletData]:
     """ Parses the raw tracked data from a file into Tracklet objects """
 
     tracklets = {}
@@ -783,7 +783,7 @@ def load_tracklets_from_file(track_data: Dict[int, List[Dict]], config: LinkerCo
     return tracklets
 
 
-def combine_chains_into_final_tracks(
+def combine_chains(
         chains: Dict[int, List[int]],
         tracklet_pool: Dict[int, 'TrackletData']
     ) -> Dict[int, List[Dict]]:
@@ -842,7 +842,7 @@ if __name__ == '__main__':
     canonical_map = create_canonical_map(keypoints, symmetry)
 
     print("\n--- STAGE 1: Merging Overlapping Fragments ---")
-    initial_tracklets = load_tracklets_from_file(all_tracked_data, config=linker_cfg)
+    initial_tracklets = load_tracklets(all_tracked_data, config=linker_cfg)
     merger = FragmentMerger(initial_tracklets, bone_stats, bones_list, config=merger_cfg)
     merged_tracklets = merger.merge_fragments()
 
@@ -864,7 +864,7 @@ if __name__ == '__main__':
         print("No valid links were made.")
 
     # Final Assembly & saving
-    final_linked_tracks = combine_chains_into_final_tracks(chains, merged_tracklets)
+    final_linked_tracks = combine_chains(chains, merged_tracklets)
 
     output_file = folder / prefix / 'outputs' / f'linked_tracks_session{session}.pkl'
     output_file.parent.mkdir(parents=True, exist_ok=True)
