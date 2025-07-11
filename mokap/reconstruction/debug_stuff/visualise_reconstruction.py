@@ -10,12 +10,15 @@ import cv2
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from scipy.spatial.distance import cdist
+
+from mokap.reconstruction.config import ReconstructorConfig
 from mokap.utils import fileio
 from mokap.utils.geometry.fitting import bundle_intersection_AABB
 from mokap.utils.geometry.projective import undistort_points, back_projection, project_points, project_to_multiple_cameras
 from mokap.utils.geometry.transforms import extrinsics_matrix, extmat_to_rtvecs
 from mokap.utils.visualisation import plot_cameras_3d, plot_points_3d, CUSTOM_COLORS
-from mokap.reconstruction.reconstruction import Reconstructor, SoupPoint
+from mokap.reconstruction.reconstruction import Reconstructor
+from mokap.reconstruction.datatypes import SoupPoint
 
 
 class ReconstructorVisualizer:
@@ -39,19 +42,19 @@ class ReconstructorVisualizer:
             return
 
         h, w = img_j.shape[:2]
-        K_j, D_j = self.r.all_K[cam_idx_j], self.r.all_D[cam_idx_j]
+        K_j, D_j = self.r.Ks[cam_idx_j], self.r.Ds[cam_idx_j]
         new_K_j, _ = cv2.getOptimalNewCameraMatrix(np.asarray(K_j), np.asarray(D_j), (w, h), 1, (w, h))
         map1, map2 = cv2.initUndistortRectifyMap(np.asarray(K_j), np.asarray(D_j), None, new_K_j, (w, h), 5)
         ud_img_j = cv2.remap(img_j, map1, map2, cv2.INTER_LINEAR)
         udets_j = undistort_points(dets_j, K_j, D_j, P=new_K_j)
 
         # Undistort points from camera i before back-projection
-        udets_i = undistort_points(dets_i, self.r.all_K[cam_idx_i], self.r.all_D[cam_idx_i])
+        udets_i = undistort_points(dets_i, self.r.Ks[cam_idx_i], self.r.Ds[cam_idx_i])
 
-        E_c2w_i = jnp.linalg.inv(self.r.all_E[cam_idx_i])
+        E_c2w_i = jnp.linalg.inv(self.r.Es[cam_idx_i])
         cam_center_i = E_c2w_i[:3, 3]
         # Now back-project the clean points with no further distortion correction
-        p_3d_on_ray = back_projection(udets_i, 1.0, self.r.all_K[cam_idx_i], E_c2w_i, dist_coeffs=None)
+        p_3d_on_ray = back_projection(udets_i, 1.0, self.r.Ks[cam_idx_i], E_c2w_i, dist_coeffs=None)
 
         ray_dirs = p_3d_on_ray - cam_center_i
         ray_dirs /= jnp.linalg.norm(ray_dirs, axis=-1, keepdims=True)
@@ -59,7 +62,7 @@ class ReconstructorVisualizer:
         p_near_3d, p_far_3d, has_intersection = bundle_intersection_AABB(cam_center_i, ray_dirs, self.r.aabb_min,
                                                                          self.r.aabb_max)
 
-        rvec_w2c_j, tvec_w2c_j = extmat_to_rtvecs(self.r.all_E[cam_idx_j])
+        rvec_w2c_j, tvec_w2c_j = extmat_to_rtvecs(self.r.Es[cam_idx_j])
         segments_3d = jnp.vstack([p_near_3d, p_far_3d])
         segments_2d, _ = project_points(segments_3d, rvec_w2c_j, tvec_w2c_j, new_K_j, dist_coeffs=jnp.zeros_like(D_j))
 
@@ -91,14 +94,14 @@ class ReconstructorVisualizer:
 
         fig = plt.figure(figsize=(12, 12))
         ax = fig.add_subplot(111, projection='3d')
-        ax = plot_cameras_3d(self.r.rvecs_c2w, self.r.tvecs_c2w, self.r.all_K, self.r.all_D,
+        ax = plot_cameras_3d(self.r.rvecs_c2w, self.r.tvecs_c2w, self.r.Ks, self.r.Ds,
                              cameras_names=self.r.camera_names, trust_volume=self.r.volume_bounds, ax=ax)
 
         E_c2w = extrinsics_matrix(self.r.rvecs_c2w, self.r.tvecs_c2w)
         for c, cam_name in enumerate(self.r.camera_names):
             if dets_per_cam[c].shape[0] == 0: continue
             cam_center = self.r.tvecs_c2w[c]
-            points_3d = back_projection(dets_per_cam[c], 10.0, self.r.all_K[c], E_c2w[c], self.r.all_D[c])
+            points_3d = back_projection(dets_per_cam[c], 10.0, self.r.Ks[c], E_c2w[c], self.r.Ds[c])
             for pt_3d in points_3d:
                 ray_end = cam_center + (pt_3d - cam_center) * 30
                 ax.plot(*np.stack([cam_center, ray_end]).T, color=CUSTOM_COLORS[c], linestyle='-', linewidth=1.0,
@@ -118,19 +121,19 @@ class ReconstructorVisualizer:
         reproj, _ = project_to_multiple_cameras(point3d[None, :],
                                                 self.r.rvecs_w2c,
                                                 self.r.tvecs_w2c,
-                                                self.r.all_K,
-                                                self.r.all_D)
+                                                self.r.Ks,
+                                                self.r.Ds)
         reproj_pts = np.squeeze(np.array(reproj), axis=1)
 
         F_mats = {}
         for i, j in product(range(C), repeat=2):
             if i == j: continue
-            E_i_inv = jnp.linalg.inv(self.r.all_E[i])
-            E_i_to_j = self.r.all_E[j] @ E_i_inv
+            E_i_inv = jnp.linalg.inv(self.r.Es[i])
+            E_i_to_j = self.r.Es[j] @ E_i_inv
             R, t = E_i_to_j[:3, :3], E_i_to_j[:3, 3]
             t_skew = jnp.array([[0, -t[2], t[1]], [t[2], 0, -t[0]], [-t[1], t[0], 0]])
             Essential = t_skew @ R
-            F_mats[(i, j)] = jnp.linalg.inv(self.r.all_K[j]).T @ Essential @ jnp.linalg.inv(self.r.all_K[i])
+            F_mats[(i, j)] = jnp.linalg.inv(self.r.Ks[j]).T @ Essential @ jnp.linalg.inv(self.r.Ks[i])
 
         handles, labels = [], []
         for j, cam_name in enumerate(self.r.camera_names):
@@ -235,33 +238,40 @@ if __name__ == '__main__':
     folder = Path().home() / 'Desktop' / '3d_ant_data'
     prefix = '240905-1616'
     session = 22
-    DEBUG_FRAME = 926
-    DEBUG_KEYPOINT = 'neck'
-    DEBUG_CAM_I, DEBUG_CAM_J = 0, 3
 
     df = fileio.load_session(folder / prefix / 'inputs' / 'tracking', session=session, use_polars=True)
     grouped_by_frame = df.group_by('frame', maintain_order=True)
+    nb_frames = df.select(pl.col('frame').n_unique()).item()
 
     cal_data = fileio.read_parameters(folder / prefix / 'calibration')
     keypoints, bones = fileio.load_skeleton_SLEAP(folder / prefix / 'inputs' / 'tracking', indices=False)
 
     volume_bounds = {'x': (-10.5, 13.0), 'y': (-21.0, 11.0), 'z': (180.0, 201.0)}
 
-    camera_names = df["camera"].unique().sort().to_list()
+    reconstructor_config = ReconstructorConfig(
+        repro_thresh=10.0,
+        cluster_radius=2.0,
+        view_count_weight=10.0,
+        repro_error_weight=1.0
+    )
+
+    reconstructor = Reconstructor(
+        camera_parameters=cal_data,
+        volume_bounds=volume_bounds,
+        config=reconstructor_config
+    )
+    # Run on the specific debug frame
+    DEBUG_FRAME = 926
+    df_frame = df.filter(pl.col('frame') == DEBUG_FRAME)
+
+    DEBUG_KEYPOINT = 'neck'
+    DEBUG_CAM_I, DEBUG_CAM_J = 0, 3
+
+    camera_names = sorted(cal_data.keys())
     videos_paths = list((folder / prefix / 'sources').glob(f'*session{session}.mp4'))
     images = get_frames(videos_paths, camera_names, DEBUG_FRAME)
 
-    reconstructor_config = {
-        'repro_thresh': 10.0,
-        'cluster_radius': 2.0,
-        'view_count_weight': 10.0,
-        'detection_confidence_weight': 5.0,
-        'repro_error_weight': 1.0
-    }
-    reconstructor = Reconstructor(camera_parameters=cal_data, volume_bounds=volume_bounds, config=reconstructor_config)
     viz = ReconstructorVisualizer(reconstructor)
-
-    df_frame = df.filter(pl.col('frame') == DEBUG_FRAME)
 
     detections_by_keypoint = reconstructor._prepare_data(df_frame, [DEBUG_KEYPOINT])
     dets_per_cam = detections_by_keypoint[DEBUG_KEYPOINT]
@@ -331,7 +341,7 @@ if __name__ == '__main__':
 
     fig = plt.figure(figsize=(15, 15))
     ax = fig.add_subplot(111, projection='3d')
-    ax = plot_cameras_3d(reconstructor.rvecs_c2w, reconstructor.tvecs_c2w, reconstructor.all_K, reconstructor.all_D,
+    ax = plot_cameras_3d(reconstructor.rvecs_c2w, reconstructor.tvecs_c2w, reconstructor.Ks, reconstructor.Ds,
                          cameras_names=camera_names,
                          # trust_volume=volume_bounds,
                          ax=ax)

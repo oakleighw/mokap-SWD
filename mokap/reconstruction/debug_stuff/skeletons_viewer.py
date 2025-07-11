@@ -9,13 +9,13 @@ from mokap.utils import fileio
 
 def convert_track_centric_to_frame_centric(track_data: dict) -> list:
     """
-    Converts a track-centric dictionary {track_id: [skeletons]} into a
+    Converts a track-centric dictionary {track_idx: [skeletons]} into a
     frame-centric list [{'frame_idx': ..., 'skeletons': [...]}] suitable for the viewer
     """
 
     # Invert the dictionary to group by frame_idx
     frames_dict = defaultdict(lambda: {'skeletons': []})
-    for track_id, skeletons_list in track_data.items():
+    for track_idx, skeletons_list in track_data.items():
         for skel in skeletons_list:
             frame_idx = skel['frame_idx']
             frames_dict[frame_idx]['skeletons'].append(skel)
@@ -56,8 +56,8 @@ def draw_skeletons(frame_data: dict, bones: list, ax: plt.Axes):
             # This skeleton has no displayable points, skip it
             continue
 
-        track_id = skel.get('track_id', -1)
-        color = color_map(track_id % color_map.N) if track_id != -1 else 'gray'
+        track_idx = skel.get('track_idx', -1)
+        color = color_map(track_idx % color_map.N) if track_idx != -1 else 'gray'
 
         # Bones
         for kp1_name, kp2_name in bones:
@@ -78,7 +78,7 @@ def draw_skeletons(frame_data: dict, bones: list, ax: plt.Axes):
         central_kp_name = 'thorax' if 'thorax' in keypoints else next(iter(keypoints), None)
         if central_kp_name:
             pos = np.array(keypoints[central_kp_name])
-            text = ax.text(pos[0], pos[1], pos[2], f"ID:{track_id}", color=color, fontsize='x-small')
+            text = ax.text(pos[0], pos[1], pos[2], f"ID:{track_idx}", color=color, fontsize='x-small')
             artists.append(text)
 
     return artists
@@ -166,13 +166,14 @@ if __name__ == '__main__':
     _, bones = fileio.load_skeleton_SLEAP(skeleton_input_path, indices=False)
     volume_bounds = {'x': (-10.5, 13.0), 'y': (-21.0, 11.0), 'z': (180.0, 201.0)}
 
-    data_to_view = folder / prefix / 'outputs' / f'tracklets_session{session}.pkl'
-    # data_to_view = folder / prefix / 'outputs' / f'linked_tracks_session{session}.pkl'
+    # data_to_view = folder / prefix / 'outputs' / f'tracklets_session{session}.pkl'
+    data_to_view = folder / prefix / 'outputs' / f'linked_tracks_session{session}.pkl'
 
     print(f"Loading data from: {data_to_view.name}")
     with open(data_to_view, 'rb') as f:
         loaded_data = pickle.load(f)
 
+    # all_Zs = []
     # all_Zs = []
     # for frame in tracked_skeletons:
     #     for skel in frame['skeletons']:
