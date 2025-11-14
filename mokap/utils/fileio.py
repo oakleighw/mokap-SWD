@@ -530,20 +530,30 @@ def sort_multiview_df(in_df, cameras_order=None, keypoints_order=None):
 
 
 def probe_video(video_path: Path | str):
+    """Extract metadata from a video."""
+
     video_path = Path(video_path)
 
     if not video_path.exists():
         raise FileNotFoundError(video_path.resolve())
 
     cap = cv2.VideoCapture(video_path.as_posix())
+    if not cap.isOpened():
+        print(f"Could not open video: {video_path.resolve()}")
+
     r, frame = cap.read()
     if not r:
         raise IOError(f"Can't read video {video_path.resolve()}")
 
-    nb_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+    metadata = {
+        'width': int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
+        'height': int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
+        'num_frames': int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
+        'fps': cap.get(cv2.CAP_PROP_FPS)
+    }
     cap.release()
 
-    return frame.shape, nb_frames
+    return metadata
 
 
 def generate_board_svg(board_params:    Union["ChessBoard", "CharucoBoard"],
