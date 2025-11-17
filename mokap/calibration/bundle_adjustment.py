@@ -10,7 +10,7 @@ from mokap.utils import CallbackOutputStream
 from mokap.utils.datatypes import DistortionModel
 from alive_progress import alive_bar
 
-from mokap.utils.geometry.projective import project_object_views_batched
+from mokap.utils.geometry.projective import project_object_views_batched, project_multiple_to_multiple
 from mokap.utils.geometry.transforms import invert_rtvecs
 
 DIST_MODEL_MAP = {'none': 0, 'simple': 4, 'standard': 5, 'full': 8, 'rational': 8}
@@ -19,21 +19,21 @@ DIST_MODEL_MAP = {'none': 0, 'simple': 4, 'standard': 5, 'full': 8, 'rational': 
 
 
 def _get_parameter_spec(
-        nb_cams:              int,
-        nb_frames:            int,
-        origin_idx:           int,
-        fix_camera_matrix:    bool,
-        fix_distortion:       bool,
-        fix_extrinsics:       bool,
-        fix_board_poses:      bool,
-        fix_aspect_ratio:     bool,
-        fix_structure:        bool,
-        nb_structure_points:  int,
-        shared_intrinsics:    bool,
-        distortion_model:     DistortionModel
+        nb_cams:            int,
+        nb_frames:          int,
+        origin_idx:         int,
+        fix_camera_matrix:  bool,
+        fix_distortion:     bool,
+        fix_extrinsics:     bool,
+        fix_board_poses:    bool,
+        fix_aspect_ratio:   bool,
+        fix_scene:          bool,
+        nb_scene_points:    int,
+        shared_intrinsics:  bool,
+        distortion_model:   DistortionModel
 ) -> Dict:
     """
-    defines the structure of the optimization vector X
+    Defines the structure of the optimization vector X
     (the size and offset for each block of parameters to optimise)
     """
     spec = {'config': locals()}
@@ -72,10 +72,10 @@ def _get_parameter_spec(
         spec['blocks']['board_poses'] = {'offset': current_offset, 'size': size}
         current_offset += size
 
-    # Unknown 3D structure points
-    if not fix_structure and nb_structure_points > 0:
-        size = 3 * nb_structure_points
-        spec['blocks']['structure_points'] = {'offset': current_offset, 'size': size}
+    # Unknown 3D scene points (can be per-frame)
+    if not fix_scene and nb_scene_points > 0:
+        size = 3 * nb_scene_points
+        spec['blocks']['scene_points'] = {'offset': current_offset, 'size': size}
         current_offset += size
 
     spec['total_size'] = current_offset
@@ -150,14 +150,14 @@ def _get_parameter_scales(
 
         scales[info['offset']:info['offset'] + info['size']] = np.concatenate([r_scales, t_scales])
 
-    # Unkown structure scale
-    if 'structure_points' in spec['blocks']:
-        info = spec['blocks']['structure_points']
+    # Unknown scene scale
+    if 'scene_points' in spec['blocks']:
+        info = spec['blocks']['scene_points']
 
         # mean distance of points to the origin is a good heuristic probably
-        if initial_params.get('structure_points') is not None:
-            pts3d = np.asarray(initial_params['structure_points'])
-            p_mean = np.mean(np.linalg.norm(pts3d, axis=1))
+        if initial_params.get('scene_points') is not None:
+            pts3d = np.asarray(initial_params['scene_points'])
+            p_mean = np.mean(np.linalg.norm(pts3d.reshape(-1, 3), axis=1))
             p_mean = 1.0 if p_mean < 1e-6 else p_mean
             scales[info['offset']:info['offset'] + info['size']] = p_mean
 
@@ -222,12 +222,12 @@ def _get_bounds(
                 k_higher_order_lo, k_higher_order_hi = -0.05, 0.05
 
                 dist_bounds_map = [
-                    (k_lo, k_hi), (k_lo, k_hi),         # k1, k2
-                    (p_lo, p_hi), (p_lo, p_hi),         # p1, p2
-                    (k_lo, k_hi),                       # k3
-                    (k_higher_order_lo, k_higher_order_hi),     # k4
-                    (k_higher_order_lo, k_higher_order_hi),     # k5
-                    (k_higher_order_lo, k_higher_order_hi)      # k6
+                    (k_lo, k_hi), (k_lo, k_hi),  # k1, k2
+                    (p_lo, p_hi), (p_lo, p_hi),  # p1, p2
+                    (k_lo, k_hi),                # k3
+                    (k_higher_order_lo, k_higher_order_hi),  # k4
+                    (k_higher_order_lo, k_higher_order_hi),  # k5
+                    (k_higher_order_lo, k_higher_order_hi)   # k6
                 ]
 
                 lb_dist = [b[0] for b in dist_bounds_map[:n_d]]
@@ -236,18 +236,18 @@ def _get_bounds(
                 lower_bounds[offset:offset + n_d] = lb_dist
                 upper_bounds[offset:offset + n_d] = ub_dist
 
-    # Extrinsics, board poses and structure points are left unbounded
+    # Extrinsics, board poses and scene points are left unbounded
     return jnp.array(lower_bounds), jnp.array(upper_bounds)
 
 def _pack_params(
-        camera_matrices:     jnp.ndarray,
-        dist_coeffs:         jnp.ndarray,
-        cam_rvecs:           jnp.ndarray,
-        cam_tvecs:           jnp.ndarray,
-        board_rvecs:         Optional[jnp.ndarray],
-        board_tvecs:         Optional[jnp.ndarray],
-        structure_points3d:  Optional[jnp.ndarray],
-        spec: Dict
+        camera_matrices:  jnp.ndarray,
+        dist_coeffs:      jnp.ndarray,
+        cam_rvecs:        jnp.ndarray,
+        cam_tvecs:        jnp.ndarray,
+        board_rvecs:      Optional[jnp.ndarray],
+        board_tvecs:      Optional[jnp.ndarray],
+        scene_points3d:   Optional[jnp.ndarray],
+        spec:             Dict
 ) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     """ Packs parameters into an optimization vector X and a fixed_params dict """
 
@@ -311,11 +311,11 @@ def _pack_params(
         fixed_params['board_r'] = board_rvecs
         fixed_params['board_t'] = board_tvecs
 
-    # Unkown 3D structure points
-    if 'structure_points' in spec['blocks']:
-        optim_parts.append(structure_points3d.ravel())
-    elif structure_points3d is not None:
-        fixed_params['structure_points'] = structure_points3d
+    # Unknown 3D scene points
+    if 'scene_points' in spec['blocks']:
+        optim_parts.append(scene_points3d.ravel())
+    elif scene_points3d is not None:
+        fixed_params['scene_points'] = scene_points3d
 
     x0 = jnp.concatenate(optim_parts) if optim_parts else jnp.array([])
     return x0, fixed_params
@@ -401,23 +401,23 @@ def _unpack_params(
         board_r_out = fixed_params.get('board_r', jnp.empty((0, 3)))
         board_t_out = fixed_params.get('board_t', jnp.empty((0, 3)))
 
-    # Unkown 3D structure points
-    structure_points_out = None
-    if 'structure_points' in spec['blocks']:
-        info = spec['blocks']['structure_points']
-        structure_flat = x[info['offset']: info['offset'] + info['size']]
-        structure_points_out = structure_flat.reshape(-1, 3)
-    elif 'structure_points' in fixed_params:
-        structure_points_out = fixed_params['structure_points']
+    # Unknown 3D scene points
+    scene_points_out = None
+    if 'scene_points' in spec['blocks']:
+        info = spec['blocks']['scene_points']
+        scene_flat = x[info['offset']: info['offset'] + info['size']]
+        scene_points_out = scene_flat.reshape(-1, 3)
+    elif 'scene_points' in fixed_params:
+        scene_points_out = fixed_params['scene_points']
 
-    return K_out, D_out, cam_r_out, cam_t_out, board_r_out, board_t_out, structure_points_out
+    return K_out, D_out, cam_r_out, cam_t_out, board_r_out, board_t_out, scene_points_out
 
 def residual_weights(
-        points2d:                   jnp.ndarray,  # (C, P, N, 2)
-        visibility_mask:            jnp.ndarray,  # (C, P, N)
-        camera_matrices:            jnp.ndarray,  # (C, 3, 3)
-        reproj_error:               Optional[jnp.ndarray] = None,  # (C, P, N) or None
-        distance_falloff_gamma:     float = 2.0
+        points2d:                jnp.ndarray,  # (C, P, N, 2)
+        visibility_mask:         jnp.ndarray,  # (C, P, N)
+        camera_matrices:         jnp.ndarray,  # (C, 3, 3)
+        reproj_error:            Optional[jnp.ndarray] = None,  # (C, P, N) or None
+        distance_falloff_gamma:  float = 2.0
 ) -> jnp.ndarray:
     """
     Compute per-observation weights for BA residuals based on
@@ -476,10 +476,11 @@ def make_jacobian_sparsity(
     cfg = spec['config']
     C, P = cfg['nb_cams'], cfg['nb_frames']
     N_board = cfg.get('nb_board_points', 0)
-    N_static = cfg.get('nb_structure_points', 0)
+    N_scene = cfg.get('nb_scene_points_per_frame', 0)
     origin_idx = cfg.get('origin_idx', 0)
 
-    num_residuals = 2 * P * C * (N_board + N_static)
+    # Total number of residuals includes both board and per-frame scene points
+    num_residuals = 2 * P * C * (N_board + N_scene)
     num_params = spec['total_size']
     S = lil_matrix((num_residuals, num_params), dtype=bool)
 
@@ -495,6 +496,7 @@ def make_jacobian_sparsity(
 
             # Dependencies for board points
             for n_board in range(N_board):
+                # Row index for the current observation (camera c, frame p, board point n)
                 row = 2 * (p * C * N_board + c * N_board + n_board)
 
                 # Each observation (p, c, n) depends on:
@@ -510,6 +512,7 @@ def make_jacobian_sparsity(
                     size_per_set = info['size'] // num_intr_sets
                     col = info['offset'] + intr_set_idx * size_per_set
                     S[row:row + 2, col:col + size_per_set] = 1
+
                 # - extrinsics of camera c
                 if 'extrinsics' in spec['blocks'] and c != origin_idx:
                     optim_pos = cam_idx_to_optim_pos[c]
@@ -519,6 +522,7 @@ def make_jacobian_sparsity(
                     t_col = info['offset'] + (num_optim_cams * 3) + optim_pos * 3
                     S[row:row + 2, r_col:r_col + 3] = 1
                     S[row:row + 2, t_col:t_col + 3] = 1
+
                 # - pose of board p
                 if 'board_poses' in spec['blocks']:
                     info = spec['blocks']['board_poses']
@@ -527,11 +531,13 @@ def make_jacobian_sparsity(
                     S[row:row + 2, r_col:r_col + 3] = 1
                     S[row:row + 2, t_col:t_col + 3] = 1
 
-            # Dependencies for unknown structure points
-            row_offset_static = 2 * P * C * N_board
+            # Dependencies for unknown per-frame scene points
+            row_offset_scene = 2 * P * C * N_board
 
-            for n_static in range(N_static):
-                row = row_offset_static + 2 * (p * C * N_static + c * N_static + n_static)
+            for n_scene in range(N_scene):
+                # Row index for obs (camera c, frame p, scene point n)
+                row = row_offset_scene + 2 * (p * C * N_scene + c * N_scene + n_scene)
+
                 # Each observation depends on:
                 # - intrinsics of camera c
                 if 'cam_mat' in spec['blocks']:
@@ -545,6 +551,7 @@ def make_jacobian_sparsity(
                     size_per_set = info['size'] // num_intr_sets
                     col = info['offset'] + intr_set_idx * size_per_set
                     S[row:row + 2, col:col + size_per_set] = 1
+
                 # - extrinsics of camera c
                 if 'extrinsics' in spec['blocks'] and c != origin_idx:
                     optim_pos = cam_idx_to_optim_pos[c]
@@ -554,10 +561,12 @@ def make_jacobian_sparsity(
                     t_col = info['offset'] + (num_optim_cams * 3) + optim_pos * 3
                     S[row:row + 2, r_col:r_col + 3] = 1
                     S[row:row + 2, t_col:t_col + 3] = 1
-                # - 3D coordinates of the static point n_static
-                if 'structure_points' in spec['blocks']:
-                    info = spec['blocks']['structure_points']
-                    col = info['offset'] + n_static * 3
+
+                # 3D coordinates of the n-th scene point for the p-th frame
+                if 'scene_points' in spec['blocks']:
+                    info = spec['blocks']['scene_points']
+                    point_overall_index = p * N_scene + n_scene
+                    col = info['offset'] + point_overall_index * 3
                     S[row:row + 2, col:col + 3] = 1
 
     # Add sparsity for all priors
@@ -586,18 +595,19 @@ def make_jacobian_sparsity(
         info = spec['blocks']['extrinsics']
         num_optim_cams = C - 1
 
-        for i in range(num_optim_cams):
-            # Rotation prior for camera i
-            r_row = current_prior_row + i * 3
-            r_col = info['offset'] + i * 3
-            S[r_row:r_row + 3, r_col:r_col + 3] = np.eye(3, dtype=bool)
+        # Priors are applied to the flattened block of rvecs then tvecs
+        r_cols_start = info['offset']
+        t_cols_start = info['offset'] + 3 * num_optim_cams
 
-            # Translation prior for camera i
-            t_row = current_prior_row + num_optim_cams * 3 + i * 3
-            t_col = info['offset'] + num_optim_cams * 3 + i * 3
-            S[t_row:t_row + 3, t_col:t_col + 3] = np.eye(3, dtype=bool)
-
-        current_prior_row += 6 * num_optim_cams
+        # Add identity blocks for rotation and translation priors
+        S[
+            current_prior_row: current_prior_row + 3 * num_optim_cams, r_cols_start: r_cols_start + 3 * num_optim_cams] = np.eye(
+            3 * num_optim_cams, dtype=bool)
+        current_prior_row += 3 * num_optim_cams
+        S[
+            current_prior_row: current_prior_row + 3 * num_optim_cams, t_cols_start: t_cols_start + 3 * num_optim_cams] = np.eye(
+            3 * num_optim_cams, dtype=bool)
+        current_prior_row += 3 * num_optim_cams
 
     # Cameras intrinsics priors
     if use_intrinsics_prior:
@@ -618,14 +628,14 @@ def make_jacobian_sparsity(
 
 
 def cost_function(
-        params:                 jnp.ndarray,    # The 1D optimization vector
+        params:                 jnp.ndarray,  # The 1D optimization vector
         fixed_params:           Dict,
         spec:                   Dict,
         board_points2d:         Optional[jnp.ndarray],
         board_points3d:         Optional[jnp.ndarray],
         board_points_weights:   Optional[jnp.ndarray],
-        static_points2d:        Optional[jnp.ndarray],  # (C, P, N_static, 2)
-        static_points_weights:  Optional[jnp.ndarray],  # (C, P, N_static)
+        scene_points2d:         Optional[jnp.ndarray], # (C, P, N_static, 2)
+        scene_points_weights:   Optional[jnp.ndarray], # (C, P, N_static)
         distortion_model:       DistortionModel,
         prior_weight_r:         float,
         prior_weight_t:         float,
@@ -633,8 +643,7 @@ def cost_function(
         prior_weight_c:         float,
         prior_weight_d:         float
 ) -> jnp.ndarray:
-
-    Ks, Ds, cam_r, cam_t, board_r, board_t, structure_points = _unpack_params(params, fixed_params, spec)
+    Ks, Ds, cam_r, cam_t, board_r, board_t, scene_points = _unpack_params(params, fixed_params, spec)
     all_residuals, all_sq_errors, all_weighted_points = [], [], []
     r_w2c, t_w2c = invert_rtvecs(cam_r, cam_t)
 
@@ -655,20 +664,23 @@ def cost_function(
         all_sq_errors.append(jnp.sum(jnp.square(weighted_resid)))
         all_weighted_points.append(jnp.sum(effective_weights > 0))
 
-    # Reprojection residuals for static structure points
-    if structure_points is not None and static_points2d is not None and static_points_weights is not None:
-        nb_frames = static_points2d.shape[1]
-        dummy_r, dummy_t = jnp.zeros((nb_frames, 3)), jnp.zeros((nb_frames, 3))
-        reproj, valid_depth = project_object_views_batched(
-            structure_points, r_w2c, t_w2c, dummy_r, dummy_t, Ks, Ds, distortion_model)
+    # Reprojection residuals for per-frame scene points
+    if scene_points is not None and scene_points2d is not None and scene_points_weights is not None:
+        P, N_scene = scene_points2d.shape[1:3]
+
+        # Reshape the flattened 3D points to be per-frame (P, N, 3)
+        per_frame_points3d = scene_points.reshape((P, N_scene, 3))
+
+        # Project all per-frame points into all cameras
+        reproj, valid_depth = project_multiple_to_multiple(
+            per_frame_points3d, r_w2c, t_w2c, Ks, Ds, distortion_model
+        )
 
         reproj = jnp.nan_to_num(reproj)
-        resid = reproj - static_points2d
-
-        # Combine the pre-computed weights with the dynamic depth-validity weight
-        effective_weights = static_points_weights * valid_depth
+        resid = reproj - scene_points2d
 
         # Apply the combined weights to the residual
+        effective_weights = scene_points_weights * valid_depth
         weighted_resid = resid * effective_weights[..., None]
 
         all_residuals.append(weighted_resid.ravel())
@@ -692,7 +704,7 @@ def cost_function(
         cam_mask = jnp.arange(spec['config']['nb_cams']) != origin_idx
 
         # Calculate difference with init parameters for all cameras
-        # we need to use jnp.where to zero-out the residual for the origin camera instead of removing it (otherwise JAX wouldn't like it)
+        # (jnp.where to zero-out the residual for the fixed origin camera)
         rvec_diff = jnp.where(cam_mask[:, None], cam_r - fixed_params['cam_r_init'], 0.0)
         tvec_diff = jnp.where(cam_mask[:, None], cam_t - fixed_params['cam_t_init'], 0.0)
 
@@ -738,64 +750,69 @@ def cost_function(
 
 
 def run_bundle_adjustment(
-        camera_matrices:         jnp.ndarray,
-        distortion_coeffs:       jnp.ndarray,
-        cam_rvecs:               jnp.ndarray,
-        cam_tvecs:               jnp.ndarray,
-        images_sizes_wh:         ArrayLike,
-        board_rvecs:             Optional[jnp.ndarray] = None,
-        board_tvecs:             Optional[jnp.ndarray] = None,
-        board_points2d:          Optional[jnp.ndarray] = None,
-        board_visibility_mask:   Optional[jnp.ndarray] = None,
-        board_points3d:          Optional[jnp.ndarray] = None,
-        static_points3d_initial: Optional[jnp.ndarray] = None,
-        static_points2d:         Optional[jnp.ndarray] = None,
-        static_visibility_mask:  Optional[jnp.ndarray] = None,
-        fix_structure:           bool = True,
-        origin_idx:              int = 0,
-        priors:                  Optional[Dict] = None,
-        radial_penalty:          float = 2.0,
-        fix_camera_matrix:       bool = False,
-        fix_distortion:          bool = False,
-        fix_extrinsics:          bool = False,
-        fix_board_poses:         bool = False,
-        fix_aspect_ratio:        bool = False,
-        shared_intrinsics:       bool = False,
-        distortion_model:        DistortionModel = 'standard',
-        max_frames:              Optional[int] = None,
-        tolerance:               float = 1e-8,
-        max_nfev:                int = 500
+        camera_matrices:        jnp.ndarray,
+        distortion_coeffs:      jnp.ndarray,
+        cam_rvecs:              jnp.ndarray,
+        cam_tvecs:              jnp.ndarray,
+        images_sizes_wh:        ArrayLike,
+        board_rvecs:            Optional[jnp.ndarray] = None,
+        board_tvecs:            Optional[jnp.ndarray] = None,
+        board_points2d:         Optional[jnp.ndarray] = None,
+        board_visibility_mask:  Optional[jnp.ndarray] = None,
+        board_points3d:         Optional[jnp.ndarray] = None,
+        scene_points3d_initial: Optional[jnp.ndarray] = None,
+        scene_points2d:         Optional[jnp.ndarray] = None,
+        scene_visibility_mask:  Optional[jnp.ndarray] = None,
+        fix_scene:              bool = True,
+        origin_idx:             int = 0,
+        priors:                 Optional[Dict] = None,
+        radial_penalty:         float = 2.0,
+        fix_camera_matrix:      bool = False,
+        fix_distortion:         bool = False,
+        fix_extrinsics:         bool = False,
+        fix_board_poses:        bool = False,
+        fix_aspect_ratio:       bool = False,
+        shared_intrinsics:      bool = False,
+        distortion_model:       DistortionModel = 'standard',
+        max_frames:             Optional[int] = None,
+        tolerance:              float = 1e-8,
+        max_nfev:               int = 500
 ) -> Tuple[bool, Dict]:
 
     # Determine problem dimensions
     C = camera_matrices.shape[0]
+    P_full, N_board, N_scene = 0, 0, 0
 
-    P_full, N_board, N_static = 0, 0, 0
-
+    # Get dimensions from board data if available
     if board_visibility_mask is not None:
-        _, P_full, N_board = board_visibility_mask.shape
+        _, P_board, N_board = board_visibility_mask.shape
+        P_full = max(P_full, P_board)
 
-    if static_visibility_mask is not None:
-        # this gets P_full if visibility_mask is None
-        _, P_full, N_static = static_visibility_mask.shape
+    # Get dimensions from per-frame scene data if available
+    if scene_visibility_mask is not None:
+        _, P_scene, N_scene = scene_visibility_mask.shape
+        P_full = max(P_full, P_scene)
 
     # if an override is given, use it (this avoids reshaping large arrays)
     P = max_frames if max_frames is not None and P_full > 0 else P_full
 
     images_sizes_wh = np.atleast_2d(images_sizes_wh)
 
+    # Total number of 3D scene points is per-frame (P * N)
+    total_scene_points = P * N_scene
+
     spec = _get_parameter_spec(
         nb_cams=C, nb_frames=P, origin_idx=origin_idx,
         fix_camera_matrix=fix_camera_matrix, fix_distortion=fix_distortion,
         fix_extrinsics=fix_extrinsics, fix_board_poses=fix_board_poses,
-        fix_structure=fix_structure, nb_structure_points=N_static,
+        fix_scene=fix_scene, nb_scene_points=total_scene_points,
         fix_aspect_ratio=fix_aspect_ratio, shared_intrinsics=shared_intrinsics,
         distortion_model=distortion_model
     )
 
     # Add nb of points to spec for jacobian sparsity calculation
     spec['config']['nb_board_points'] = N_board
-    spec['config']['nb_structure_points'] = N_static
+    spec['config']['nb_scene_points_per_frame'] = N_scene
 
     # Unpack priors dictionary into floats for jax
     # TODO: maybe a dual API with simple and advanced control for the priors would be cool?
@@ -817,7 +834,7 @@ def run_bundle_adjustment(
         n_d = spec['config']['n_d']
         current_d = distortion_coeffs.shape[1]
         if current_d < n_d:
-            padding= ((0, 0), (0, n_d - current_d))
+            padding = ((0, 0), (0, n_d - current_d))
             distortion_coeffs = jnp.pad(distortion_coeffs, padding, mode='constant')
 
     x0, fixed_params = _pack_params(
@@ -825,9 +842,9 @@ def run_bundle_adjustment(
         distortion_coeffs,
         cam_rvecs,
         cam_tvecs,
-        board_rvecs,
-        board_tvecs,
-        static_points3d_initial,
+        board_rvecs[:P] if board_rvecs is not None else None,
+        board_tvecs[:P] if board_tvecs is not None else None,
+        scene_points3d_initial,
         spec
     )
 
@@ -838,27 +855,27 @@ def run_bundle_adjustment(
     # Generate per-parameter scales for the optimizer
     initial_params_for_scaling = {
         'cam_tvecs': cam_tvecs,
-        'board_tvecs': board_tvecs,
-        'structure_points': static_points3d_initial
+        'board_tvecs': board_tvecs[:P] if board_tvecs is not None else None,
+        'scene_points': scene_points3d_initial
     }
     x_scales_np = _get_parameter_scales(spec, initial_params_for_scaling, images_sizes_wh)
 
-    # Setup static arguments for the residual function
-    board_weights, static_weights = None, None
+    # Setup weights for residual function
+    board_weights, scene_weights = None, None
 
     if board_points2d is not None and board_visibility_mask is not None:
-        board_weights = residual_weights(points2d=board_points2d,
-                                         visibility_mask=board_visibility_mask,
+        board_weights = residual_weights(points2d=board_points2d[:, :P],
+                                         visibility_mask=board_visibility_mask[:, :P],
                                          camera_matrices=camera_matrices,
                                          reproj_error=None,
                                          distance_falloff_gamma=radial_penalty)     # (C, P, N)
 
-    if static_points2d is not None and static_visibility_mask is not None:
-        static_weights = residual_weights(points2d=static_points2d,
-                                          visibility_mask=static_visibility_mask,
-                                          camera_matrices=camera_matrices,
-                                          reproj_error=None,
-                                          distance_falloff_gamma=radial_penalty)    # (C, P, N)
+    if scene_points2d is not None and scene_visibility_mask is not None:
+        scene_weights = residual_weights(points2d=scene_points2d[:, :P],
+                                             visibility_mask=scene_visibility_mask[:, :P],
+                                             camera_matrices=camera_matrices,
+                                             reproj_error=None,
+                                             distance_falloff_gamma=radial_penalty)    # (C, P, N)
 
     # Create the partial function, baking in all static data
     residuals_fn_partial = partial(
@@ -868,13 +885,10 @@ def run_bundle_adjustment(
 
         board_points2d=board_points2d[:, :P] if board_points2d is not None else None,
         board_points3d=board_points3d,
-        board_points_weights=board_weights[:, :P] if board_weights is not None else None,
-
-        static_points2d=static_points2d[:, :P] if static_points2d is not None else None,
-        static_points_weights=static_weights[:, :P] if static_weights is not None else None,
-
+        board_points_weights=board_weights,
+        scene_points2d=scene_points2d[:, :P] if scene_points2d is not None else None,
+        scene_points_weights=scene_weights,
         distortion_model=distortion_model,
-
         prior_weight_r=prior_weight_r,
         prior_weight_t=prior_weight_t,
         prior_weight_f=prior_weight_f,
@@ -920,11 +934,15 @@ def run_bundle_adjustment(
         jnp.asarray(result.x), fixed_params, spec
     )
 
+    # Reshape scene points to be per-frame (P, N, 3)
+    if struct_pts_opt is not None and N_scene > 0:
+        struct_pts_opt = struct_pts_opt.reshape((P, N_scene, 3))
+
     ret_vals = {
         'K_opt': K_opt, 'D_opt': D_opt,
         'cam_r_opt': cam_r_opt, 'cam_t_opt': cam_t_opt,
         'board_r_opt': board_r_opt, 'board_t_opt': board_t_opt,
-        'structure_points_opt': struct_pts_opt
+        'scene_points_opt': struct_pts_opt
     }
 
     return result.success, ret_vals
