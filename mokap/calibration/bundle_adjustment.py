@@ -792,13 +792,13 @@ def run_bundle_adjustment(
         distortion_model:       DistortionModel = 'standard',
         max_frames:             Optional[int] = None,
         tolerance:              float = 1e-8,
+        time_independent_mode:  bool = False,
         max_nfev:               int = 500
 ) -> Tuple[bool, Dict]:
 
     # Determine problem dimensions
     C = camera_matrices.shape[0]
     P, N_board, N_per_frame = 0, 0, 0
-    is_sparse_mode = False
 
     # Get dimensions from board data if available
     if board_visibility_mask is not None:
@@ -812,15 +812,10 @@ def run_bundle_adjustment(
         _, P_scene, N_mask_dim = scene_visibility_mask.shape
         P = max(P, P_scene)
 
-        # Sparse mode: The last dimension of the visibility mask is the total number of points
-        # Dense mode: The last dimension is the number of points per frame
-        if N_mask_dim == total_scene_points and P > 0:
-            is_sparse_mode = True
-            N_per_frame = total_scene_points // P
-            if total_scene_points % P != 0:
-                raise ValueError("In sparse mode, total points must be divisible by num frames.")
+        # TODO: The two modes should be clarified
+        if time_independent_mode:
+            N_per_frame = total_scene_points // P if P > 0 else 0
         else:
-            is_sparse_mode = False
             N_per_frame = N_mask_dim
 
     if max_frames is not None and P > 0:
@@ -844,7 +839,7 @@ def run_bundle_adjustment(
     )
 
     # Add run mode and nb of points to spec for jacobian sparsity calculation
-    spec['config']['is_sparse_mode'] = is_sparse_mode
+    spec['config']['is_sparse_mode'] = time_independent_mode
     spec['config']['nb_board_points'] = N_board
     spec['config']['nb_scene_points_per_frame'] = N_per_frame
 
