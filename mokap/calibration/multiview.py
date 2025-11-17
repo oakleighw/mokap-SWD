@@ -467,13 +467,19 @@ class MultiviewCalibrationTool:
                 #
                 logger.debug(f"[BA] >>> STAGE 1: Consolidating cameras position with {current_P} frames...")
                 success_s1, results_s1 = bundle_adjustment.run_bundle_adjustment(
+                    camera_matrices=K_online,
+                    distortion_coeffs=D_online,
+                    cam_rvecs=cam_r_online,
+                    cam_tvecs=cam_t_online,
 
-                    K_online, D_online, cam_r_online, cam_t_online, board_r_online, board_t_online,
+                    images_sizes_wh=self._images_sizes_wh,
 
-                    pts2d_buf, vis_buf,
+                    board_rvecs=board_r_online,
+                    board_tvecs=board_t_online,
+                    board_points2d=pts2d_buf,
+                    board_visibility_mask=vis_buf,
+                    board_points3d=self._object_points,
 
-                    self._object_points,
-                    self._images_sizes_wh,
                     origin_idx=self.origin_idx,
 
                     max_frames=current_P,
@@ -483,7 +489,7 @@ class MultiviewCalibrationTool:
                     shared_intrinsics=True,         # This is critical: Forces a single camera model for all views
                     fix_aspect_ratio=True,          # this is a simplification: it assumes fx = fy
                     distortion_model='simple',      # we use a simple model...
-                    fix_distortion=True,            # ...but don;t optimize it. it's frozen it at 0
+                    fix_distortion=True,            # ...but dont optimize it. it's frozen it at 0
 
                     # Free parameters we want to solve for
                     fix_camera_matrix=False,
@@ -509,13 +515,19 @@ class MultiviewCalibrationTool:
                 board_r_s2_init, board_t_s2_init = results_s1['board_r_opt'], results_s1['board_t_opt']
 
                 success_s2, results_s2 = bundle_adjustment.run_bundle_adjustment(
+                    camera_matrices=K_s2_init,
+                    distortion_coeffs=D_s2_init,
+                    cam_rvecs=cam_r_s2_init,
+                    cam_tvecs=cam_t_s2_init,
 
-                    K_s2_init, D_s2_init, cam_r_s2_init, cam_t_s2_init, board_r_s2_init, board_t_s2_init,
+                    images_sizes_wh=self._images_sizes_wh,
 
-                    pts2d_buf, vis_buf,
+                    board_rvecs=board_r_s2_init,
+                    board_tvecs=board_t_s2_init,
+                    board_points2d=pts2d_buf,
+                    board_visibility_mask=vis_buf,
+                    board_points3d=self._object_points,
 
-                    self._object_points,
-                    self._images_sizes_wh,
                     origin_idx=self.origin_idx,
 
                     max_frames=current_P,
@@ -551,13 +563,20 @@ class MultiviewCalibrationTool:
                 board_r_s3_init, board_t_s3_init = results_s2['board_r_opt'], results_s2['board_t_opt']
 
                 success_s3, final_results_attempt = bundle_adjustment.run_bundle_adjustment(
+                    camera_matrices=K_s3_init,
+                    distortion_coeffs=D_s3_init,
+                    cam_rvecs=cam_r_s3_init,
+                    cam_tvecs=cam_t_s3_init,
 
-                    K_s3_init, D_s3_init, cam_r_s3_init, cam_t_s3_init, board_r_s3_init, board_t_s3_init,
+                    images_sizes_wh=self._images_sizes_wh,
 
-                    pts2d_buf, vis_buf,
+                    board_rvecs=board_r_s3_init,
+                    board_tvecs=board_t_s3_init,
+                    board_points2d=pts2d_buf,
+                    board_visibility_mask=vis_buf,
 
-                    self._object_points,
-                    self._images_sizes_wh,
+                    board_points3d=self._object_points,
+
                     origin_idx=self.origin_idx,
 
                     max_frames=current_P,
