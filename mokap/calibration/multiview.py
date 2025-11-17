@@ -158,7 +158,7 @@ class MultiviewCalibrationTool:
         if not jnp.any(known_mask):
             return
 
-        # --- Initial Board Pose Estimation ---
+        # Initial board pose estimation
         E_b2c_all = jnp.stack([entry[1] for entry in entries])
         E_c2w_known = extrinsics_matrix(self._rvecs_c2w[cam_indices[known_mask]],
                                         self._tvecs_c2w[cam_indices[known_mask]])
@@ -167,7 +167,7 @@ class MultiviewCalibrationTool:
         # Initial vote for the board's pose based on currently known cameras
         E_b2w_votes = E_c2w_known @ E_b2c_known
 
-        # --- Temporal disambiguation using a stable ref pose ---
+        # Temporal disambiguation using a stable ref pose
         if len(self._board_pose_history) > 0:
 
             history_r, history_t = extmat_to_rtvecs(jnp.stack(list(self._board_pose_history)))
@@ -205,7 +205,7 @@ class MultiviewCalibrationTool:
             if num_corrected > 0:
                 logger.debug(f"[FLIP_CORRECTED] Corrected {num_corrected} PnP results using stable reference.")
 
-        # --- Averaging and Quality Control ---
+        # Averaging and quality control
         r_stack, t_stack = extmat_to_rtvecs(E_b2w_votes)
         q_stack = axisangle_to_quaternion_batched(r_stack)
         rt_stack = jnp.concatenate([q_stack, t_stack], axis=1)
@@ -222,7 +222,7 @@ class MultiviewCalibrationTool:
             self._latest_board_pose_w = None  # invalidate the single-frame pose
             return
 
-        # --- Update state with the new good pose ---
+        # Update state with the new good pose
         E_b2w = extrinsics_matrix(quaternion_to_axisangle(q_avg), t_avg)
         self._latest_board_pose_w = E_b2w
         self._board_pose_history.append(E_b2w)
@@ -291,7 +291,7 @@ class MultiviewCalibrationTool:
         if not success:
             return
 
-        #--- From here on, rvec and tvec should be sane ---
+        # From here on rvec and tvec should be sane
 
         f = detection.frame
         self._last_frame[cam_idx] = f
