@@ -1,5 +1,4 @@
 import numpy as np
-from Cython.Compiler.TypeInference import object_expr
 from scipy.optimize import least_squares
 from scipy.sparse import lil_matrix, csr_matrix
 from typing import Tuple, Dict, Optional
