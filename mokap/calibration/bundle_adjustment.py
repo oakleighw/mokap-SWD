@@ -10,7 +10,8 @@ from mokap.utils import CallbackOutputStream
 from mokap.utils.datatypes import DistortionModel
 from alive_progress import alive_bar
 
-from mokap.utils.geometry.projective import project_object_views_batched, project_multiple_to_multiple
+from mokap.utils.geometry.projective import project_object_views_batched, project_to_multiple_cameras, \
+    project_multiple_to_multiple
 from mokap.utils.geometry.transforms import invert_rtvecs
 
 DIST_MODEL_MAP = {'none': 0, 'simple': 4, 'standard': 5, 'full': 8, 'rational': 8}
@@ -664,22 +665,40 @@ def cost_function(
         all_sq_errors.append(jnp.sum(jnp.square(weighted_resid)))
         all_weighted_points.append(jnp.sum(effective_weights > 0))
 
-    # Reprojection residuals for per-frame scene points
+        # Reprojection residuals for scene points (mode-dependent logic)
     if scene_points is not None and scene_points2d is not None and scene_points_weights is not None:
-        P, N_scene = scene_points2d.shape[1:3]
+        is_sparse_mode = spec['config']['is_sparse_mode']
 
-        # Reshape the flattened 3D points to be per-frame (P, N, 3)
-        per_frame_points3d = scene_points.reshape((P, N_scene, 3))
+        if is_sparse_mode:
+            # Independent Points / Scaffolding mode
+            reproj_all, valid_depth_flat = project_to_multiple_cameras(
+                scene_points, r_w2c, t_w2c, Ks, Ds, distortion_model
+            )  # (C, N_total, 2) and (C, N_total)
 
-        # Project all per-frame points into all cameras
-        reproj, valid_depth = project_multiple_to_multiple(
-            per_frame_points3d, r_w2c, t_w2c, Ks, Ds, distortion_model
-        )
+            reproj_expanded = jnp.expand_dims(reproj_all, axis=1)  # (C, 1, N_total, 2)
+            valid_depth = jnp.expand_dims(valid_depth_flat, axis=1)  # (C, 1, N_total)
 
-        effective_weights = scene_points_weights * valid_depth
-        resid = jnp.where(effective_weights[..., None] > 0, jnp.nan_to_num(reproj) - scene_points2d, 0.0)
+            # Broadcasting handles the sparse subtraction
+            effective_weights = scene_points_weights * valid_depth
+            resid = jnp.where(effective_weights[..., None] > 0, jnp.nan_to_num(reproj_expanded) - scene_points2d, 0.0)
+
+        else:
+            # Temporally-consistent / Pose refinement mode
+            P = scene_points2d.shape[1]
+            N_per_frame = scene_points2d.shape[2]
+
+            # Reshape the flattened 3D points back to be per-frame (P, N, 3)
+            per_frame_points3d = scene_points.reshape((P, N_per_frame, 3))
+
+            reproj_all, valid_depth = project_multiple_to_multiple(
+                per_frame_points3d, r_w2c, t_w2c, Ks, Ds, distortion_model
+            )  # (C, P, N_per_frame, 2) and (C, P, N_per_frame)
+
+            effective_weights = scene_points_weights * valid_depth
+            resid = jnp.where(effective_weights[..., None] > 0, jnp.nan_to_num(reproj_all) - scene_points2d, 0.0)
+
+        # Common logic to append results
         weighted_resid = resid * effective_weights[..., None]
-
         all_residuals.append(weighted_resid.ravel())
         all_sq_errors.append(jnp.sum(jnp.square(weighted_resid)))
         all_weighted_points.append(jnp.sum(effective_weights > 0))
@@ -778,38 +797,56 @@ def run_bundle_adjustment(
 
     # Determine problem dimensions
     C = camera_matrices.shape[0]
-    P_full, N_board, N_scene = 0, 0, 0
+    P, N_board, N_per_frame = 0, 0, 0
+    is_sparse_mode = False
 
     # Get dimensions from board data if available
     if board_visibility_mask is not None:
         _, P_board, N_board = board_visibility_mask.shape
-        P_full = max(P_full, P_board)
+        P = max(P, P_board)
 
-    # Get dimensions from per-frame scene data if available
+    # Determine number of scene points
+    total_scene_points = scene_points3d_initial.shape[0] if scene_points3d_initial is not None else 0
+
     if scene_visibility_mask is not None:
-        _, P_scene, N_scene = scene_visibility_mask.shape
-        P_full = max(P_full, P_scene)
+        _, P_scene, N_mask_dim = scene_visibility_mask.shape
+        P = max(P, P_scene)
 
-    # if an override is given, use it (this avoids reshaping large arrays)
-    P = max_frames if max_frames is not None and P_full > 0 else P_full
+        # Sparse mode: The last dimension of the visibility mask is the total number of points
+        # Dense mode: The last dimension is the number of points per frame
+        if N_mask_dim == total_scene_points and P > 0:
+            is_sparse_mode = True
+            N_per_frame = total_scene_points // P
+            if total_scene_points % P != 0:
+                raise ValueError("In sparse mode, total points must be divisible by num frames.")
+        else:
+            is_sparse_mode = False
+            N_per_frame = N_mask_dim
+
+    if max_frames is not None and P > 0:
+        P = max_frames
 
     images_sizes_wh = np.atleast_2d(images_sizes_wh)
 
-    # Total number of 3D scene points is per-frame (P * N)
-    total_scene_points = P * N_scene
-
     spec = _get_parameter_spec(
-        nb_cams=C, nb_frames=P, origin_idx=origin_idx,
-        fix_camera_matrix=fix_camera_matrix, fix_distortion=fix_distortion,
-        fix_extrinsics=fix_extrinsics, fix_board_poses=fix_board_poses,
-        fix_scene=fix_scene, nb_scene_points=total_scene_points,
-        fix_aspect_ratio=fix_aspect_ratio, shared_intrinsics=shared_intrinsics,
+        nb_cams=C,
+        nb_frames=P,
+        origin_idx=origin_idx,
+        fix_camera_matrix=fix_camera_matrix,
+        fix_distortion=fix_distortion,
+        fix_extrinsics=fix_extrinsics,
+        fix_board_poses=fix_board_poses,
+        fix_scene=fix_scene,
+        nb_scene_points=total_scene_points,
+        fix_aspect_ratio=fix_aspect_ratio,
+        shared_intrinsics=shared_intrinsics,
         distortion_model=distortion_model
     )
 
-    # Add nb of points to spec for jacobian sparsity calculation
+    # Add run mode and nb of points to spec for jacobian sparsity calculation
+    spec['config']['is_sparse_mode'] = is_sparse_mode
     spec['config']['nb_board_points'] = N_board
-    spec['config']['nb_scene_points_per_frame'] = N_scene
+    spec['config']['nb_scene_points_per_frame'] = N_per_frame
 
     # Unpack priors dictionary into floats for jax
     # TODO: maybe a dual API with simple and advanced control for the priors would be cool?
@@ -931,9 +968,9 @@ def run_bundle_adjustment(
         jnp.asarray(result.x), fixed_params, spec
     )
 
-    # Reshape scene points to be per-frame (P, N, 3)
-    if struct_pts_opt is not None and N_scene > 0:
-        struct_pts_opt = struct_pts_opt.reshape((P, N_scene, 3))
+
+    if struct_pts_opt is not None:
+        struct_pts_opt = struct_pts_opt.reshape((total_scene_points, 3))
 
     ret_vals = {
         'K_opt': K_opt, 'D_opt': D_opt,
