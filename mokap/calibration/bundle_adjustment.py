@@ -866,11 +866,11 @@ def run_bundle_adjustment(
         fixed_params=fixed_params,
         spec=spec,
 
-        board_points_2d=board_points2d[:, :P] if board_points2d is not None else None,
-        object_points=board_points3d,
+        board_points2d=board_points2d[:, :P] if board_points2d is not None else None,
+        board_points3d=board_points3d,
         board_points_weights=board_weights[:, :P] if board_weights is not None else None,
 
-        static_points_2d=static_points2d[:, :P] if static_points2d is not None else None,
+        static_points2d=static_points2d[:, :P] if static_points2d is not None else None,
         static_points_weights=static_weights[:, :P] if static_weights is not None else None,
 
         distortion_model=distortion_model,
