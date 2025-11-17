@@ -676,11 +676,8 @@ def cost_function(
             per_frame_points3d, r_w2c, t_w2c, Ks, Ds, distortion_model
         )
 
-        reproj = jnp.nan_to_num(reproj)
-        resid = reproj - scene_points2d
-
-        # Apply the combined weights to the residual
         effective_weights = scene_points_weights * valid_depth
+        resid = jnp.where(effective_weights[..., None] > 0, jnp.nan_to_num(reproj) - scene_points2d, 0.0)
         weighted_resid = resid * effective_weights[..., None]
 
         all_residuals.append(weighted_resid.ravel())
