@@ -453,8 +453,9 @@ class MultiviewCalibrationTool:
                 cam_t_online = self._tvecs_c2w
                 K_online = self._cam_matrices
                 D_online = self._dist_coeffs
-                board_r_online = jnp.stack(r_board_w_list)
-                board_t_online = jnp.stack(t_board_w_list)
+
+                poses_r_initial = jnp.stack(r_board_w_list)
+                poses_t_initial = jnp.stack(t_board_w_list)
 
                 pts2d_buf = jnp.asarray(pts2d_buf)
                 vis_buf = jnp.asarray(vis_buf)
@@ -467,35 +468,34 @@ class MultiviewCalibrationTool:
                 #
                 logger.debug(f"[BA] >>> STAGE 1: Consolidating cameras position with {current_P} frames...")
                 success_s1, results_s1 = bundle_adjustment.run_bundle_adjustment(
-                    camera_matrices=K_online,
-                    distortion_coeffs=D_online,
-                    cam_rvecs=cam_r_online,
-                    cam_tvecs=cam_t_online,
+                    camera_matrices_initial=K_online,
+                    distortion_coeffs_initial=D_online,
+                    cam_rvecs_initial=cam_r_online,
+                    cam_tvecs_initial=cam_t_online,
 
                     images_sizes_wh=self._images_sizes_wh,
 
-                    board_rvecs=board_r_online,
-                    board_tvecs=board_t_online,
-                    board_points2d=pts2d_buf,
-                    board_visibility_mask=vis_buf,
-                    board_points3d=self._object_points,
+                    image_points=pts2d_buf,
+                    visibility_mask=vis_buf,
 
-                    origin_idx=self.origin_idx,
+                    object_points_initial=self._object_points,  # The board's 3D model
+                    poses_rvecs_initial=poses_r_initial,
+                    poses_tvecs_initial=poses_t_initial,
 
-                    max_frames=current_P,
+                    # BA logic control flags
+                    fix_cameras_intrinsics=False,
+                    fix_cameras_extrinsics=False,
+                    fix_object_points=True,              # The board's shape is known and rigid
+                    fix_poses=False,                # The board's pose is being optimized
+                    time_independent_points=False,  # It's the same board over time
 
+                    # Stage 1 specific flags
+                    shared_intrinsics=True,         # Forces a single camera model for all views
+                    fix_aspect_ratio=True,          # Assume fx = fy
+                    distortion_model='none',
                     priors=priors_stage1,
 
-                    shared_intrinsics=True,         # This is critical: Forces a single camera model for all views
-                    fix_aspect_ratio=True,          # this is a simplification: it assumes fx = fy
-                    distortion_model='simple',      # we use a simple model...
-                    fix_distortion=True,            # ...but dont optimize it. it's frozen it at 0
-
-                    # Free parameters we want to solve for
-                    fix_camera_matrix=False,
-                    fix_extrinsics=False,
-                    fix_board_poses=False,
-
+                    origin_idx=self.origin_idx,
                     radial_penalty=0.0      # for fisrst stage we want to consider all points, even at the edge
                 )
                 if not success_s1:
@@ -512,38 +512,36 @@ class MultiviewCalibrationTool:
 
                 K_s2_init, D_s2_init = results_s1['K_opt'], results_s1['D_opt']
                 cam_r_s2_init, cam_t_s2_init = results_s1['cam_r_opt'], results_s1['cam_t_opt']
-                board_r_s2_init, board_t_s2_init = results_s1['board_r_opt'], results_s1['board_t_opt']
+                poses_r_s2_init, poses_t_s2_init = results_s1['poses_r_opt'], results_s1['poses_t_opt']
 
                 success_s2, results_s2 = bundle_adjustment.run_bundle_adjustment(
-                    camera_matrices=K_s2_init,
-                    distortion_coeffs=D_s2_init,
-                    cam_rvecs=cam_r_s2_init,
-                    cam_tvecs=cam_t_s2_init,
+                    camera_matrices_initial=K_s2_init,
+                    distortion_coeffs_initial=D_s2_init,
+                    cam_rvecs_initial=cam_r_s2_init,
+                    cam_tvecs_initial=cam_t_s2_init,
 
                     images_sizes_wh=self._images_sizes_wh,
 
-                    board_rvecs=board_r_s2_init,
-                    board_tvecs=board_t_s2_init,
-                    board_points2d=pts2d_buf,
-                    board_visibility_mask=vis_buf,
-                    board_points3d=self._object_points,
+                    image_points=pts2d_buf,
+                    visibility_mask=vis_buf,
 
-                    origin_idx=self.origin_idx,
+                    object_points_initial=self._object_points,
+                    poses_rvecs_initial=poses_r_s2_init,
+                    poses_tvecs_initial=poses_t_s2_init,
 
-                    max_frames=current_P,
+                    # BA logic control flags
+                    fix_cameras_intrinsics=False,
+                    fix_cameras_extrinsics=False,
+                    fix_object_points=True,
+                    fix_poses=False,
+                    time_independent_points=False,
+
+                    # Stage 2 specific flags
+                    shared_intrinsics=False,    # We now optimize per-camera intrinsics
+                    fix_aspect_ratio=False,     # We relax the aspect ratio constraint
+                    distortion_model='simple',  # And start optimising distortion
 
                     priors=priors_stage2,
-
-                    shared_intrinsics=False,    # Critical: we now optimize per-camera intrinsics
-                    fix_aspect_ratio=False,     # We relax the aspect ratio constraint
-                    distortion_model='simple',  # we use a simple 4-parameter model...
-                    fix_distortion=False,       # ... and start optimizing for it
-
-                    # Free parameters we want to solve for
-                    fix_camera_matrix=False,
-                    fix_extrinsics=False,
-                    fix_board_poses=False,
-
                     radial_penalty=2.0 # for second stage we want to start penalising points too far from the working volume
                 )
                 if not success_s2:
@@ -560,38 +558,36 @@ class MultiviewCalibrationTool:
 
                 K_s3_init, D_s3_init = results_s2['K_opt'], results_s2['D_opt']
                 cam_r_s3_init, cam_t_s3_init = results_s2['cam_r_opt'], results_s2['cam_t_opt']
-                board_r_s3_init, board_t_s3_init = results_s2['board_r_opt'], results_s2['board_t_opt']
+                poses_r_s3_init, poses_t_s3_init = results_s2['poses_r_opt'], results_s2['poses_t_opt']
 
                 success_s3, final_results_attempt = bundle_adjustment.run_bundle_adjustment(
-                    camera_matrices=K_s3_init,
-                    distortion_coeffs=D_s3_init,
-                    cam_rvecs=cam_r_s3_init,
-                    cam_tvecs=cam_t_s3_init,
+                    camera_matrices_initial=K_s3_init,
+                    distortion_coeffs_initial=D_s3_init,
+                    cam_rvecs_initial=cam_r_s3_init,
+                    cam_tvecs_initial=cam_t_s3_init,
 
                     images_sizes_wh=self._images_sizes_wh,
 
-                    board_rvecs=board_r_s3_init,
-                    board_tvecs=board_t_s3_init,
-                    board_points2d=pts2d_buf,
-                    board_visibility_mask=vis_buf,
+                    image_points=pts2d_buf,
+                    visibility_mask=vis_buf,
 
-                    board_points3d=self._object_points,
+                    object_points_initial=self._object_points,
+                    poses_rvecs_initial=poses_r_s3_init,
+                    poses_tvecs_initial=poses_t_s3_init,
 
-                    origin_idx=self.origin_idx,
+                    # BA logic control flags
+                    fix_cameras_intrinsics=False,
+                    fix_cameras_extrinsics=False,
+                    fix_object_points=True,
+                    fix_poses=False,
+                    time_independent_points=False,
 
-                    max_frames=current_P,
+                    # Stage 3 specific flags
+                    shared_intrinsics=False,
+                    fix_aspect_ratio=False,
+                    distortion_model='full',    # Full distortion model
 
                     priors=priors_stage3,       # Priors are mega important at this stage
-
-                    shared_intrinsics=False,    # Still optimising for this independently
-                    fix_aspect_ratio=False,     # Still letting fx and fy be independent
-                    distortion_model='full',    # Now we use a more elaborate model...
-                    fix_distortion=False,       # ...and of course we let it be optimised
-
-                    # These ones are ofc still optimised
-                    fix_camera_matrix=False,
-                    fix_extrinsics=False,
-                    fix_board_poses=False,
 
                     radial_penalty=4.0   # now we kinda want to ignore the points far from the working volume
                 )
@@ -631,12 +627,12 @@ class MultiviewCalibrationTool:
             final_D = final_results['D_opt']
             final_cam_r = final_results['cam_r_opt']
             final_cam_t = final_results['cam_t_opt']
-            final_board_r = final_results['board_r_opt']
-            final_board_t = final_results['board_t_opt']
+            final_poses_r = final_results['poses_r_opt']
+            final_poses_t = final_results['poses_t_opt']
 
             self._refined_intrinsics = (final_K, final_D)
             self._refined_extrinsics = (final_cam_r, final_cam_t)
-            self._refined_board_poses = (final_board_r, final_board_t)
+            self._refined_board_poses = (final_poses_r, final_poses_t)
 
             self._refined = True
             self.volume_of_trust()
@@ -688,7 +684,7 @@ class MultiviewCalibrationTool:
         if self._refined:
 
             # calculate the 3D world coordinates of all point instances using the refined poses
-            E_b2w_all_opt = extrinsics_matrix(*self._refined_board_poses)
+            E_b2w_all_opt = extrinsics_matrix(*self.refined_board_poses)
             world_pts_all_instances = jnp.einsum('pij,nj->pni', E_b2w_all_opt, self._board_pts_hom)[:, :, :3]
 
             # Reprojection and error calculation
