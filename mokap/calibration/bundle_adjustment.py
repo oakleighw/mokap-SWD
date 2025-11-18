@@ -43,13 +43,13 @@ def _get_parameter_spec(
     current_offset = 0
 
     is_shared = shared_intrinsics and nb_cams > 1
-    num_intr_sets = 1 if is_shared else nb_cams
+    nb_intr_sets = 1 if is_shared else nb_cams
 
     # Cameras intrinsics
     if not fix_cameras_intrinsics:
         # Camera matrix params (f, cx, cy) or (fx, fy, cx, cy)
         size_per_set = 3 if fix_aspect_ratio else 4
-        size_cam_mat = size_per_set * num_intr_sets
+        size_cam_mat = size_per_set * nb_intr_sets
         spec['blocks']['cam_mat'] = {'offset': current_offset, 'size': size_cam_mat}
         current_offset += size_cam_mat
 
@@ -57,15 +57,15 @@ def _get_parameter_spec(
         n_d = DIST_MODEL_MAP[distortion_model]
         spec['config']['n_d'] = n_d
         if n_d > 0:
-            size_dist = n_d * num_intr_sets
+            size_dist = n_d * nb_intr_sets
             spec['blocks']['distortion'] = {'offset': current_offset, 'size': size_dist}
             current_offset += size_dist
 
     # Camera extrinsics
     if not fix_cameras_extrinsics:
         # We optimize for all cameras except the origin camera
-        num_optim_cams = nb_cams - 1
-        size = 6 * num_optim_cams  # 6 params (3 rvec, 3 tvec) per camera
+        nb_optim_cams = nb_cams - 1
+        size = 6 * nb_optim_cams  # 6 params (3 rvec, 3 tvec) per camera
         spec['blocks']['extrinsics'] = {'offset': current_offset, 'size': size}
         current_offset += size
 
@@ -95,15 +95,15 @@ def _get_parameter_scales(
     C = cfg['nb_cams']
     P = cfg['nb_frames']
     is_shared = cfg['shared_intrinsics'] and C > 1
-    num_intr_sets = 1 if is_shared else C
+    nb_intr_sets = 1 if is_shared else C
 
     scales = np.ones(spec['total_size'], dtype=np.float64)
 
     # Cameras intrinsics scales
     if 'cam_mat' in spec['blocks']:
         info = spec['blocks']['cam_mat']
-        size_per_set = info['size'] // num_intr_sets
-        for i in range(num_intr_sets):
+        size_per_set = info['size'] // nb_intr_sets
+        for i in range(nb_intr_sets):
             cam_idx = 0 if is_shared else i
             w, h = images_sizes_wh[cam_idx]
             offset = info['offset'] + i * size_per_set
@@ -123,10 +123,10 @@ def _get_parameter_scales(
     # Cameras extrinsics scales
     if 'extrinsics' in spec['blocks']:
         info = spec['blocks']['extrinsics']
-        num_optim_cams = C - 1
+        nb_optim_cams = C - 1
 
         # Scale for rotation vectors (radians)
-        r_scales = np.full(3 * num_optim_cams, 1.0)
+        r_scales = np.full(3 * nb_optim_cams, 1.0)
 
         # For translation vectors, the std of their initial values is a good heuristic
         origin_idx = cfg.get('origin_idx', 0)
@@ -134,7 +134,7 @@ def _get_parameter_scales(
         tvecs_to_optim = np.asarray(initial_params['cam_tvecs'][cam_mask])
         t_std = np.std(tvecs_to_optim, axis=0)
         t_std[t_std < 1e-6] = 1.0
-        t_scales = np.tile(t_std, num_optim_cams)
+        t_scales = np.tile(t_std, nb_optim_cams)
 
         scales[info['offset']:info['offset'] + info['size']] = np.concatenate([r_scales, t_scales])
 
@@ -170,14 +170,14 @@ def _get_parameter_scales(
 def _get_bounds(
         spec: Dict,
         images_sizes_wh: ArrayLike
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+) -> Tuple[np.ndarray, np.ndarray]:
     """
     Computes lower and upper bounds for the optimization variables based on the spec
     """
     cfg = spec['config']
     C = cfg['nb_cams']
     is_shared = cfg['shared_intrinsics'] and C > 1
-    num_intr_sets = 1 if is_shared else C
+    nb_intr_sets = 1 if is_shared else C
 
     # initialize with -inf, +inf for all parameters
     lower_bounds = np.full(spec['total_size'], -np.inf, dtype=np.float64)
@@ -185,14 +185,14 @@ def _get_bounds(
 
     # Set bounds for camera intrinsics
     if not cfg['fix_cameras_intrinsics']:
-        for i in range(num_intr_sets):
+        for i in range(nb_intr_sets):
             cam_idx = 0 if is_shared else i
             w, h = images_sizes_wh[cam_idx]
 
             # Focal Length and Principal Point
             if 'cam_mat' in spec['blocks']:
                 info = spec['blocks']['cam_mat']
-                size_per_set = info['size'] // num_intr_sets
+                size_per_set = info['size'] // nb_intr_sets
                 offset = info['offset'] + i * size_per_set
 
                 f_lo, f_hi = 100.0, 100000.0
@@ -219,6 +219,7 @@ def _get_bounds(
                 # k_lo, k_hi = -1.5, 1.5
                 # p_lo, p_hi = -0.5, 0.5
                 # k_higher_order_lo, k_higher_order_hi = -0.5, 0.5  # Tighter bounds for higher order
+
                 # TODO: Bounds dict passed from the outside with lens types presets!!!!!
                 k_lo, k_hi = -0.1, 0.1
                 p_lo, p_hi = -0.005, 0.005
@@ -240,7 +241,7 @@ def _get_bounds(
                 upper_bounds[offset:offset + n_d] = ub_dist
 
     # Extrinsics, poses and points are left unbounded
-    return jnp.array(lower_bounds), jnp.array(upper_bounds)
+    return lower_bounds, upper_bounds
 
 def _pack_params(
         camera_matrices:    jnp.ndarray,
@@ -292,8 +293,9 @@ def _pack_params(
         origin_idx = cfg.get('origin_idx', 0)
         cam_mask = jnp.arange(cfg['nb_cams']) != origin_idx
 
-        optim_parts.append(cam_rvecs[cam_mask].ravel())
-        optim_parts.append(cam_tvecs[cam_mask].ravel())
+        optim_parts.append(cam_rvecs[cam_mask].ravel())  # [r1, r2, r3, r4, ...]
+        optim_parts.append(cam_tvecs[cam_mask].ravel())  # [t1, t2, t3, t4, ...]
+        # TODO: This is different from how poses are packed (they alternate r,t per pose), consider uniformising
 
         # Also store fixed origin pose separately for convenience in unpacking
         fixed_params['origin_r'] = cam_rvecs[origin_idx]
@@ -372,11 +374,11 @@ def _unpack_params(
     if 'extrinsics' in spec['blocks']:
         origin_idx = cfg.get('origin_idx', 0)
         info = spec['blocks']['extrinsics']
-        num_optim_cams = C - 1
+        nb_optim_cams = C - 1
 
         extr_flat = x[info['offset']: info['offset'] + info['size']]
-        r_optim = extr_flat[:3 * num_optim_cams].reshape(num_optim_cams, 3)
-        t_optim = extr_flat[3 * num_optim_cams:].reshape(num_optim_cams, 3)
+        r_optim = extr_flat[:3 * nb_optim_cams].reshape(nb_optim_cams, 3)
+        t_optim = extr_flat[3 * nb_optim_cams:].reshape(nb_optim_cams, 3)
 
         # Get all camera indices except the origin camera
         optim_cam_indices = jnp.delete(jnp.arange(C), origin_idx)
@@ -445,10 +447,12 @@ def residual_weights(
         reproj_weight = jnp.clip(reproj_weight, 0.1, 1.0)
     else:
         reproj_weight = jnp.ones_like(visibility_mask, dtype=jnp.float32)
-    weights = (visibility_mask.astype(jnp.float32) * dist_weight * nb_views_weight * reproj_weight)
-    weights /= (jnp.max(weights) + 1e-8)
 
-    return weights
+    weights = (visibility_mask.astype(jnp.float32) * dist_weight * nb_views_weight * reproj_weight)
+    # Scale weights so the median is around 1.0
+    median_weight = jnp.median(weights[weights > 0])
+
+    return weights / (median_weight + 1e-8)
 
 
 def make_jacobian_sparsity(
@@ -464,12 +468,12 @@ def make_jacobian_sparsity(
     C, P, N = cfg['nb_cams'], cfg['nb_frames'], cfg['nb_points']
     origin_idx = cfg.get('origin_idx', 0)
 
-    num_residuals = 2 * P * C * N
-    num_params = spec['total_size']
-    S = lil_matrix((num_residuals, num_params), dtype=bool)
+    nb_residuals = 2 * P * C * N
+    nb_params = spec['total_size']
+    S = lil_matrix((nb_residuals, nb_params), dtype=bool)
 
     is_shared = cfg['shared_intrinsics'] and C > 1
-    num_intr_sets = 1 if is_shared else C
+    nb_intr_sets = 1 if is_shared else C
     optim_cam_indices = np.delete(np.arange(C), origin_idx)
     cam_idx_to_optim_pos = {cam_idx: pos for pos, cam_idx in enumerate(optim_cam_indices)}
 
@@ -483,13 +487,13 @@ def make_jacobian_sparsity(
                 # Dependency on camera intrinsics
                 if 'cam_mat' in spec['blocks']:
                     info = spec['blocks']['cam_mat']
-                    size_per_set = info['size'] // num_intr_sets
+                    size_per_set = info['size'] // nb_intr_sets
                     col = info['offset'] + intr_set_idx * size_per_set
                     S[row:row + 2, col:col + size_per_set] = 1
 
                 if 'distortion' in spec['blocks']:
                     info = spec['blocks']['distortion']
-                    size_per_set = info['size'] // num_intr_sets
+                    size_per_set = info['size'] // nb_intr_sets
                     col = info['offset'] + intr_set_idx * size_per_set
                     S[row:row + 2, col:col + size_per_set] = 1
 
@@ -497,9 +501,9 @@ def make_jacobian_sparsity(
                 if 'extrinsics' in spec['blocks'] and c != origin_idx:
                     optim_pos = cam_idx_to_optim_pos[c]
                     info = spec['blocks']['extrinsics']
-                    num_optim_cams = C - 1
+                    nb_optim_cams = C - 1
                     r_col = info['offset'] + optim_pos * 3
-                    t_col = info['offset'] + (num_optim_cams * 3) + optim_pos * 3
+                    t_col = info['offset'] + (nb_optim_cams * 3) + optim_pos * 3
                     S[row:row + 2, r_col:r_col + 3] = 1
                     S[row:row + 2, t_col:t_col + 3] = 1
 
@@ -515,73 +519,63 @@ def make_jacobian_sparsity(
                 if 'object_points' in spec['blocks']:
                     info = spec['blocks']['object_points']
 
-                    if cfg['time_independent_points']:
-                        # Scaffolding mode: The point for frame p, keypoint n is at index p*N + n
-                        point_idx_in_optim_vector = p * N + n
+                    if not cfg['fix_poses']:
+                        # Rigid object (calibration board) whose poses are optimized: all frames refer to same N points
+                        point_idx_in_optim_vector = n
                     else:
-                        # Consistent modes
-                        if info['size'] == N * 3:  # Optimizing a single rigid body (N, 3)
-                            point_idx_in_optim_vector = n
-                        else:  # Optimizing a non-rigid body (P, N, 3)
-                            point_idx_in_optim_vector = p * N + n
+                        # This covers both scaffolding and non-rigid objects (animal): ach frame has a unique set of N points
+                        point_idx_in_optim_vector = p * N + n
 
                     col = info['offset'] + point_idx_in_optim_vector * 3
                     S[row:row + 2, col:col + 3] = 1
 
     # Add sparsity for all priors
-    num_prior_residuals = 0
+    nb_prior_residuals = 0
     if use_extrinsics_prior and 'extrinsics' in spec['blocks']:
-        num_prior_residuals += 6 * (C - 1)  # only for optimizable cameras
+        nb_prior_residuals += 6 * (C - 1)  # only for optimizable cameras
 
     if use_intrinsics_prior:
         if 'cam_mat' in spec['blocks']:
-            num_prior_residuals += spec['blocks']['cam_mat']['size']
+            nb_prior_residuals += spec['blocks']['cam_mat']['size']
         if 'distortion' in spec['blocks']:
-            num_prior_residuals += spec['blocks']['distortion']['size']
+            nb_prior_residuals += spec['blocks']['distortion']['size']
 
-    # if num_prior_residuals > 0:
-    #     S_new = lil_matrix((num_residuals + num_prior_residuals, num_params), dtype=bool)
-    #     S_new[:num_residuals, :] = S
-    #     S = S_new
+    if nb_prior_residuals > 0:
+        S.resize(nb_residuals + nb_prior_residuals, nb_params)
 
-    if num_prior_residuals > 0:
-        S.resize(num_residuals + num_prior_residuals, num_params)
-
-    current_prior_row = num_residuals
+    curr_prior_row = nb_residuals
 
     # Cameras extrinsics priors
     if use_extrinsics_prior and 'extrinsics' in spec['blocks']:
         info = spec['blocks']['extrinsics']
-        num_optim_cams = C - 1
+        nb_optim_cams = C - 1
 
         # Priors are applied to the flattened block of rvecs then tvecs
-        r_cols_start = info['offset']
-        t_cols_start = info['offset'] + 3 * num_optim_cams
+        r_cols = info['offset']
+        t_cols = info['offset'] + 3 * nb_optim_cams
 
         # Add identity blocks for rotation and translation priors
-        S[
-            current_prior_row: current_prior_row + 3 * num_optim_cams, r_cols_start: r_cols_start + 3 * num_optim_cams] = np.eye(
-            3 * num_optim_cams, dtype=bool)
-        current_prior_row += 3 * num_optim_cams
-        S[
-            current_prior_row: current_prior_row + 3 * num_optim_cams, t_cols_start: t_cols_start + 3 * num_optim_cams] = np.eye(
-            3 * num_optim_cams, dtype=bool)
-        current_prior_row += 3 * num_optim_cams
+        S[curr_prior_row:curr_prior_row + 3 * nb_optim_cams, r_cols:r_cols + 3 * nb_optim_cams] = np.eye(
+            3 * nb_optim_cams, dtype=bool)
+        curr_prior_row += 3 * nb_optim_cams
+        S[curr_prior_row:curr_prior_row + 3 * nb_optim_cams, t_cols:t_cols + 3 * nb_optim_cams] = np.eye(
+            3 * nb_optim_cams, dtype=bool)
+        curr_prior_row += 3 * nb_optim_cams
 
     # Cameras intrinsics priors
     if use_intrinsics_prior:
 
         if 'cam_mat' in spec['blocks']:
             info = spec['blocks']['cam_mat']
-            S[current_prior_row:current_prior_row + info['size'], info['offset']:info['offset'] + info[
+            S[curr_prior_row:curr_prior_row + info['size'], info['offset']:info['offset'] + info[
                 'size']] = np.eye(info['size'], dtype=bool)
-            current_prior_row += info['size']
+            curr_prior_row += info['size']
 
         if 'distortion' in spec['blocks']:
             info = spec['blocks']['distortion']
-            S[current_prior_row:current_prior_row + info['size'], info['offset']:info['offset'] + info[
+            S[curr_prior_row:curr_prior_row + info['size'], info['offset']:info['offset'] + info[
                 'size']] = np.eye(info['size'], dtype=bool)
-            current_prior_row += info['size']
+            curr_prior_row += info['size']
 
     return S.tocsr()
 
@@ -608,38 +602,40 @@ def cost_function(
     cfg = spec['config']
     C, P, N = cfg['nb_cams'], cfg['nb_frames'], cfg['nb_points']
 
-    # Map each workflow to the correct JAX projection function
+    # Workflow-dependent reprojection
     is_rigid_object = not cfg['fix_poses']
-    is_time_independent = cfg['time_independent_points']
 
     if is_rigid_object:
-        # Workflow: Rigid object (calibration board) with moving poses
-        # object_points has shape (N, 3)
-        reproj, valid_depth = project_object_views_batched(object_points, r_w2c, t_w2c, poses_r, poses_t, Ks, Ds,
-                                                           distortion_model)
-    elif is_time_independent:
-        # Workflow: Scaffolding calibration
-        # object_points has shape (P*N, 3). Each frame's points are independent.
-        reproj_flat, valid_depth_flat = project_to_multiple_cameras(object_points, r_w2c, t_w2c, Ks, Ds,
-                                                                    distortion_model)
-        reproj = reproj_flat.reshape(C, P, N, 2)
-        valid_depth = valid_depth_flat.reshape(C, P, N)
+        # Workflow: Rigid object (calibration board)
+        # Projects a single set of N points for each of the P poses
+        # object_points shape: (N, 3), poses_r/t shape: (P, 3)
+        reproj, valid_depth = project_object_views_batched(
+            object_points, r_w2c, t_w2c, poses_r, poses_t, Ks, Ds, distortion_model
+        )
     else:
-        # Workflow: Temporally consistent, non-rigid object (animal)
-        # object_points from unpack is (P*N, 3), we need (P, N, 3)
+        # Workflows: Scaffolding or Temporally-consistent non-rigid (animal)
+        # Both use the same multiple-to-multiple projection logic (their 3D point structure is the same)
         object_points_per_frame = object_points.reshape(P, N, 3)
-        reproj, valid_depth = project_multiple_to_multiple(object_points_per_frame, r_w2c, t_w2c, Ks, Ds, distortion_model)
+        reproj, valid_depth = project_multiple_to_multiple(
+            object_points_per_frame, r_w2c, t_w2c, Ks, Ds, distortion_model
+        )
 
+    # Residuals calculation
     resid = reproj - image_points
     effective_weights = weights * valid_depth
     weighted_resid = resid * effective_weights[..., None]
     all_residuals.append(weighted_resid.ravel())
 
-    # RMS Error reporting
-    total_sum_sq_err = jnp.sum(jnp.square(weighted_resid))
-    total_num_points = jnp.sum(effective_weights > 0)
-    rms_error = jnp.sqrt(total_sum_sq_err / jnp.maximum(1, 2 * total_num_points))
-    jax.debug.print("Mean Reprojection Error (RMS): {x:.3f}px", x=rms_error)
+    # RMS Error
+    total_nb_points = jnp.sum(effective_weights > 0)  # Number of visible observations
+    # total_sum_sq_err = jnp.sum(jnp.square(weighted_resid))  # Sum of all (x, y) squared errors
+    # rms_error = jnp.sqrt(total_sum_sq_err / jnp.maximum(1, 2 * total_nb_points))
+    # jax.debug.print("Mean Reprojection Error (RMS): {x:.3f}px", x=rms_error)
+
+    # Actual pixel error (unweighted)
+    unweighted_sq_err = jnp.sum(jnp.square(resid) * (effective_weights[..., None] > 0))
+    rms_error_px = jnp.sqrt(unweighted_sq_err / jnp.maximum(1, 2 * total_nb_points))
+    jax.debug.print("Mean Reprojection Error (RMS): {x:.3f}px", x=rms_error_px)
 
     # Prior residuals
 
@@ -648,29 +644,40 @@ def cost_function(
         origin_idx = spec['config']['origin_idx']
         cam_mask = jnp.arange(spec['config']['nb_cams']) != origin_idx
 
-        # Calculate difference for all cameras
-        rvec_diff = cam_r - fixed_params['cam_r_init']
-        tvec_diff = cam_t - fixed_params['cam_t_init']
+        # # Calculate difference for all cameras
+        # rvec_diff = cam_r - fixed_params['cam_r_init']
+        # tvec_diff = cam_t - fixed_params['cam_t_init']
+        #
+        # # Apply mask to zero-out the residual for the fixed origin camera
+        # # (ensures the residual vector maintains a consistent shape)
+        # rvec_resid = (rvec_diff * cam_mask[:, None]).ravel() * prior_weight_r
+        # tvec_resid = (tvec_diff * cam_mask[:, None]).ravel() * prior_weight_t
 
-        # Apply mask to zero-out the residual for the fixed origin camera
-        # (ensures the residual vector maintains a consistent shape)
-        rvec_resid = (rvec_diff * cam_mask[:, None]).ravel() * prior_weight_r
-        tvec_resid = (tvec_diff * cam_mask[:, None]).ravel() * prior_weight_t
+        rvec_resid = (cam_r[cam_mask] - fixed_params['cam_r_init'][cam_mask]).ravel() * prior_weight_r
+        tvec_resid = (cam_t[cam_mask] - fixed_params['cam_t_init'][cam_mask]).ravel() * prior_weight_t
 
         all_residuals.extend([rvec_resid, tvec_resid])
 
     # Cameras intrinsics priors
     if not cfg['fix_cameras_intrinsics']:
         is_shared = cfg['shared_intrinsics'] and cfg['nb_cams'] > 1
-        K_init = jnp.mean(fixed_params['K_init'], 0, keepdims=True) if is_shared else fixed_params['K_init']
-        D_init = jnp.mean(fixed_params['D_init'], 0, keepdims=True) if is_shared else fixed_params['D_init']
-        Ks_opt = jnp.mean(Ks, 0, keepdims=True) if is_shared else Ks
-        Ds_opt = jnp.mean(Ds, 0, keepdims=True) if is_shared else Ds
+        if cfg['shared_intrinsics'] and cfg['nb_cams'] > 1:
+            # When shared, we optimized a single set - compare to mean of initial values
+            K_init = jnp.mean(fixed_params['K_init'], axis=0, keepdims=True)  # (1, 3, 3)
+            D_init = jnp.mean(fixed_params['D_init'], axis=0, keepdims=True)  # (1, n_d)
+            # Ks and Ds are already all identical due to shared optimization, just take first
+            Ks_opt = Ks[:1]  # (1, 3, 3)
+            Ds_opt = Ds[:1]  # (1, n_d)
+        else:
+            K_init = fixed_params['K_init']
+            D_init = fixed_params['D_init']
+            Ks_opt = Ks
+            Ds_opt = Ds
 
         if prior_weight_f > 0.0:
             if cfg['fix_aspect_ratio']:
                 f_init = (K_init[:, 0, 0] + K_init[:, 1, 1]) * 0.5
-                f_opt = (Ks_opt[:, 0, 0] + Ks_opt[:, 1, 1]) * 0.5 # compare average to average
+                f_opt = Ks_opt[:, 0, 0]
                 f_resid = (f_opt - f_init) * prior_weight_f
             else:
                 f_init_x = K_init[:, 0, 0]
@@ -694,6 +701,80 @@ def cost_function(
             all_residuals.append(dist_resid)
 
     return jnp.concatenate(all_residuals)
+
+
+def _validate_inputs(**kwargs):
+    """
+    Validates the shapes and consistency of all inputs to run_bundle_adjustment.
+    This enforces the API contract and provides clear, early error messages.
+    """
+
+    for key, value in kwargs.items():
+        locals()[key] = value
+
+    # Basic shape and consistency checks
+    if image_points.ndim != 4:
+        raise ValueError(
+            f"image_points must be a 4D array of shape (C, P, N, 2), but got {image_points.ndim} dimensions.")
+
+    C, P, N, _ = image_points.shape
+
+    if visibility_mask.shape != (C, P, N):
+        raise ValueError(
+            f"Shape mismatch: visibility_mask should be ({C}, {P}, {N}), but got {visibility_mask.shape}.")
+
+    if camera_matrices_initial.shape != (C, 3, 3):
+        raise ValueError(
+            f"Shape mismatch: camera_matrices_initial should be ({C}, 3, 3), but got {camera_matrices_initial.shape}.")
+
+    if cam_rvecs_initial.shape != (C, 3):
+        raise ValueError(
+            f"Shape mismatch: cam_rvecs_initial should be ({C}, 3) to match the number of cameras, but got {cam_rvecs_initial.shape}.")
+
+    if cam_tvecs_initial.shape != (C, 3):
+        raise ValueError(
+            f"Shape mismatch: cam_tvecs_initial should be ({C}, 3) to match the number of cameras, but got {cam_tvecs_initial.shape}.")
+
+    if distortion_coeffs_initial.ndim != 2 or distortion_coeffs_initial.shape[0] != C:
+        raise ValueError(
+            f"Shape mismatch: distortion_coeffs_initial should be a 2D array of shape (C, nb_coeffs), i.e., ({C}, k), "
+            f"but got shape {distortion_coeffs_initial.shape}."
+        )
+
+    if not 0 <= origin_idx < C:
+        raise ValueError(f"origin_idx must be between 0 and {C - 1}, but got {origin_idx}.")
+
+    # Workflow-specific checks
+
+    if not fix_poses:
+        # Workflow: Rigid object (calibration board)
+        if poses_rvecs_initial is None or poses_tvecs_initial is None:
+            raise ValueError("For rigid object optimization (fix_poses=False), initial poses must be provided.")
+        if poses_rvecs_initial.shape != (P, 3) or poses_tvecs_initial.shape != (P, 3):
+            raise ValueError(
+                f"Shape mismatch: initial poses must be ({P}, 3), but got {poses_rvecs_initial.shape} and {poses_tvecs_initial.shape}.")
+        if object_points_initial is None:
+            raise ValueError("For rigid object optimization, object_points_initial must be provided.")
+        if object_points_initial.ndim != 2 or object_points_initial.shape[0] != N or object_points_initial.shape[
+            1] != 3:
+            raise ValueError(
+                f"Shape mismatch: For rigid objects, object_points_initial must be of shape (N, 3), i.e. ({N}, 3), but got {object_points_initial.shape}.")
+
+    else:  # fix_poses is True
+        # Workflow: Non-rigid (animal) or Scaffolding
+        if object_points_initial is None and not fix_object_points:
+            raise ValueError(
+                "An initial guess for 3D points must be provided when optimizing them (fix_object_points=False).")
+
+        if object_points_initial is not None:
+            total_points = P * N
+            if object_points_initial.shape != (total_points, 3):
+                raise ValueError(
+                    f"Shape mismatch: For non-rigid/scaffolding workflows, object_points_initial must be a flattened array "
+                    f"of shape (P*N, 3), i.e., ({total_points}, 3), but got {object_points_initial.shape}."
+                )
+
+    print("BA input validation successful.")
 
 
 def run_bundle_adjustment(
@@ -722,30 +803,20 @@ def run_bundle_adjustment(
         max_nfev:                   int = 500
 ) -> Tuple[bool, Dict]:
 
+    # _validate_inputs(**locals())
+
     C, P, N, _ = image_points.shape
     images_sizes_wh = np.atleast_2d(images_sizes_wh)
 
-    # Determine the total number of 3D point variables to optimize
-    # (which depends on the workflow defined by the control flags)
-    nb_total_points = 0
+    nb_points_to_optim = 0
     if not fix_object_points and object_points_initial is not None:
-        if time_independent_points:
-            # Scaffolding mode: Each point in each frame is a unique 3D variable
-            nb_total_points = P * N
-        else:
-            # Consistent modes:
-            if object_points_initial.ndim == 2:
-                # Rigid object: We optimize one set of N points
-                nb_total_points = N
-            else:
-                # Non-rigid object: Each point has a unique 3D position in each frame
-                nb_total_points = P * N
+        nb_points_to_optim = object_points_initial.shape[0]
 
     spec = _get_parameter_spec(
         nb_cams=C,
         nb_frames=P,
-        nb_points=N,
-        nb_points_to_optim=nb_total_points,
+        nb_points=N,  # N is the number of points *per frame*
+        nb_points_to_optim=nb_points_to_optim,  # This is the total number of 3D variables
         origin_idx=origin_idx,
         fix_cameras_intrinsics=fix_cameras_intrinsics,
         fix_cameras_extrinsics=fix_cameras_extrinsics,
@@ -790,7 +861,7 @@ def run_bundle_adjustment(
 
     # Bounds and scaling
     lb, ub = _get_bounds(spec, images_sizes_wh)
-    x0 = jnp.clip(x0, lb, ub)
+    x0 = np.clip(x0, lb, ub)
 
     # Generate per-parameter scales for the optimizer
     initial_params_for_scaling = {
