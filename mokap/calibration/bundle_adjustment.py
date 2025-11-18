@@ -437,8 +437,9 @@ def residual_weights(
     dists = jnp.linalg.norm(points2d - center, axis=-1)
     max_dist = jnp.sqrt(cx[:, 0, 0] ** 2 + cy[:, 0, 0] ** 2)[:, None, None] + 1e-8
     dist_weight = 1.0 / (1.0 + (dists / max_dist) ** distance_falloff_gamma)
-    nb_views = jnp.sum(visibility_mask, axis=0)
-    nb_views_weight = jnp.tile(nb_views[None, :, :], (C, 1, 1))
+
+    nb_views = jnp.sum(visibility_mask, axis=0)  # (P, N)
+    nb_views_weight = nb_views[None, :, :]  # (1, P, N)
     nb_views_weight = nb_views_weight / (1.0 + nb_views_weight)
 
     # Optional reprojection weight
