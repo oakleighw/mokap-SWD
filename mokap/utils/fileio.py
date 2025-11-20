@@ -1,6 +1,6 @@
 import re
 from pathlib import Path
-from typing import Union, List, Any
+from typing import Union, List, Any, Dict
 import cv2
 import yaml
 import toml
@@ -529,31 +529,49 @@ def sort_multiview_df(in_df, cameras_order=None, keypoints_order=None):
     return df_ordered
 
 
-def probe_video(video_path: Path | str):
-    """Extract metadata from a video."""
+def probe_video(video_path: Union[Path, str]) -> Dict[str, any]:
+    """
+    Extracts metadata from a video file.
+
+    Returns:
+        A dictionary containing width, height, frame count, fps, fourcc codec,
+        and duration in seconds.
+    """
 
     video_path = Path(video_path)
 
     if not video_path.exists():
-        raise FileNotFoundError(video_path.resolve())
+        raise FileNotFoundError(f"Video file not found: {video_path.resolve()}")
 
     cap = cv2.VideoCapture(video_path.as_posix())
     if not cap.isOpened():
-        print(f"Could not open video: {video_path.resolve()}")
+        raise IOError(f"Could not open video: {video_path.resolve()}")
 
-    r, frame = cap.read()
-    if not r:
-        raise IOError(f"Can't read video {video_path.resolve()}")
+    try:
+        width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+        height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
+        num_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+        fps = cap.get(cv2.CAP_PROP_FPS)
 
-    metadata = {
-        'width': int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)),
-        'height': int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)),
-        'num_frames': int(cap.get(cv2.CAP_PROP_FRAME_COUNT)),
-        'fps': cap.get(cv2.CAP_PROP_FPS)
-    }
-    cap.release()
+        fourcc_int = int(cap.get(cv2.CAP_PROP_FOURCC))
+        fourcc_str = "".join([chr((fourcc_int >> 8 * i) & 0xFF) for i in range(4)])
 
-    return metadata
+        if width == 0 or height == 0 or num_frames == 0:
+            raise IOError(f"Video file seems corrupted or empty: {video_path.resolve()}")
+
+        duration_s = num_frames / fps if fps > 0 else 0
+
+        return {
+            'width': width,
+            'height': height,
+            'num_frames': num_frames,
+            'fps': fps,
+            'fourcc': fourcc_str,
+            'duration': duration_s,
+        }
+
+    finally:
+        cap.release()
 
 
 def generate_board_svg(board_params:    Union["ChessBoard", "CharucoBoard"],
