@@ -73,6 +73,26 @@ class Reconstructor:
         self.EMPTY_POINT3D_NP = np.empty((0, 3), dtype=np.float32)
         self.EMPTY_POINT3D_JAX = jnp.empty((0, 3), dtype=jnp.float32)
 
+    def update_camera_parameters(self, camera_parameters: Dict):
+        """
+        Updates the reconstructor with new camera parameters on the fly.
+        """
+
+        self.camera_names = sorted(camera_parameters.keys())
+        self.num_cams = len(self.camera_names)
+
+        # Pre-compute and cache all camera matrices and transforms
+        self.Ks = jnp.stack([camera_parameters[name]['camera_matrix'] for name in self.camera_names])
+        self.Ds = jnp.stack([camera_parameters[name]['dist_coeffs'] for name in self.camera_names])
+        self.rvecs_c2w = jnp.stack([camera_parameters[name]['rvec'] for name in self.camera_names])
+        self.tvecs_c2w = jnp.stack([camera_parameters[name]['tvec'] for name in self.camera_names])
+
+        self.rvecs_w2c, self.tvecs_w2c = invert_rtvecs(self.rvecs_c2w, self.tvecs_c2w)
+        self.Es = extrinsics_matrix(self.rvecs_w2c, self.tvecs_w2c)
+        self.Ps = projection_matrix(self.Ks, self.Es)
+
+        print("[Reconstructor] Calibration updated successfully.")
+
     def reconstruct_frame(self,
             df_frame:           pl.DataFrame,
             keypoint_names:     List[str]
