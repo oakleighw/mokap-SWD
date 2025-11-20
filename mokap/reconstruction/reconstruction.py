@@ -49,19 +49,9 @@ class Reconstructor:
         ):
 
         self.config = config
-        self.camera_names = sorted(camera_parameters.keys())
-        self.num_cams = len(self.camera_names)
         self.volume_bounds = volume_bounds
 
-        # Pre-compute and cache all camera matrices and transforms
-        self.Ks = jnp.stack([camera_parameters[name]['camera_matrix'] for name in self.camera_names])
-        self.Ds = jnp.stack([camera_parameters[name]['dist_coeffs'] for name in self.camera_names])
-        self.rvecs_c2w = jnp.stack([camera_parameters[name]['rvec'] for name in self.camera_names])
-        self.tvecs_c2w = jnp.stack([camera_parameters[name]['tvec'] for name in self.camera_names])
-
-        self.rvecs_w2c, self.tvecs_w2c = invert_rtvecs(self.rvecs_c2w, self.tvecs_c2w)
-        self.Es = extrinsics_matrix(self.rvecs_w2c, self.tvecs_w2c)
-        self.Ps = projection_matrix(self.Ks, self.Es)
+        self.update_camera_parameters(camera_parameters)
 
         self.aabb_min = jnp.array([val[0] for val in self.volume_bounds.values()])
         self.aabb_max = jnp.array([val[1] for val in self.volume_bounds.values()])
@@ -93,20 +83,19 @@ class Reconstructor:
 
         print("[Reconstructor] Calibration updated successfully.")
 
-    def reconstruct_frame(self,
+    def reconstruct_frame_df(self,
             df_frame:           pl.DataFrame,
             keypoint_names:     List[str]
         ) -> List[SoupPoint]:
         """
-        Reconstructs all keypoints for a single frame
+        Reconstructs all keypoints for a single frame directly from a polars df slice.
 
         Args:
-            df_frame: A polars dataframe containing 2D detections for a single frame
-            keypoint_names: A list of keypoint names to reconstruct
+            array_frame: A numpy array of shape (C, P, 3) with (x, y, score)
+            keypoint_names: An ordered list of keypoint names.
 
         Returns:
-            A list of ReconstructedPoint objects, for all successfully
-            reconstructed 3D points in the frame
+            A list of ReconstructedPoint objects.
         """
 
         if df_frame.is_empty():
@@ -147,11 +136,66 @@ class Reconstructor:
 
         return reconstructed_points
 
+    def reconstruct_frame_array(self,
+            array_frame: np.ndarray,
+            frame_idx: int,
+            keypoint_names: List[str]
+        ) -> List[SoupPoint]:
+        """
+        Reconstructs all keypoints for a single frame directly from a numpy array.
+
+        Args:
+            array_frame: A numpy array of shape (C, P, 3) with (x, y, score)
+            frame_idx: The index of the current frame.
+            keypoint_names: An ordered list of keypoint names.
+
+        Returns:
+            A list of ReconstructedPoint objects.
+        """
+        reconstructed_points = []
+        num_cams, num_keypoints, _ = array_frame.shape
+
+        for p_idx in range(num_keypoints):
+            kp_name = keypoint_names[p_idx]
+
+            # Slice data for the current keypoint across all cameras, shape (C, 3)
+            keypoint_data = array_frame[:, p_idx, :]
+
+            # mask for valid detections, shape (C,)
+            is_valid = ~np.isnan(keypoint_data[:, 0])
+
+            # not enough views for this point, skip it
+            if np.sum(is_valid) < self.config.min_views:
+                continue
+
+            points_per_cam = [
+                jnp.array([keypoint_data[c, :2]]) if is_valid[c] else self.EMPTY_POINT2D_JAX
+                for c in range(num_cams)
+            ]
+            confs_per_cam = [
+                jnp.array([keypoint_data[c, 2]]) if is_valid[c] else self.EMPTY_SCORE_JAX
+                for c in range(num_cams)
+            ]
+
+            final_pts, final_confs = self._reconstruct_keypoint(points_per_cam, confs_per_cam)
+
+            for i in range(final_pts.shape[0]):
+                point = SoupPoint(
+                    frame_idx=frame_idx,
+                    idx=i,  # the idx is local to this keypoint type for this frame
+                    keypoint_type=kp_name,
+                    position=final_pts[i],
+                    confidence=float(final_confs[i])
+                )
+                reconstructed_points.append(point)
+
+        return reconstructed_points
+
     def _reconstruct_keypoint(self,
             points_per_cam: List[jnp.ndarray],
             confs_per_cam:  List[jnp.ndarray]
         ) -> Tuple[np.ndarray, np.ndarray]:
-        """ Runs the full reconstruction pipeline for a single keypoint """
+        """ Runs the full reconstruction pipeline for a single keypoint. """
 
         # Generate all plausible 3D point hypotheses
         all_pts_jax, all_groups, view_counts, summed_confs, all_errors = self._generate_hypotheses(
@@ -664,7 +708,7 @@ if __name__ == '__main__':
     DEBUG_FRAME = 926
     df_frame = df.filter(pl.col('frame') == DEBUG_FRAME)
 
-    points_list = reconstructor.reconstruct_frame(
+    points_list = reconstructor.reconstruct_frame_df(
         df_frame=df_frame,
         keypoint_names=keypoints
     )

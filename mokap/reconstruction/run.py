@@ -25,7 +25,7 @@ def reconstruct_batch(batch_of_groups, keypoints, camera_parameters, volume_boun
     soup_batch = {}
     for ftuple, df_frame in batch_of_groups:
         frame_idx = ftuple[0]
-        reconstructed_points = reconstructor.reconstruct_frame(
+        reconstructed_points = reconstructor.reconstruct_frame_df(
             df_frame=df_frame,
             keypoint_names=keypoints
         )

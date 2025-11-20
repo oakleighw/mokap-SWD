@@ -334,7 +334,7 @@ if __name__ == '__main__':
     #  LEVEL 4: FINAL RECONSTRUCTION & SKELETON PLOTTING
     # ==========================================================================
     print("\n--- LEVEL 4: Visualizing Final Filtered Reconstruction ---")
-    points_list = reconstructor.reconstruct_frame(df_frame=df_frame, keypoint_names=keypoints)
+    points_list = reconstructor.reconstruct_frame_df(df_frame=df_frame, keypoint_names=keypoints)
 
     total_points = len(points_list)
     print(f"Final reconstruction found {total_points} total points across all keypoints.")
