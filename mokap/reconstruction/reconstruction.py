@@ -1,4 +1,5 @@
 import logging
+import time
 from functools import partial
 from pathlib import Path
 import jax
@@ -30,10 +31,9 @@ class Reconstructor:
     """
     A class to perform robust 3D reconstruction of keypoints from multiple camera views
 
-    It uses a multi-stage, evidence-based pipeline to handle ambiguities, occlusions,
-    and duplicate detections common in multi-animal tracking scenarios
+    Uses a multi-stage, evidence-based pipeline to handle ambiguities, occlusions,
+    and duplicate detections
 
-    The pipeline consists of:
     1. Hypothesis Generation: All geometrically plausible 3D points are generated
        using a graph-based approach on epipolar constraints
     2. Evidence-based Filtering: These candidates are filtered using a conflict graph
@@ -707,13 +707,14 @@ if __name__ == '__main__':
     # Run on the specific debug frame
     DEBUG_FRAME = 926
     df_frame = df.filter(pl.col('frame') == DEBUG_FRAME)
-
+    before = time.time()
     points_list = reconstructor.reconstruct_frame_df(
         df_frame=df_frame,
         keypoint_names=keypoints
     )
-
+    after = time.time()
     print(f"Total points reconstructed in frame {DEBUG_FRAME}: {len(points_list)}\n")
+    print(f"Took {after - before} seconds.")
     if points_list:
 
         points_by_type = defaultdict(list)
