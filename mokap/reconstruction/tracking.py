@@ -1,9 +1,6 @@
-import pickle
 import logging
 from typing import Tuple, Optional, Dict, List, FrozenSet
-from collections import defaultdict
 from itertools import combinations
-from pathlib import Path
 import networkx as nx
 import numpy as np
 from alive_progress import alive_bar
@@ -12,13 +9,13 @@ from filterpy.kalman import KalmanFilter
 from scipy.linalg import block_diag
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
-from mokap.reconstruction.anatomy import StatsBootstrapper, AnatomyLearner
-from mokap.reconstruction.config import AssemblerConfig, TrackerConfig, AnatomyConfig
-from mokap.reconstruction.datatypes import Bone, AssembledSkeleton, CandidateSkeleton
-from mokap.reconstruction.utils import solve_mwis_networkx
+
 from mokap.utils import fileio
 from mokap.utils.geometry.fitting import find_rigid_transform
-from mokap.reconstruction.reconstruction import SoupPoint
+
+from mokap.reconstruction.config import AssemblerConfig, TrackerConfig, AnatomyConfig
+from mokap.reconstruction.datatypes import Bone, AssembledSkeleton, CandidateSkeleton, SoupData
+from mokap.reconstruction.utils import solve_mwis_networkx
 
 
 logger = logging.getLogger(__name__)
@@ -30,15 +27,13 @@ class Tracklet:
     Manages state estimation (position, velocity, scale) using a Kalman Filter
     """
 
-    # TODO: Maybe this class should store its data into a TrackletData object directly...
-
     def __init__(self,
-            track_idx:          int,
-            initial_skeleton:   AssembledSkeleton,
-            frame_idx:          int,
-            central_kp:         str,
-            config:             TrackerConfig
-        ):
+                 track_idx: int,
+                 initial_skeleton: AssembledSkeleton,
+                 frame_idx: int,
+                 central_kp: str,
+                 config: TrackerConfig
+                 ):
 
         self.config = config
         self.track_idx = track_idx
@@ -47,32 +42,31 @@ class Tracklet:
         self.last_update_frame = frame_idx
 
         # Tracklet health and score metrics
-        self.health = 1.0  # Running confidence metric (1.0 = high confidence)
-        self.anatomical_integrity = initial_skeleton.score  # Exponential Moving Average of the skeleton score
+        self.health = 1.0
+        self.anatomical_integrity = initial_skeleton.score
 
         self.skeleton: AssembledSkeleton = initial_skeleton
         self.central_kp = central_kp
 
         # Kalman Filter for 3D position (x, y, z), 3D velocity (vx, vy, vz), and scale (s)
         # State vector (dim_x = 7): [x, y, z, vx, vy, vz, s]
-        # Measurement (dim_z = 4): [x, y, z, s]
         self.kf = KalmanFilter(dim_x=7, dim_z=4)
 
-        dt = 1.0  # Time step
+        dt = 1.0
 
-        self.kf.F = np.array([[1.0, 0.0, 0.0,  dt, 0.0, 0.0, 0.0],
-                              [0.0, 1.0, 0.0, 0.0,  dt, 0.0, 0.0],
-                              [0.0, 0.0, 1.0, 0.0, 0.0,  dt, 0.0],
+        self.kf.F = np.array([[1.0, 0.0, 0.0, dt, 0.0, 0.0, 0.0],
+                              [0.0, 1.0, 0.0, 0.0, dt, 0.0, 0.0],
+                              [0.0, 0.0, 1.0, 0.0, 0.0, dt, 0.0],
                               [0.0, 0.0, 0.0, 1.0, 0.0, 0.0, 0.0],
                               [0.0, 0.0, 0.0, 0.0, 1.0, 0.0, 0.0],
                               [0.0, 0.0, 0.0, 0.0, 0.0, 1.0, 0.0],
-                              [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]])  # Constant velocity and scale model
+                              [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]])
 
-        # Measurement function
+        # Measurement function: we measure position (x, y, z) and scale (s)
         self.kf.H = np.array([[1.0, 0.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                               [0.0, 1.0, 0.0, 0.0, 0.0, 0.0, 0.0],
                               [0.0, 0.0, 1.0, 0.0, 0.0, 0.0, 0.0],
-                              [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]])  # We measure position and scale
+                              [0.0, 0.0, 0.0, 0.0, 0.0, 0.0, 1.0]])
 
         # Process noise
         pos_vel_q = Q_discrete_white_noise(dim=2, dt=dt, var=self.config.KF_PROCESS_NOISE_POS, block_size=3)
@@ -92,40 +86,29 @@ class Tracklet:
         self.kf.x[6] = self.skeleton.scale
 
     def predict(self, current_frame_idx: int):
-        """ Predicts the state of the tracklet for the current frame """
+        """Predicts the state of the tracklet for the current frame."""
 
-        # The number of prediction steps is how many frames we've coasted
         steps_to_predict = current_frame_idx - self.last_update_frame
 
         for _ in range(steps_to_predict):
             self.kf.predict()
             self.age += 1
             self.time_since_update += 1
-            # Decay health for each frame without a measurement update
             self.health *= self.config.HEALTH_DECAY_RATE
 
     def update(self, skeleton: AssembledSkeleton, frame_idx: int):
-        """
-        Updates the tracklet's state with a new skeleton measurement
-
-        If the central keypoint is missing, it attempts to infer its position using
-        rigid alignment (Kabsch algorithm) before updating the Kalman Filter
-        """
+        """Updates the tracklet's state with a new skeleton measurement."""
 
         update_skeleton = skeleton
         inferred = False
 
-        # if the primary keypoint is missing, try to infer it
+        # If the primary keypoint is missing, try to infer it
         if self.central_kp not in skeleton.keypoints:
             inferred_skeleton = self._infer_missing_central_kp(skeleton)
             if inferred_skeleton:
-                # Use the completed skeleton for the update
                 update_skeleton = inferred_skeleton
                 inferred = True
             else:
-                # if inference fails (too few points) we can't update the KF
-                # We still update the tracklet's skeleton to the partial view, reset its age,
-                # but do *not* update health or score_ema, as it was not a full KF update
                 self.skeleton = skeleton
                 self.score = skeleton.score
                 self.time_since_update = 0
@@ -133,62 +116,41 @@ class Tracklet:
                 return
 
         self.skeleton = update_skeleton
-
         self.time_since_update = 0
         self.last_update_frame = frame_idx
 
-        # Create the measurement vector for the Kalman Filter
         measurement = np.array([*update_skeleton.keypoints[self.central_kp], update_skeleton.scale])
 
-        # If the position was inferred, we are less certain about it...
-        # so we tell this to the KF by temporarily increasing its measurement noise
         if inferred:
             original_R = self.kf.R.copy()
-            self.kf.R[:3, :3] *= self.config.KF_INFERENCE_UNCERTAINTY_FACTOR  # only increase position uncertainty
+            self.kf.R[:3, :3] *= self.config.KF_INFERENCE_UNCERTAINTY_FACTOR
             self.kf.update(measurement)
-            self.kf.R = original_R  # and restore for the next update
+            self.kf.R = original_R
         else:
             self.kf.update(measurement)
 
-        # Update health and score metrics after a successful KF update
-
-        # Update the smoothed anatomical score
+        # Update health metrics
         self.anatomical_integrity = self.config.ANATOMICAL_SCORE_ALPHA * skeleton.score + (
-                    1 - self.config.ANATOMICAL_SCORE_ALPHA) * self.anatomical_integrity
+                1 - self.config.ANATOMICAL_SCORE_ALPHA) * self.anatomical_integrity
 
-        # Update the tracklet's health
         if inferred:
-            # The update was based on an inferred point, so it's a bit less certain...
-            # so restore health, but with a lil penalty
             self.health = 1.0 - self.config.INFERRED_HEALTH_PENALTY
         else:
-            # The update was based on a direct measurement: this is a high-confidence event
-            # so reset health to its maximum value
             self.health = 1.0
 
     def _infer_missing_central_kp(self, fragment: AssembledSkeleton) -> Optional[AssembledSkeleton]:
-        """
-        Infers the position of a missing central keypoint by aligning the last known
-        full pose to the currently visible fragment using a rigid transform
-        """
-
         prev_kps, curr_kps = self.skeleton.keypoints, fragment.keypoints
         common_names = list(prev_kps.keys() & curr_kps.keys())
 
         if len(common_names) < self.config.MIN_KPS_FOR_INFERENCE:
-            return None  # not enough information to infer a stable alignment
+            return None
 
-        # Point clouds for alignment: current fragment (A) to previous pose (B)
         points_A = np.array([prev_kps[name] for name in common_names])
         points_B = np.array([curr_kps[name] for name in common_names])
 
-        # Use Kabsch algorithm to find R, t such that: B ~ R @ A + t
         R_mat, t_vec = find_rigid_transform(points_A, points_B)
-
-        # Apply the found transform to the last known position of the central keypoint
         inferred_pos = np.array(R_mat) @ prev_kps[self.central_kp] + np.array(t_vec)
 
-        # Return a new object to avoid modifying the input fragment
         completed_skeleton = AssembledSkeleton(
             keypoints=fragment.keypoints.copy(),
             score=fragment.score,
@@ -200,36 +162,21 @@ class Tracklet:
 
     @property
     def predicted_pose(self) -> Optional[Dict[str, np.ndarray]]:
-        """
-        Returns a full skeleton pose based on the Kalman Filter's predicted position of the central keypoint
-        """
         if self.central_kp not in self.skeleton.keypoints:
             return None
-
         translation = self.predicted_position - self.skeleton.keypoints[self.central_kp]
-
         return {kp_name: pos + translation for kp_name, pos in self.skeleton.keypoints.items()}
 
     @property
     def predicted_position(self) -> np.ndarray:
-        """
-        Returns the predicted 3D position from the KF state
-        """
         return self.kf.x[:3].flatten()
 
     @property
     def predicted_scale(self) -> float:
-        """
-        Returns the predicted scale from the KF state
-        """
         return self.kf.x[6, 0]
 
     @property
     def uncertainty(self) -> Dict[str, np.ndarray]:
-        """
-        Returns the uncertainty (variance) of the state variables from the
-        Kalman Filter's covariance matrix P
-        """
         diag_P = self.kf.P.diagonal()
         return {
             'position': diag_P[0:3],
@@ -239,14 +186,14 @@ class Tracklet:
 
 
 class SkeletonAssembler:
-    """ Assembles skeletons from a 'soup' of 3D reconstructed points for a single frame """
+    """Assembles skeletons from a SoupData frame slice."""
 
     def __init__(self,
-            bones_list: List[Bone],
-            bone_stats: Dict,
-            assembler_config: AssemblerConfig,
-            tracker_config: TrackerConfig
-        ):
+                 bones_list: List[Bone],
+                 bone_stats: Dict,
+                 assembler_config: AssemblerConfig,
+                 tracker_config: TrackerConfig
+                 ):
 
         self.config = assembler_config
         self.tracker_config = tracker_config
@@ -254,483 +201,269 @@ class SkeletonAssembler:
         self.bones_list = [frozenset(bone) for bone in bones_list]
         self.update_bone_stats(bone_stats)
 
-        # Build the graph to determine topology
         skeleton_graph = nx.Graph([tuple(b) for b in self.bones_list])
         if not skeleton_graph.nodes:
             raise ValueError("Cannot assemble skeletons from an empty bone list.")
 
         self._skeleton_graph = skeleton_graph
 
-        # Get keypoint degrees to determine topology
+        # Topology analysis
         degrees = dict(self._skeleton_graph.degree())
         self.leaf_nodes = {node for node, degree in degrees.items() if degree == 1}
 
         non_leaf_nodes = set(degrees.keys()) - self.leaf_nodes
-        self.central_anchors = set()
-        self.secondary_anchors = set()
-
         if non_leaf_nodes:
             sorted_anchors = sorted(list(non_leaf_nodes), key=lambda node: degrees[node], reverse=True)
             self.central_anchors = set(sorted_anchors[:self.config.MIN_CENTRAL_ANCHORS])
             self.secondary_anchors = non_leaf_nodes - self.central_anchors
-
-        logger.debug(f"Central Anchors: {sorted(list(self.central_anchors))}")
-        logger.debug(f"Secondary Anchors: {sorted(list(self.secondary_anchors))}")
-        logger.debug(f"Leaf Nodes: {sorted(list(self.leaf_nodes))}")
+        else:
+            self.central_anchors = set()
+            self.secondary_anchors = set()
 
         self.central_kp = max(degrees, key=degrees.get)
-        logger.debug(f"Assembler determined central keypoint: '{self.central_kp}'")
+
+        # Temporary storage for the current frame
+        self._current_soup: Optional[SoupData] = None
+        self._current_virtual_points: Dict[int, Dict] = {}  # Negative indices -> {pos, conf, kp_type}
+        self._current_kdtree: Optional[cKDTree] = None
+        self._kp_to_indices: Dict[str, List[int]] = defaultdict(list)
+        self._kp_to_rays: Dict[str, List[int]] = defaultdict(list)
 
     def update_bone_stats(self, new_stats: Dict):
-        """ Allows the assembler's anatomical model to be updated on the fly """
-
         self.reference_bone: Bone = frozenset(new_stats['reference_bone'])
         self.median_ref_len = new_stats['median_reference_length']
         self.bones_ratios = {frozenset(k.split(';')): v for k, v in new_stats['bones_ratios'].items()}
 
-    def assemble_frame(self, soup_points: List[SoupPoint]
-        ) -> Tuple[List[CandidateSkeleton], Dict[Tuple[str, int], SoupPoint]]:
-        """
-        Main assembly entry point. Generates initial fragments and then creates all
-        plausible merge hypotheses (without committing to them)
-        """
+    def _reset_frame_context(self, soup: SoupData):
+        """Prepares lookup structures for the current frame."""
+        self._current_soup = soup
+        self._current_virtual_points = {}
 
-        # Generate small, high-confidence initial fragments
-        initial_fragments, points_map = self._generate_candidates(soup_points)
+        # Index map for 3D points
+        self._kp_to_indices.clear()
+        for i in range(soup.num_points):
+            kp_name = soup.keypoint_names[soup.kp_types[i]]
+            self._kp_to_indices[kp_name].append(i)
+
+        # Index map for Rays (Orphan views)
+        self._kp_to_rays.clear()
+        num_rays = len(soup.ray_origins)
+        for i in range(num_rays):
+            kp_name = soup.keypoint_names[soup.ray_kp_types[i]]
+            self._kp_to_rays[kp_name].append(i)
+
+        # KDTree
+        if soup.num_points > 0:
+            self._current_kdtree = cKDTree(soup.positions)
+        else:
+            self._current_kdtree = None
+
+    def _get_pos_conf(self, idx: int) -> Tuple[np.ndarray, float]:
+        """Abstracts retrieval of position/confidence for Real (>= 0) vs Virtual (< 0) points."""
+        if idx >= 0:
+            return self._current_soup.positions[idx], self._current_soup.confidences[idx]
+        else:
+            vp = self._current_virtual_points[idx]
+            return vp['pos'], vp['conf']
+
+    def assemble_frame(self, soup: SoupData) -> Tuple[List[CandidateSkeleton], Dict[int, Dict]]:
+        """
+        Main assembly entry point.
+        Returns candidates and the registry of virtual points created during rescue.
+        """
+        self._reset_frame_context(soup)
+
+        # Generate initial fragments (including orphan rescue)
+        initial_fragments = self._generate_candidates()
         if not initial_fragments:
-            return [], {}
+            return [], self._current_virtual_points
 
-        # Generate all plausible merges between initial fragments (but keep initial fragments)
-        merge_hypotheses = self._generate_merge_hypotheses(initial_fragments, points_map)
+        # Generate merges
+        merge_hypotheses = self._generate_merge_hypotheses(initial_fragments)
 
-        # Return the complete set of hypotheses for the global solver
         all_hypotheses = initial_fragments + merge_hypotheses
 
-        logger.debug(
-            f"Assembler created {len(initial_fragments)} initial fragments and {len(merge_hypotheses)} merge hypotheses.")
-        return all_hypotheses, points_map
+        return all_hypotheses, self._current_virtual_points
 
-    def _generate_merge_hypotheses(self,
-                                   fragments: List[CandidateSkeleton],
-                                   points_map: Dict[Tuple[str, int], SoupPoint]
-                                   ) -> List[CandidateSkeleton]:
-        """
-        Generates all plausible merge hypotheses from a list of fragments without committing to any single merge.
-        It is stateless (returns only the new, merged skeletons)
-        """
-
-        if len(fragments) < 2:
-            return []
-
-        # Each initial fragment is its own constituent part
-        for i, frag in enumerate(fragments):
-            # we use index i as a unique identifier for each initial fragment
-            frag.constituent_indices = frozenset([i])
-
-        merge_hypotheses = []
-
-        # consider every possible pair of initial fragments for merging
-        for i, j in combinations(range(len(fragments)), 2):
-            skel_A, skel_B = fragments[i], fragments[j]
-
-            # attempt to merge the two fragments
-            merged_candidate = self._attempt_merge(skel_A, skel_B, points_map)
-
-            if merged_candidate:
-                # th emerged candidate's identity is the union of the parent fragments' IDs
-                merged_candidate.constituent_indices = skel_A.constituent_indices.union(skel_B.constituent_indices)
-                merge_hypotheses.append(merged_candidate)
-
-        # TODO: could add a second layer of merging here by calling this function recursively on 'merge_hypotheses'...
-
-        return merge_hypotheses
-
-    def _generate_candidates(self,
-            soup_points: List[SoupPoint]
-        ) -> Tuple[List[CandidateSkeleton], Dict[Tuple[str, int], SoupPoint]]:
-        """
-        Generates all plausible skeleton candidates by exhaustively seeding from all anchor and leaf points.
-        This creates the necessary redundancy for the downstream solver
-        """
-
-        if not soup_points:
-            return [], {}
-
-        points_map = {(p.keypoint_type, p.idx): p for p in soup_points}
-
+    def _generate_candidates(self) -> List[CandidateSkeleton]:
         candidate_skeletons = []
+        used_as_seed_indices = set()
 
-        all_seed_nodes = list(points_map.keys())
-
-        # used_as_seed is used to avoid starting a full growth from every single point in a large fragment
-        # (which would be redundant). Only one point in a component should be used to seed
-        used_as_seed = set()
-
-        # Grow full skeletons from any anchor point
+        # Seed from anchors
         all_anchor_types = self.central_anchors.union(self.secondary_anchors)
-        anchor_seed_nodes = [node for node in all_seed_nodes if node[0] in all_anchor_types]
 
-        for seed_node in anchor_seed_nodes:
-            if seed_node in used_as_seed:
-                continue
+        for anchor_type in all_anchor_types:
+            # Iterate over all real 3D points of this type
+            for seed_idx in self._kp_to_indices[anchor_type]:
+                if seed_idx in used_as_seed_indices:
+                    continue
 
-            candidate = self._grow_skeleton(
-                seed_node,
-                points_map,
-                score_debt_tol=self.config.SCORE_DEBT_TOLERANCE
-            )
+                candidate = self._grow_skeleton(
+                    (anchor_type, seed_idx),
+                    score_debt_tol=self.config.SCORE_DEBT_TOLERANCE
+                )
 
-            if candidate:
-                candidate_skeletons.append(candidate)
-                # Mark all nodes in the discovered fragment as 'used for seeding'
-                for node in candidate.nodes:
-                    used_as_seed.add(node)
+                if candidate:
+                    candidate_skeletons.append(candidate)
+                    for _, idx in candidate.nodes:
+                        # Only mark real points as used seeds
+                        if idx >= 0:
+                            used_as_seed_indices.add(idx)
 
-        # Find any remaining isolated 2-point leaf fragments that weren't part of a larger growth
-        # TODO: should it be more than 2?
-        leaf_seed_nodes = [node for node in all_seed_nodes if node[0] in self.leaf_nodes]
-        for seed_node in leaf_seed_nodes:
-            if seed_node in used_as_seed:
-                continue
+        # Seed from leaves (cleanup)
+        for leaf_type in self.leaf_nodes:
+            for seed_idx in self._kp_to_indices[leaf_type]:
+                if seed_idx in used_as_seed_indices:
+                    continue
 
-            fragment = self._find_leaf_fragment(seed_node, points_map)
-            if fragment:
-                candidate_skeletons.append(fragment)
-                # mark these two nodes as used as well
-                for node in fragment.nodes:
-                    used_as_seed.add(node)
+                fragment = self._find_leaf_fragment(leaf_type, seed_idx)
+                if fragment:
+                    candidate_skeletons.append(fragment)
+                    for _, idx in fragment.nodes:
+                        if idx >= 0:
+                            used_as_seed_indices.add(idx)
 
-        logger.debug(f"Generated {len(candidate_skeletons)} initial candidates for this frame.")
-        return candidate_skeletons, points_map
-
-    def _attempt_merge(self,
-                       skel_A: CandidateSkeleton,
-                       skel_B: CandidateSkeleton,
-                       points_map:  Dict[Tuple[str, int], SoupPoint]
-                       ) -> Optional[CandidateSkeleton]:
-        """
-        Attempts to merge two disjoint fragments into a larger skeleton
-
-        1. Ensures fragments are fully disjoint (no shared points or keypoint types)
-        2. Checks for "clone" fragments using Jaccard similarity on keypoint positions
-        3. Verifies scale consistency
-        4. Finds the best high-quality 'linking' bone between fragments
-        5. Validates this link using a 'shared neighbour' graph heuristic
-        """
-
-        # Pre-check 1: must be fully disjoint
-        if not skel_A.nodes.isdisjoint(skel_B.nodes):
-            return None
-
-        kps_A = {node[0] for node in skel_A.nodes}
-        kps_B = {node[0] for node in skel_B.nodes}
-        if not kps_A.isdisjoint(kps_B):
-            return None
-
-        # Pre-check 2: handle clones with Jaccard score
-        common_kps = kps_A.intersection(kps_B)
-        if common_kps:
-            # this block should theoretically not be reached due to the check above but it's a good safeguard
-            proximal_intersection = 0
-            kps_map_A = {node[0]: points_map[node].position for node in skel_A.nodes}
-            kps_map_B = {node[0]: points_map[node].position for node in skel_B.nodes}
-
-            for name in common_kps:
-                if np.linalg.norm(kps_map_A[name] - kps_map_B[name]) < self.tracker_config.CONFLICT_SOLVER_PROXIMITY_RADIUS:
-                    proximal_intersection += 1
-
-            union_size = len(kps_A.union(kps_B))
-            jaccard_prox = proximal_intersection / union_size if union_size > 0 else 0
-
-            if jaccard_prox > self.tracker_config.CONFLICT_SOLVER_JACCARD_THRESHOLD:
-                # they are not merge candidates, they are conflicting clones
-                return None
-
-        # Scale consistency
-        if abs(skel_A.scale - skel_B.scale) > self.config.MERGE_SCALE_TOLERANCE:
-            return None
-        combined_scale = (skel_A.scale + skel_B.scale) / 2.0
-
-        # Find a high quailty linking bone
-        best_link_score = -1.0
-        best_linking_bone = None
-
-        combined_nodes = skel_A.nodes.union(skel_B.nodes)
-        combined_kps_map = {node[0]: points_map[node].position for node in combined_nodes}
-
-        for kp_a in kps_A:
-            for kp_b in kps_B:
-                bone = frozenset((kp_a, kp_b))
-                if bone in self.bones_ratios:
-                    score = self._score_bone(bone, combined_kps_map, points_map, combined_nodes, combined_scale)
-                    if score > best_link_score:
-                        best_link_score = score
-                        best_linking_bone = bone
-
-        # Check if the best link we found is good enough to justify a merge
-        if best_link_score < self.config.MERGE_LINKING_BONE_THRESHOLD:
-            return None
-
-        # Shared neighbour check
-        kp_a_name, kp_b_name = tuple(best_linking_bone)
-        neighbors_of_a = set(self._skeleton_graph.neighbors(kp_a_name))
-        neighbors_of_b = set(self._skeleton_graph.neighbors(kp_b_name))
-
-        shared_neighbors = neighbors_of_a.intersection(neighbors_of_b)
-        shared_neighbors.discard(kp_a_name)
-        shared_neighbors.discard(kp_b_name)
-
-        if not any(n in kps_A or n in kps_B for n in shared_neighbors):
-            # island-to-island link with no existing anchor point
-            # It's the signature of a pathological merge. Reject it.
-            return None
-
-        # Merge is valid
-        merged_nodes = skel_A.nodes.union(skel_B.nodes)
-
-        # Estimate the new average score for the merged object
-        avg_score_A = skel_A.anatomical_score / len(skel_A.nodes) if skel_A.nodes else 0
-        avg_score_B = skel_B.anatomical_score / len(skel_B.nodes) if skel_B.nodes else 0
-        num_bones_A = max(1, len(skel_A.nodes) - 1)
-        num_bones_B = max(1, len(skel_B.nodes) - 1)
-
-        new_total_score = (avg_score_A * num_bones_A) + (avg_score_B * num_bones_B) + best_link_score
-        new_num_bones = num_bones_A + num_bones_B + 1
-        new_avg_score = new_total_score / new_num_bones
-
-        # Use the standard factory to create the final candidate
-        return self._create_candidate(merged_nodes, new_avg_score, combined_scale)
-
-    def _create_candidate(self,
-            nodes:      FrozenSet[Tuple[str, int]],
-            avg_score:  float,
-            scale:      float
-        ) -> CandidateSkeleton:
-        """ Factory function to create a CandidateSkeleton object """
-
-        if avg_score <= 0:
-            # this can happen if the fragment is nonsensical
-            # so we return a candidate with a score of 0
-            return CandidateSkeleton(
-                nodes=nodes,
-                competition_score=0.0,
-                anatomical_score=0.0,
-                scale=scale
-            )
-
-        num_nodes = len(nodes)
-
-        size_bonus_multiplier = num_nodes
-        base_score = avg_score * size_bonus_multiplier
-
-        # quality-over-quantity boost for exceptionally well-formed skeletons
-        # (his helps high-quality fragments to punch above their weight in the conflict resolution stage)
-        quality_bonus = 0.0
-
-        high_quality_thresh = self.config.HIGH_QUALITY_THRESHOLD
-        quality_bonus_factor = self.config.QUALITY_BONUS_FACTOR
-
-        if avg_score > high_quality_thresh:
-            # The bonus is a percentage of the base score
-            quality_bonus = base_score * (quality_bonus_factor - 1.0)
-
-        # The final 'competition score' (used by MWIS) is the sum of the base score and all bonuses
-        competition_score = base_score + quality_bonus
-
-        # The 'anatomical_score' reflects the pure anatomical fit multiplied by size
-        # This is useful for the AnatomyLearner and for diagnostics
-        anatomical_score = avg_score * num_nodes
-
-        return CandidateSkeleton(
-            nodes=nodes,
-            competition_score=competition_score,
-            anatomical_score=anatomical_score,
-            scale=scale
-        )
-
-    def _find_leaf_fragment(self,
-            leaf_node:      Tuple[str, int],
-            points_map:     Dict[Tuple[str, int], SoupPoint]
-        ) -> Optional[CandidateSkeleton]:
-        """ lightweight method to find the single best 2-point fragment starting from a leaf node """
-
-        leaf_kp_name = leaf_node[0]
-
-        # a leaf has only one neighbor in the skeleton graph
-        try:
-            parent_kp_name = next(self._skeleton_graph.neighbors(leaf_kp_name))
-        except StopIteration:
-            # this shouldn't happen if the skeleton graph is correct, but as a safeguard:
-            return None
-
-        # Find all available points of the parent type
-        parent_candidates = [node for node in points_map if node[0] == parent_kp_name]
-        if not parent_candidates:
-            return None
-
-        best_parent_node = None
-        best_bone_score = -1.0
-
-        # Iterate through potential parents to find the one that forms the best single bone
-        for parent_cand_node in parent_candidates:
-            kps = {leaf_kp_name: points_map[leaf_node].position, parent_kp_name: points_map[parent_cand_node].position}
-            nodes = frozenset([leaf_node, parent_cand_node])
-
-            # We need to estimate scale even for a 2-point fragment
-            # This is a bit of a chicken-and-egg problem but we can use a quick estimate
-            scale = self._get_skeleton_scale(kps)
-            if not (self.config.MIN_SANE_SCALE < scale < self.config.MAX_SANE_SCALE):
-                continue
-
-            bone = frozenset((leaf_kp_name, parent_kp_name))
-            score = self._score_bone(bone, kps, points_map, nodes, scale)
-
-            if score > best_bone_score:
-                best_bone_score = score
-                best_parent_node = parent_cand_node
-
-        # Check if the best connection we found is good enough
-        if best_parent_node and best_bone_score > self.config.MIN_BONE_SCORE_FOR_FRAGMENT:
-            fragment_nodes = frozenset([leaf_node, best_parent_node])
-
-            final_scale = self._get_skeleton_scale({n[0]: points_map[n].position for n in fragment_nodes})
-
-            # Use the factory function to create the candidate with proper competition scoring
-            return self._create_candidate(fragment_nodes, best_bone_score, final_scale)
-
-        return None
+        return candidate_skeletons
 
     def _grow_skeleton(self,
-           anchor_node:     Tuple[str, int],
-           points_map:      Dict[Tuple[str, int], SoupPoint],
-           score_debt_tol:  float
+            anchor_node: Tuple[str, int],
+            score_debt_tol: float
         ) -> Optional[CandidateSkeleton]:
-        """ Grows a single skeleton candidate from an anchor point """
+        """
+        Grows a skeleton from an anchor and tries to rescue single view observations.
+        """
 
-        # KDTree for fast spatial lookups
-        all_nodes_list = list(points_map.keys())
-        all_positions = np.array([points_map[node].position for node in all_nodes_list])
-        if all_positions.shape[0] == 0: return None
-        kdtree = cKDTree(all_positions)
+        # anchor_node is (kp_name, index)
+        anchor_idx = anchor_node[1]
+        anchor_pos, _ = self._get_pos_conf(anchor_idx)
 
-        max_bone_len = self.median_ref_len * self.config.MAX_BONE_LEN
-
-        # initialisation
+        # Initialise
         current_nodes = {anchor_node}
-        current_kps = {anchor_node[0]: points_map[anchor_node].position}
+        current_kps = {anchor_node[0]: anchor_pos}
         total_bone_score_sum = 0.0
         num_bones = 0
 
-        while True:
-            # Find all valid keypoints that could connect to the current skeleton
-            # using topology (skeleton graph) and spatial proximity (KDTree)
+        # Heuristic: don't search infinitely far
+        max_search_radius = self.median_ref_len * self.config.MAX_BONE_LEN
 
+        while True:
             current_kp_names = {node[0] for node in current_nodes}
             nodes_to_evaluate = set()
+
+            # Find candidates via Graph topology + spatial proximity
             for node_in_skel in current_nodes:
-                neighbor_kp_types = {n for n in self._skeleton_graph.neighbors(node_in_skel[0]) if
-                                     n not in current_kp_names}
+                node_kp, node_idx = node_in_skel
+                node_pos, _ = self._get_pos_conf(node_idx)
+
+                neighbor_kp_types = {n for n in self._skeleton_graph.neighbors(node_kp) if n not in current_kp_names}
                 if not neighbor_kp_types: continue
 
-                center_pos = points_map[node_in_skel].position
-                nearby_indices = kdtree.query_ball_point(center_pos, r=max_bone_len)
-                for idx in nearby_indices:
-                    cand_node = all_nodes_list[idx]
-                    if cand_node[0] in neighbor_kp_types:
-                        nodes_to_evaluate.add(cand_node)
+                # Standard 3D search
+                if self._current_kdtree:
+                    nearby_indices = self._current_kdtree.query_ball_point(node_pos, r=max_search_radius)
+                    for idx in nearby_indices:
+                        cand_type_idx = self._current_soup.kp_types[idx]
+                        cand_type = self._current_soup.keypoint_names[cand_type_idx]
+
+                        if cand_type in neighbor_kp_types:
+                            nodes_to_evaluate.add((cand_type, int(idx)))
+
+                # Orphan Ray rescue (single view observations)
+
+                # Try to intersect rays
+                for target_type in neighbor_kp_types:
+                    # Only rescue if we don't have strong 3D candidates for this type already
+                    # (to avoid solving geometry for everything)
+                    has_3d_candidates = any(n[0] == target_type for n in nodes_to_evaluate)
+
+                    if not has_3d_candidates:
+                        orphans = self._single_view_rescue(node_pos, node_kp, target_type)
+                        for vp_idx, vp_type in orphans:
+                            nodes_to_evaluate.add((vp_type, vp_idx))
 
             if not nodes_to_evaluate:
-                break  # no more valid connections found
-
-            # Calculate scale once per growth step
-            current_step_scale = self._get_skeleton_scale(current_kps)
-            if not (self.config.MIN_SANE_SCALE < current_step_scale < self.config.MAX_SANE_SCALE):
-                # current skeleton has a bad scale so, abort
                 break
 
+            # Scale
+            current_step_scale = self._get_skeleton_scale(current_kps)
+            if not (self.config.MIN_SANE_SCALE < current_step_scale < self.config.MAX_SANE_SCALE):
+                break
+
+            # Baseline scores
             current_avg_score = (total_bone_score_sum / num_bones) if num_bones > 0 else 0
             current_base_score = current_avg_score * len(current_nodes)
             current_quality_bonus = 0.0
-
             if current_avg_score > self.config.HIGH_QUALITY_THRESHOLD:
                 current_quality_bonus = current_base_score * (self.config.QUALITY_BONUS_FACTOR - 1.0)
             current_growth_score = current_base_score + current_quality_bonus
 
-            # Evaluate each potential extension
             best_extension = None
             best_new_growth_score = -float('inf')
 
+            # Evaluate extensions
             for cand_node in nodes_to_evaluate:
+                cand_kp_name, cand_idx = cand_node
+                cand_pos, _ = self._get_pos_conf(cand_idx)
 
-                # Calculate the score contribution of only the new bones this candidate would form
-                cand_kp_name = cand_node[0]
                 temp_kps = current_kps.copy()
-                temp_kps[cand_kp_name] = points_map[cand_node].position
-                new_scale = current_step_scale
+                temp_kps[cand_kp_name] = cand_pos
 
                 new_bone_score_sum = 0
                 new_bone_count = 0
+
                 for existing_node in current_nodes:
-                    bone = frozenset((cand_node[0], existing_node[0]))
+                    bone = frozenset((cand_kp_name, existing_node[0]))
+
                     if bone in self.bones_ratios:
+
                         temp_nodes = frozenset(current_nodes | {cand_node})
-                        score = self._score_bone(bone, temp_kps, points_map, temp_nodes, new_scale)
-                        if score < -500:  # An impossible bone was formed.
+                        score = self._score_bone(bone, temp_kps, temp_nodes, current_step_scale)
+
+                        if score < -500:
                             new_bone_score_sum = -float('inf')
                             break
+
                         new_bone_score_sum += score
                         new_bone_count += 1
 
                 if new_bone_count == 0 or new_bone_score_sum == -float('inf'):
                     continue
 
-                # Calculate the potential new holistic competition score
                 new_total_bones = num_bones + new_bone_count
                 new_total_score_sum = total_bone_score_sum + new_bone_score_sum
                 new_avg_score = new_total_score_sum / new_total_bones
-
                 new_num_nodes = len(current_nodes) + 1
                 new_base_score = new_avg_score * new_num_nodes
 
-                # smooth quality bonus
+                # Quality bonus
                 bonus_factor = self.config.QUALITY_BONUS_FACTOR - 1.0
-
-                # Map average score to 0-1 range, starting from a baseline (like 75) up to 100
-                # Skeletons with avg score below 75 get no bonus
-                baseline_quality = 75.0
-                quality_range = 100.0 - baseline_quality
-
-                # Normalized quality (0 to 1, clamped)
-                normalized_quality = max(0, (new_avg_score - baseline_quality) / quality_range)
-
-                # The bonus is the base score times the bonus factor, scaled by the normalized quality
+                normalized_quality = max(0, (new_avg_score - 75.0) / 25.0)
                 new_quality_bonus = new_base_score * bonus_factor * normalized_quality
 
-                # final score to compare for the growth decision
                 new_growth_score = new_base_score + new_quality_bonus
 
-                # Keep track of the best extension found so far
                 if new_growth_score > best_new_growth_score:
                     best_new_growth_score = new_growth_score
+
                     best_extension = {
                         "node": cand_node,
+                        "pos": cand_pos,
                         "score_contribution": new_bone_score_sum,
                         "bone_count_increase": new_bone_count
                     }
 
-            # Make the growth decision (ompare the best potential new score with the current score)
+            # Decision
             if best_extension and best_new_growth_score > (current_growth_score - score_debt_tol):
-                # Yep, it's a good move. Accept growth.
                 best_node = best_extension["node"]
                 current_nodes.add(best_node)
-                current_kps[best_node[0]] = points_map[best_node].position
+                current_kps[best_node[0]] = best_extension["pos"]
                 total_bone_score_sum += best_extension["score_contribution"]
                 num_bones += best_extension["bone_count_increase"]
+
             else:
-                # Nope, best potential growth is not good enough. Stop.
                 break
 
-        # Finalise and return the grown skeleton
+        # Finish
         if len(current_nodes) < self.config.MIN_KPS_FOR_SKELETON:
             return None
 
@@ -742,19 +475,259 @@ class SkeletonAssembler:
 
         return self._create_candidate(frozenset(current_nodes), final_avg_score, final_scale)
 
-    def _get_skeleton_scale(self,
-            keypoints:  Dict[str, np.ndarray]
-        ) -> float:
-        """ Estimates the scale of a (possibly partial) skeleton relative to the reference stats """
+    def _single_view_rescue(self,
+            anchor_pos: np.ndarray,
+            anchor_kp: str,
+            target_kp: str
+        ) -> List[Tuple[int, str]]:
+        """
+        Intersects rays for target_kp with sphere around anchor_pos.
+        Returns list of (virtual_idx, kp_type) tuples.
+        """
+        bone = frozenset((anchor_kp, target_kp))
+        if bone not in self.bones_ratios:
+            return []
+
+        # Expected radius
+        r = self.median_ref_len * self.bones_ratios[bone]['median_ratio']
+
+        # Get orphan rays
+        ray_indices = self._kp_to_rays[target_kp]
+        if not ray_indices:
+            return []
+
+        ray_indices_arr = np.array(ray_indices)
+        origins = self._current_soup.ray_origins[ray_indices_arr]
+        dirs = self._current_soup.ray_directions[ray_indices_arr]
+
+        # Ray-sphere intersection
+        # TODO: Maybe make a jitted version
+        V = origins - anchor_pos
+        b = 2.0 * np.einsum('ij,ij->i', V, dirs)
+        c = np.einsum('ij,ij->i', V, V) - (r ** 2)
+        discriminant = b ** 2 - 4 * c
+
+        # Filter valid intersections
+        valid_mask = discriminant >= 0
+        if not np.any(valid_mask):
+            return []
+
+        valid_indices = np.where(valid_mask)[0]
+
+        # Calculate points for valid rays
+        sqrt_delta = np.sqrt(discriminant[valid_indices])
+        b_valid = b[valid_indices]
+
+        t1 = (-b_valid - sqrt_delta) / 2.0
+        t2 = (-b_valid + sqrt_delta) / 2.0
+
+        orig_valid = origins[valid_indices]
+        dirs_valid = dirs[valid_indices]
+
+        p1s = orig_valid + t1[:, np.newaxis] * dirs_valid
+        p2s = orig_valid + t2[:, np.newaxis] * dirs_valid
+
+        # Register virtual points
+        result = []
+
+        # Original indices into the SoupData ray arrays
+        source_ray_ids = ray_indices_arr[valid_indices]
+
+        for i in range(len(valid_indices)):
+            ray_idx = source_ray_ids[i]
+
+            conf = self._current_soup.ray_confidences[ray_idx]
+
+            # Add both solutions as candidates
+            # The conflict solver should trash the wrong one
+            vid1 = self._register_virtual_point(p1s[i], conf, target_kp, ray_idx)
+            result.append((vid1, target_kp))
+
+            vid2 = self._register_virtual_point(p2s[i], conf, target_kp, ray_idx)
+            result.append((vid2, target_kp))
+
+        return result
+
+    def _register_virtual_point(self, pos: np.ndarray, conf: float, kp_type: str, source_ray_idx: int) -> int:
+        """
+        Stores a computed 3D point in the temporary registry and returns a unique negative index.
+        """
+
+        next_idx = -1 * (len(self._current_virtual_points) + 1)
+        self._current_virtual_points[next_idx] = {
+            'pos': pos,
+            'conf': conf * 0.8,  # penalty for being inferred from single view
+            'kp_type': kp_type,
+            'source_ray_idx': source_ray_idx    # ray source index (needed to make the candidates mutually exclusive)
+        }
+        return next_idx
+
+    def _find_leaf_fragment(self, leaf_kp: str, leaf_idx: int) -> Optional[CandidateSkeleton]:
+
+        # Simple leaf finder logic
+        try:
+            parent_kp = next(self._skeleton_graph.neighbors(leaf_kp))
+        except StopIteration:
+            return None
+
+        leaf_pos, _ = self._get_pos_conf(leaf_idx)
+        best_score = -1.0
+        best_cand_data = None  # stores (idx, pos, is_virtual)
+
+        # Check for real parent points
+        parent_indices = self._kp_to_indices[parent_kp]
+        for p_idx in parent_indices:
+            p_pos, _ = self._get_pos_conf(p_idx)
+
+            kps = {leaf_kp: leaf_pos, parent_kp: p_pos}
+            scale = self._get_skeleton_scale(kps)
+            if not (self.config.MIN_SANE_SCALE < scale < self.config.MAX_SANE_SCALE):
+                continue
+
+            # Score it
+            nodes = frozenset([(leaf_kp, leaf_idx), (parent_kp, p_idx)])
+            bone = frozenset((leaf_kp, parent_kp))
+            score = self._score_bone(bone, kps, nodes, scale)
+
+            if score > best_score:
+                best_score = score
+                best_cand_data = (p_idx, p_pos)
+
+        # Check for orphan parent points
+        # (only if we didn't find a high-quality real connection)
+        if best_score < self.config.MIN_BONE_SCORE_FOR_FRAGMENT:
+            orphans = self._single_view_rescue(leaf_pos, leaf_kp, parent_kp)
+
+            for vp_idx, _ in orphans:
+                vp_pos, _ = self._get_pos_conf(vp_idx)
+
+                kps = {leaf_kp: leaf_pos, parent_kp: vp_pos}
+                scale = self._get_skeleton_scale(kps)  # estimate scale
+                if not (self.config.MIN_SANE_SCALE < scale < self.config.MAX_SANE_SCALE):
+                    continue
+
+                nodes = frozenset([(leaf_kp, leaf_idx), (parent_kp, vp_idx)])
+                bone = frozenset((leaf_kp, parent_kp))
+                score = self._score_bone(bone, kps, nodes, scale)
+
+                if score > best_score:
+                    best_score = score
+                    best_cand_data = (vp_idx, vp_pos)
+
+        if best_cand_data and best_score > self.config.MIN_BONE_SCORE_FOR_FRAGMENT:
+            p_idx, p_pos = best_cand_data
+            nodes = frozenset([(leaf_kp, leaf_idx), (parent_kp, p_idx)])
+
+            # Recompute scale
+            final_kps = {leaf_kp: leaf_pos, parent_kp: p_pos}
+            final_scale = self._get_skeleton_scale(final_kps)
+            return self._create_candidate(nodes, best_score, final_scale)
+
+        return None
+
+    def _generate_merge_hypotheses(self, fragments: List[CandidateSkeleton]) -> List[CandidateSkeleton]:
+
+        if len(fragments) < 2:
+            return []
+
+        for i, frag in enumerate(fragments):
+            frag.constituent_indices = frozenset([i])
+
+        merge_hypotheses = []
+        for i, j in combinations(range(len(fragments)), 2):
+            skel_A, skel_B = fragments[i], fragments[j]
+            merged = self._attempt_merge(skel_A, skel_B)
+            if merged:
+                merged.constituent_indices = skel_A.constituent_indices.union(skel_B.constituent_indices)
+                merge_hypotheses.append(merged)
+
+        return merge_hypotheses
+
+    def _attempt_merge(self, skel_A: CandidateSkeleton, skel_B: CandidateSkeleton) -> Optional[CandidateSkeleton]:
+
+        # Disjoint check
+        nodes_A = {n[1] for n in skel_A.nodes}  # indices only
+        nodes_B = {n[1] for n in skel_B.nodes}
+        if not nodes_A.isdisjoint(nodes_B):
+            return None
+
+        kps_A = {n[0] for n in skel_A.nodes}
+        kps_B = {n[0] for n in skel_B.nodes}
+        if not kps_A.isdisjoint(kps_B):
+            return None
+
+        # Scale consistency
+        if abs(skel_A.scale - skel_B.scale) > self.config.MERGE_SCALE_TOLERANCE:
+            return None
+        combined_scale = (skel_A.scale + skel_B.scale) / 2.0
+
+        # Find linking bone
+        best_link_score = -1.0
+
+        # Collect positions
+        kps_map_A = {n[0]: self._get_pos_conf(n[1])[0] for n in skel_A.nodes}
+        kps_map_B = {n[0]: self._get_pos_conf(n[1])[0] for n in skel_B.nodes}
+
+        combined_kps_map = {**kps_map_A, **kps_map_B}
+        combined_nodes = skel_A.nodes.union(skel_B.nodes)
+
+        for kp_a in kps_A:
+            for kp_b in kps_B:
+                bone = frozenset((kp_a, kp_b))
+                if bone in self.bones_ratios:
+                    score = self._score_bone(bone, combined_kps_map, combined_nodes, combined_scale)
+                    if score > best_link_score:
+                        best_link_score = score
+
+        if best_link_score < self.config.MERGE_LINKING_BONE_THRESHOLD:
+            return None
+
+        # Construct merged
+        avg_score_A = skel_A.anatomical_score / len(skel_A.nodes)
+        avg_score_B = skel_B.anatomical_score / len(skel_B.nodes)
+        num_bones_A = max(1, len(skel_A.nodes) - 1)
+        num_bones_B = max(1, len(skel_B.nodes) - 1)
+
+        new_total_score = (avg_score_A * num_bones_A) + (avg_score_B * num_bones_B) + best_link_score
+        new_num_bones = num_bones_A + num_bones_B + 1
+        new_avg_score = new_total_score / new_num_bones
+
+        return self._create_candidate(combined_nodes, new_avg_score, combined_scale)
+
+    def _create_candidate(self,
+            nodes: FrozenSet[Tuple[str, int]],
+            avg_score: float,
+            scale: float
+         ) -> CandidateSkeleton:
+
+        if avg_score <= 0:
+            return CandidateSkeleton(nodes=nodes, competition_score=0.0, anatomical_score=0.0, scale=scale)
+
+        num_nodes = len(nodes)
+        base_score = avg_score * num_nodes
+
+        quality_bonus = 0.0
+        if avg_score > self.config.HIGH_QUALITY_THRESHOLD:
+            quality_bonus = base_score * (self.config.QUALITY_BONUS_FACTOR - 1.0)
+
+        competition_score = base_score + quality_bonus
+        anatomical_score = avg_score * num_nodes
+
+        return CandidateSkeleton(
+            nodes=nodes,
+            competition_score=competition_score,
+            anatomical_score=anatomical_score,
+            scale=scale
+        )
+
+    def _get_skeleton_scale(self, keypoints: Dict[str, np.ndarray]) -> float:
 
         scales = []
 
-        # Use primary reference bone first
         if self.reference_bone.issubset(keypoints) and self.median_ref_len > 1e-6:
             kp1, kp2 = tuple(self.reference_bone)
             scales.append(np.linalg.norm(keypoints[kp1] - keypoints[kp2]) / self.median_ref_len)
 
-        # Use all other bones for a robust estimate
         for bone_type, stats in self.bones_ratios.items():
             kp1, kp2 = tuple(bone_type)
             if kp1 in keypoints and kp2 in keypoints:
@@ -765,143 +738,121 @@ class SkeletonAssembler:
         if not scales:
             return 1.0
 
-        # Filter out absurd scale values before taking the median
-        sane_scales = [s for s in scales if
-                       self.config.MIN_SANE_SCALE <= s <= self.config.MAX_SANE_SCALE]
+        sane_scales = [s for s in scales if self.config.MIN_SANE_SCALE <= s <= self.config.MAX_SANE_SCALE]
 
         return float(np.median(sane_scales)) if sane_scales else 1.0
 
     def _score_bone(self,
-                    bone: Bone,
-                    keypoints:  Dict[str, np.ndarray],
-                    points_map: Dict[Tuple[str, int], SoupPoint],
-                    nodes:      FrozenSet[Tuple[str, int]],
-                    scale:      float
-                    ) -> float:
-        """ Scores a single bone based on its length conformity to the stats (adjusted for scale) """
+            bone: Bone,
+            keypoints: Dict[str, np.ndarray],
+            nodes: FrozenSet[Tuple[str, int]],
+            scale: float
+        ) -> float:
 
         if bone not in self.bones_ratios:
             return 0.0
 
         stats = self.bones_ratios[bone]
         kp1_name, kp2_name = tuple(bone)
-        p1 = keypoints[kp1_name]
-        p2 = keypoints[kp2_name]
+        p1, p2 = keypoints[kp1_name], keypoints[kp2_name]
 
-        # Find confidences
+        # Retrieve confidences
         node1 = next(n for n in nodes if n[0] == kp1_name)
         node2 = next(n for n in nodes if n[0] == kp2_name)
-        conf1 = points_map[node1].confidence
-        conf2 = points_map[node2].confidence
 
-        expected_length = self.median_ref_len * stats['median_ratio'] * scale
+        _, conf1 = self._get_pos_conf(node1[1])
+        _, conf2 = self._get_pos_conf(node2[1])
 
-        # Scale the expected deviation
+        expected_len = self.median_ref_len * stats['median_ratio'] * scale
         expected_mad = self.median_ref_len * stats['mad_ratio'] * scale + self.config.BONE_SCORE_MAD_EPSILON
         distance = np.linalg.norm(p1 - p2)
 
-        # How many std dev (using MAD) the length is from the mean
-        num_mads_away = abs(distance - expected_length) / (expected_mad + 1e-6)
-
-        if num_mads_away > 2.0:  # Debug print for bones that are just a bit off
-            logger.debug(f"      - Scoring bone {kp1_name}-{kp2_name}:\n"
-                         f"          Scale: {scale:.2f}, Measured Dist: {distance:.2f}, Expected: {expected_length:.2f}"
-                         f"          MADs away: {num_mads_away:.2f} (Thresh: {self.config.BONE_SCORE_MAD_THRESH})")
+        num_mads_away = abs(distance - expected_len) / (expected_mad + 1e-6)
 
         if num_mads_away > self.config.BONE_SCORE_MAD_THRESH:
-            # impossible bone: large negative penalty that will poison the average score
             return -1000.0
 
-        # Gaussian-like fall off for the length score
         length_score = np.exp(-0.5 * num_mads_away ** 2)
-
-        # Factor in the confidence of the 2D detections that created the 3D points
         confidence_score = (conf1 + conf2) / 2.0
 
         return length_score * confidence_score
 
 
 class MultiObjectTracker:
-    """ Main class for tracking multiple skeletons over time """
+    """Main class for tracking multiple skeletons over time."""
 
     def __init__(self, assembler: SkeletonAssembler, config: TrackerConfig = TrackerConfig()):
-
         self.assembler = assembler
         self.config = config
         self.frame_idx = -1
         self.tracklets: List[Tracklet] = []
         self.next_track_idx = 0
 
-    def update(self,
-               soup_points: List[SoupPoint],
-               frame_idx: int
-        ) -> List[Tracklet]:
-        """ Processes a single frame using 'Hypothesize-and-Solve' workflow """
-
+    def update(self, soup: SoupData, frame_idx: int) -> List[Tracklet]:
         self.frame_idx = frame_idx
 
-        # Predict forward state of existing tracklets
         for tracklet in self.tracklets:
             tracklet.predict(self.frame_idx)
 
-        # Generate all initial fragments from the 3D point soup and merge hypotheses from the assembler
-        all_candidates, points_map = self.assembler.assemble_frame(soup_points)
+        # Generate Hypotheses
+        all_candidates, virtual_registry = self.assembler.assemble_frame(soup)
+
         if not all_candidates:
             self.prune_tracklets()
             return self.get_active_tracklets()
 
-        # Apply temporal guidance: boost scores of candidates that match tracklets
-        bonuses = self._calculate_association_bonuses(all_candidates, points_map)
+        # mini helper to resolve positions for conflict graph and association
+        def get_pos(idx):
+            if idx >= 0:
+                return soup.positions[idx]
+            return virtual_registry[idx]['pos']
+
+        # Association bonus
+        bonuses = self._calculate_association_bonuses(all_candidates, get_pos)
         for i, cand in enumerate(all_candidates):
             cand.competition_score += bonuses[i] * self.config.CONTINUITY_BONUS
 
-        # Build a conflict graph that includes spatial conflicts and hierarchical conflicts (merge vs. its parts)
-        conflict_graph = self._build_conflict_graph(all_candidates, points_map)
-
-        # Solve for the globally optimal set of skeletons using MWIS
-        # winner_indices = solve_mwis_SCIP(conflict_graph)
+        # Conflict solver
+        conflict_graph = self._build_conflict_graph(all_candidates, get_pos, virtual_registry)
         winner_indices = solve_mwis_networkx(conflict_graph)
 
-        winning_skeletons = [
-            AssembledSkeleton(
-                keypoints={node[0]: points_map[node].position for node in all_candidates[i].nodes},
-                point_indices={node[0]: node[1] for node in all_candidates[i].nodes},
-                score=all_candidates[i].anatomical_score,
-                scale=all_candidates[i].scale
-            )
-            for i in winner_indices
-        ]
-        logger.debug(
-            f"Conflict resolution selected {len(winner_indices)} skeletons from {len(all_candidates)} total candidates.")
+        # Reify winners into AssembledSkeletons
+        winning_skeletons = []
 
-        # Associate winning skeletons with tracklets and update state
+        for i in winner_indices:
+            cand = all_candidates[i]
+            kps = {node[0]: get_pos(node[1]) for node in cand.nodes}
+            pt_indices = {node[0]: node[1] for node in cand.nodes}
+
+            winning_skeletons.append(
+                AssembledSkeleton(keypoints=kps, point_indices=pt_indices, score=cand.anatomical_score,
+                                  scale=cand.scale)
+            )
+
+        # Update tracklets
+        matched_winner_indices = set()
         if self.tracklets and winning_skeletons:
             cost_matrix = self._build_final_assignment_cost_matrix(self.tracklets, winning_skeletons)
             tracklet_inds, winner_inds = linear_sum_assignment(cost_matrix)
 
-            matched_winner_indices = set()
             for t_idx, w_idx in zip(tracklet_inds, winner_inds):
                 if cost_matrix[t_idx, w_idx] < 1e9:
                     self.tracklets[t_idx].update(skeleton=winning_skeletons[w_idx], frame_idx=self.frame_idx)
                     matched_winner_indices.add(w_idx)
-        else:
-            matched_winner_indices = set()
 
-        # Create new tracklets for unmatched skeletons
+        # Create new tracklets
         for i, skel in enumerate(winning_skeletons):
             if i not in matched_winner_indices and self.assembler.central_kp in skel.keypoints:
-                new_tracklet = Tracklet(self.next_track_idx, skel, self.frame_idx, self.assembler.central_kp, config=self.config)
+                new_tracklet = Tracklet(self.next_track_idx, skel, self.frame_idx, self.assembler.central_kp,
+                                        self.config)
                 self.tracklets.append(new_tracklet)
                 self.next_track_idx += 1
 
-        # Prune old/lost tracklets
         self.prune_tracklets()
 
         return self.get_active_tracklets()
 
     def predict_only(self, frame_idx: int) -> List[Tracklet]:
-        """ Handles frames with no detections by only running the prediction step """
-
         self.frame_idx = frame_idx
 
         for tracklet in self.tracklets:
@@ -912,22 +863,20 @@ class MultiObjectTracker:
         return self.get_active_tracklets()
 
     def get_active_tracklets(self) -> List[Tracklet]:
-        """ Returns a list of tracklets that have been updated in the current frame """
         return [t for t in self.tracklets if t.time_since_update == 0]
 
     def prune_tracklets(self):
-        """ Removes tracklets that have been lost for too long or that are very uncertain """
-
         self.tracklets = [
             t for t in self.tracklets
-            if t.time_since_update <= self.config.MAX_TRACKLET_AGE and not np.sum(t.uncertainty['position']) > self.config.UNCERTAINTY_THRESHOLD
+            if t.time_since_update <= self.config.MAX_TRACKLET_AGE and not np.sum(
+                t.uncertainty['position']) > self.config.UNCERTAINTY_THRESHOLD
         ]
 
     def _build_conflict_graph(self,
             candidates: List[CandidateSkeleton],
-            points_map: Dict[Tuple[str, int], SoupPoint]
+            pos_lookup,
+            virtual_registry: Dict[int, Dict]
         ) -> nx.Graph:
-        """ Builds a conflict graph with both spatial and hierarchical conflicts """
 
         conflict_graph = nx.Graph()
         num_candidates = len(candidates)
@@ -936,56 +885,72 @@ class MultiObjectTracker:
             weight = max(0, int(cand.competition_score * 100))
             conflict_graph.add_node(i, weight=weight)
 
-        # Pre-calculate centroids for spatial checks
         centroids = np.array([
-            np.mean([points_map[node].position for node in cand.nodes], axis=0) if cand.nodes else np.array([np.nan] * 3)
+            np.mean([pos_lookup(node[1]) for node in cand.nodes], axis=0) if cand.nodes else np.array([np.nan] * 3)
             for cand in candidates
         ])
+
+        # Grab the set of source ray IDs for each candidate
+        # For real points ray_id is None (or -1)
+        # For virtual points it's the index in SoupData.rays
+        cand_ray_sources = []
+        for cand in candidates:
+            rays = set()
+            for kp_name, idx in cand.nodes:
+                if idx < 0:  # virtual point
+                    source_ray = virtual_registry[idx]['source_ray_idx']
+                    rays.add(source_ray)
+            cand_ray_sources.append(rays)
 
         for i, j in combinations(range(num_candidates), 2):
             cand_i, cand_j = candidates[i], candidates[j]
 
-            # Hierarchical conflict: if one candidate is composed of the other, they conflict
+            # Hierarchical conflict
             if cand_i.constituent_indices and cand_j.constituent_indices:
                 if cand_j.constituent_indices.issubset(cand_i.constituent_indices) or \
                         cand_i.constituent_indices.issubset(cand_j.constituent_indices):
                     conflict_graph.add_edge(i, j)
                     continue
 
-            # Spatial Conflict (direct point sharing)
-            shared_nodes = cand_i.nodes.intersection(cand_j.nodes)
-            if len(shared_nodes) > self.config.CONFLICT_SOLVER_SHARED_POINTS_TOLERANCE:
+            # Spatial conflict (shared point indices)
+            nodes_i = {n[1] for n in cand_i.nodes}
+            nodes_j = {n[1] for n in cand_j.nodes}
+            if not nodes_i.isdisjoint(nodes_j):
                 conflict_graph.add_edge(i, j)
                 continue
 
-            # Spatial Conflict (proximity)
-            # Only check this if centroids are close
+            # Ray source conflict
+            # If both candidates come from the same 2D detection ray, they are mutually exclusive
+            # (even if the 3D points are different)
+            if not cand_ray_sources[i].isdisjoint(cand_ray_sources[j]):
+                conflict_graph.add_edge(i, j)
+                continue
+
+            # Spatial proximity (clones)
+            # Jaccard similarity: if most of the points are in the same positions then they're likely clones
             dist_sq = np.sum((centroids[i] - centroids[j]) ** 2)
+
             if dist_sq < self.config.CONFLICT_SOLVER_BROAD_RADIUS ** 2:
-                kps_i = {node[0]: points_map[node].position for node in cand_i.nodes}
-                kps_j = {node[0]: points_map[node].position for node in cand_j.nodes}
+                kps_i = {node[0]: pos_lookup(node[1]) for node in cand_i.nodes}
+                kps_j = {node[0]: pos_lookup(node[1]) for node in cand_j.nodes}
+
                 common = kps_i.keys() & kps_j.keys()
                 union = kps_i.keys() | kps_j.keys()
+
                 if not union:
                     continue
 
-                proximal_intersection = sum(
+                proximal_count = sum(
                     1 for name in common if
                     np.linalg.norm(kps_i[name] - kps_j[name]) < self.config.CONFLICT_SOLVER_PROXIMITY_RADIUS
                 )
-                if proximal_intersection / len(union) > self.config.CONFLICT_SOLVER_JACCARD_THRESHOLD:
+
+                if proximal_count / len(union) > self.config.CONFLICT_SOLVER_JACCARD_THRESHOLD:
                     conflict_graph.add_edge(i, j)
 
         return conflict_graph
 
-    def _calculate_association_bonuses(self,
-                                       candidates: List[CandidateSkeleton],
-                                       points_map: Dict[Tuple[str, int], SoupPoint]
-                                       ) -> np.ndarray:
-        """
-        Calculates a score bonus (0 to 1) for each candidate skeleton based on its
-        best possible alignment with any existing tracklet's prediction
-        """
+    def _calculate_association_bonuses(self, candidates: List[CandidateSkeleton], pos_lookup) -> np.ndarray:
 
         if not self.tracklets or not candidates:
             return np.zeros(len(candidates))
@@ -993,12 +958,13 @@ class MultiObjectTracker:
         bonuses = np.zeros(len(candidates))
 
         for j, cand_skel in enumerate(candidates):
-            skel_kps = {node[0]: points_map[node].position for node in cand_skel.nodes}
+            skel_kps = {node[0]: pos_lookup(node[1]) for node in cand_skel.nodes}
 
             if not skel_kps:
                 continue
 
             max_bonus = 0.0
+
             for tracklet in self.tracklets:
                 pred_pose = tracklet.predicted_pose
 
@@ -1009,11 +975,9 @@ class MultiObjectTracker:
                 if len(common_kps) < self.config.ASSOCIATION_MIN_KPS:
                     continue
 
-                # Calculate mean squared distance between common keypoints
                 mean_dist_sq = sum(np.sum((pred_pose[kp] - skel_kps[kp]) ** 2) for kp in common_kps) / len(common_kps)
-
-                # Gaussian bonus falls off as distance increases
                 bonus = np.exp(-0.5 * mean_dist_sq / (self.config.ASSOCIATION_RADIUS ** 2))
+
                 if bonus > max_bonus:
                     max_bonus = bonus
 
@@ -1022,10 +986,9 @@ class MultiObjectTracker:
         return bonuses
 
     def _build_final_assignment_cost_matrix(self,
-                                            tracklets:  List[Tracklet],
-                                            skeletons:  List[AssembledSkeleton]
-                                            ) -> np.ndarray:
-        """ Builds the cost matrix for the final assignment via Hungarian algorithm """
+            tracklets: List[Tracklet],
+            skeletons: List[AssembledSkeleton]
+        ) -> np.ndarray:
 
         cost_matrix = np.full((len(tracklets), len(skeletons)), 1e9)
 
@@ -1041,14 +1004,12 @@ class MultiObjectTracker:
                 if len(common_kps) < self.config.ASSOCIATION_MIN_KPS:
                     continue
 
-                mean_dist_sq = sum(np.sum((pred_pose[kp] - skel.keypoints[kp]) ** 2)
-                                   for kp in common_kps) / len(common_kps)
+                mean_dist_sq = sum(np.sum((pred_pose[kp] - skel.keypoints[kp]) ** 2) for kp in common_kps) / len(
+                    common_kps)
 
                 if mean_dist_sq > self.config.ASSOCIATION_RADIUS ** 2:
                     continue
 
-                # The cost is a weighted sum of pose distance and the skeleton's intrinsic score
-                # A good skeleton (high score) should reduce the cost
                 cost = (self.config.COST_POSE_DISTANCE_WEIGHT * mean_dist_sq +
                         self.config.COST_SKELETON_SCORE_WEIGHT * skel.score)
                 cost_matrix[i, j] = cost
@@ -1057,7 +1018,16 @@ class MultiObjectTracker:
 
 
 if __name__ == '__main__':
+    import pickle
+    import json
+    from pathlib import Path
+    from collections import defaultdict
+    import numpy as np
 
+    from mokap.reconstruction.anatomy import StatsBootstrapper, AnatomyLearner
+    from mokap.reconstruction.datatypes import SoupData
+
+    # Configuration
     folder = Path().home() / 'Desktop' / '3d_ant_data'
     prefix = '240905-1616'
     session = 22
@@ -1067,93 +1037,103 @@ if __name__ == '__main__':
     tracker_cfg = TrackerConfig()
 
     stats_output_file = folder / prefix / 'outputs' / f'bone_stats_session{session}.json'
-    # prior_stats_file = Path().home() / 'Desktop' / 'bone_lengths.csv'
-    prior_stats_file = None
-
-    # Load data
     points_soup_file = folder / prefix / 'outputs' / f'points_soup_session{session}.pkl'
     skeleton_input_file = folder / prefix / 'inputs' / 'tracking'
+    tracklets_output_file = folder / prefix / 'outputs' / f'tracklets_session{session}.pkl'
 
+    # Load data
+    print(f"Loading soup from {points_soup_file}...")
     with open(points_soup_file, 'rb') as f:
-        points_soup = pickle.load(f)
+        soup: SoupData = pickle.load(f)
 
-    if not points_soup:
-        print("No points in the soup. Exiting.")
+    if soup.num_points == 0:
+        print("Soup is empty (no 3D points). Exiting.")
         exit()
 
+    # Load metadata
     keypoints, bones, symmetry = fileio.load_skeleton_SLEAP(skeleton_input_file, symmetry=True)
 
-    # Get Anatomical stats
+    # Bootstrap anatomy
     bootstrapper = StatsBootstrapper(
         output_path=stats_output_file,
         bones_list=bones,
         symmetry_map=symmetry,
-        prior_stats_path=prior_stats_file,
-        bootstrap_data=points_soup,
+        prior_stats_path=None,
+        bootstrap_data=soup,
         config=anatomy_cfg
     )
     bone_stats = bootstrapper.get_initial_stats()
 
-    # Initialise the tracking pipeline
-    anatomy_learner = AnatomyLearner(initial_stats=bone_stats,
-                                     config=anatomy_cfg)
-    assembler = SkeletonAssembler(bones_list=bones,
-                                  bone_stats=bone_stats,
-                                  assembler_config=assembler_cfg,
-                                  tracker_config=tracker_cfg)
-    tracker = MultiObjectTracker(assembler=assembler,
-                                 config=tracker_cfg)
+    # Initialise pipeline
+    anatomy_learner = AnatomyLearner(initial_stats=bone_stats, config=anatomy_cfg)
 
-    # Run tracking pipeline
-    frames_indices = sorted(points_soup.keys())
-    min_frame, max_frame = frames_indices[0], frames_indices[-1]
+    assembler = SkeletonAssembler(
+        bones_list=bones,
+        bone_stats=bone_stats,
+        assembler_config=assembler_cfg,
+        tracker_config=tracker_cfg
+    )
+
+    tracker = MultiObjectTracker(assembler=assembler, config=tracker_cfg)
+
+    # Run Tracking
+
+    unique_frames = np.unique(soup.frame_indices)
+    min_frame, max_frame = int(unique_frames[0]), int(unique_frames[-1])
 
     tracklets_by_id = defaultdict(list)
 
-    with alive_bar(title='Tracking Skeletons...', length=20, total=(max_frame - min_frame + 1), force_tty=True) as bar:
+    print(f"Tracking from frame {min_frame} to {max_frame}...")
+
+    with alive_bar(total=(max_frame - min_frame + 1), force_tty=True) as bar:
         for frame_idx in range(min_frame, max_frame + 1):
 
-            # The assembler's anatomical model is updated with the latest learned stats
+            # Update anatomical model with learning
             current_stats = anatomy_learner.get_stats()
             assembler.update_bone_stats(current_stats)
 
-            # Run the tracker for the frame
-            if frame_idx in points_soup:
-                active_tracklets = tracker.update(points_soup[frame_idx], frame_idx)
+            frame_soup = soup.get_frame_slice(frame_idx)
+
+            # Check if we have any data (Points or Rays) to process
+            if frame_soup.num_points > 0 or len(frame_soup.ray_origins) > 0:
+                active_tracklets = tracker.update(frame_soup, frame_idx)
             else:
+                # Coasting / Prediction only
                 active_tracklets = tracker.predict_only(frame_idx)
 
-            # Feed the results back into the learner
+            # Store results
             for tracklet in active_tracklets:
-                # We only use skeletons from the current frame for learning
+                # Feed higher quality skeletons to the learner
                 if tracklet.last_update_frame == frame_idx:
                     anatomy_learner.add_sample(tracklet.skeleton)
 
-            # Convert dataclasses back to dicts for serialization
-            for tracklet in active_tracklets:
+                # Serialize to dictionary for Stage 3 (Linking)
                 skel_dict = tracklet.skeleton.to_dict()
-                skel_dict['track_idx'] = tracklet.track_idx
-                skel_dict['track_health'] = tracklet.health
-                skel_dict['track_anatomical_integrity'] = tracklet.anatomical_integrity
-                skel_dict['track_uncertainty_pos'] = tracklet.uncertainty['position'].tolist()
-                skel_dict['track_velocity'] = tracklet.kf.x[3:6].flatten().tolist()
-                skel_dict['track_predicted_pos'] = tracklet.predicted_position.tolist()
-                skel_dict['time_since_update'] = tracklet.time_since_update
-
-                # add the frame_idx to the skeleton dict
-                skel_dict['frame_idx'] = frame_idx
-
+                skel_dict.update({
+                    'track_idx': tracklet.track_idx,
+                    'track_health': tracklet.health,
+                    'track_anatomical_integrity': tracklet.anatomical_integrity,
+                    'track_uncertainty_pos': tracklet.uncertainty['position'].tolist(),
+                    'track_velocity': tracklet.kf.x[3:6].flatten().tolist(),
+                    'track_predicted_pos': tracklet.predicted_position.tolist(),
+                    'time_since_update': tracklet.time_since_update,
+                    'frame_idx': frame_idx
+                })
                 tracklets_by_id[tracklet.track_idx].append(skel_dict)
 
             bar()
 
     print("Tracking complete.")
+    print(f"Generated {len(tracklets_by_id)} unique tracklets.")
 
-    # Save final results (tracklet-centric format)
-    output_file = folder / prefix / 'outputs' / f'tracklets_session{session}.pkl'
-    output_file.parent.mkdir(parents=True, exist_ok=True)
-
-    with open(output_file, 'wb') as f:
+    # Save Tracklets
+    tracklets_output_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(tracklets_output_file, 'wb') as f:
         pickle.dump(dict(tracklets_by_id), f)
+    print(f"Tracklet results saved to '{tracklets_output_file}'")
 
-    print(f"Results saved to '{output_file}'")
+    # Save updated anatomy stats
+    with open(stats_output_file, 'w') as f:
+        json.dump(anatomy_learner.get_stats(), f, indent=2)
+    print(f"Refined bone stats saved to '{stats_output_file}'")
+

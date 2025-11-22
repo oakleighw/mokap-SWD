@@ -1,7 +1,9 @@
 import logging
 import re
-from typing import List, Optional, Tuple, Dict
+import polars as pl
 import networkx as nx
+from typing import List, Optional, Tuple, Dict
+
 from mokap.utils import common_prefix_suffix
 
 
@@ -112,3 +114,28 @@ def create_canonical_map(
     logger.debug(f"  -> Example: '{example_kp}' maps to '{canonical_map.get(example_kp)}'")
 
     return canonical_map
+
+
+# TODO: This will be removed once fileio is cleaned and uses polars for all disk-persistent data
+def prepare_reconstruction_input(df: pl.DataFrame, cameras: List[str], keypoints: List[str]):
+    """
+    Converts Polars DataFrame to flat numpy arrays for the Reconstructor
+    """
+
+    df = df.sort(["frame", "keypoint", "camera"])
+
+    cam_map = {cam_name: c for c, cam_name in enumerate(cameras)}
+    kp_map = {kp_name: k for k, kp_name in enumerate(keypoints)}
+
+    df = df.with_columns(
+        pl.col("keypoint").replace(kp_map).cast(pl.Int16).alias("kp_type_id"),
+        pl.col("camera").replace(cam_map).cast(pl.Int8).alias("cam_id"),
+    ).sort(["frame", "kp_type_id", "cam_id", "score"], descending=[False, False, False, True])
+
+    return {
+        "frame_indices": df["frame"].to_numpy(),
+        "kp_type_ids": df["kp_type_id"].to_numpy(),
+        "cam_ids": df["cam_id"].to_numpy(),
+        "coords": df.select(["x", "y"]).to_numpy(),
+        "scores": df["score"].to_numpy()
+    }

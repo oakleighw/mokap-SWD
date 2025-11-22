@@ -274,7 +274,7 @@ def undistort_points(
     ones = jnp.ones_like(x_u)
     pts_h = jnp.stack([x_u, y_u, ones], axis=-1)  # (..., 3)
 
-    # --- Optional Rectification and Reprojection ---
+    # Optional Rectification and Reprojection
     # This block mimics cv2.undistortPoints' R and P arguments
     # If R is provided, apply rectification rotation
     if R is not None:
@@ -401,7 +401,7 @@ def reprojection_errors(
         sq_diff_masked = sq_diff
         num_visible_points = jnp.prod(jnp.array(points_2d_observed.shape[:-1]))
 
-    # --- Metric Calculations ---
+    # Metric calculations
     # True RMS Error (of all 2*N coordinates)
     total_sum_sq_err = jnp.sum(sq_diff_masked)
     rms_error = jnp.sqrt(total_sum_sq_err / jnp.maximum(2 * num_visible_points, 1))

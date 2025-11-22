@@ -1,7 +1,4 @@
-import json
 import logging
-import pickle
-from pathlib import Path
 from typing import List, Dict, Tuple
 from collections import defaultdict
 import numpy as np
@@ -10,10 +7,9 @@ import jax.numpy as jnp
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 from alive_progress import alive_bar
+
 from mokap.reconstruction.config import MergerConfig, LinkerConfig
 from mokap.reconstruction.datatypes import TrackletData
-from mokap.reconstruction.utils import create_canonical_map
-from mokap.utils import fileio
 from mokap.utils.geometry.fitting import find_rigid_transform
 
 
@@ -53,7 +49,7 @@ class FragmentMerger:
                     continue
 
                 if self.config.DEBUG:
-                    print(f"\n--- Checking pair ({track_a.idx}, {track_b.idx}) ---")
+                    print(f"\n[ Checking pair ({track_a.idx}, {track_b.idx}) ]")
 
                 if not self._check_motion_consistency(track_a, track_b):
                     if self.config.DEBUG:
@@ -183,7 +179,7 @@ class FragmentMerger:
         groups = [[tid] for tid in component]
 
         def _check_compatibility(group1, group2):
-            """ Check if merging two groups would introduce a conflict """
+            """Check if merging two groups would introduce a conflict."""
             for id1 in group1:
                 for id2 in group2:
                     if frozenset((id1, id2)) in conflicts:
@@ -191,7 +187,7 @@ class FragmentMerger:
             return True
 
         def _check_connectivity(group1, group2):
-            """ Check if there's a merge link between any members of the two groups """
+            """Check if there's a merge link between any members of the two groups."""
             for id1 in group1:
                 for id2 in group2:
                     if id2 in merge_adj.get(id1, []):
@@ -293,6 +289,11 @@ class FragmentMerger:
         Checks if two fragments have consistent velocities over their overlapping frames
         (a large difference in velocity is strong evidence they are separate objects)
         """
+
+        # If a tracklet is very short, its velocity estimate is pure noise
+        # so we skip the motion check and rely only on anatomy/proximity
+        if len(track_a.frames) < 4 or len(track_b.frames) < 4:
+            return True
 
         frames_a = {f: i for i, f in enumerate(track_a.frames)}
         frames_b = {f: i for i, f in enumerate(track_b.frames)}
@@ -398,7 +399,7 @@ class FragmentMerger:
         return is_proximal, avg_min_dist
 
     def _calculate_anatomical_fit_score(self, track_a: 'TrackletData', track_b: 'TrackletData') -> Tuple[float, float]:
-        """ Calculates how well two fragments fit together anatomically by scoring all possible inter-fragment bones """
+        """Calculates how well two fragments fit together anatomically by scoring all possible inter-fragment bones."""
 
         frames_a, frames_b = set(track_a.frames), set(track_b.frames)
 
@@ -455,7 +456,7 @@ class FragmentMerger:
         return np.mean(all_bone_scores), np.percentile(all_bone_scores, 90)
 
     def _score_single_bone(self, bone: frozenset, p1: np.ndarray, p2: np.ndarray, scale: float) -> float:
-        """ Scores a single bone based on its length conformity, returning a value from 0 to 100 """
+        """Scores a single bone based on its length conformity, returning a value from 0 to 100."""
 
         bone_str = ';'.join(sorted(tuple(bone)))
         if bone_str not in self.bone_stats['bones_ratios']:
@@ -479,7 +480,7 @@ class FragmentMerger:
         return 100 * (1.0 - (mad_away / self.config.ANATOMY_BONE_MAD_THRESH))
 
     def _perform_multi_merge(self, tracklets_to_merge: List['TrackletData']) -> 'TrackletData':
-        """ Combines multiple tracklets from a connected component into a single new tracklet """
+        """Combines multiple tracklets from a connected component into a single new tracklet."""
 
         # The new tracklet inherits the ID of the longest original tracklet
         tracklets_to_merge.sort(key=lambda t: len(t.frames), reverse=True)
@@ -559,7 +560,7 @@ class FragmentMerger:
         )
 
 class TrackletLinker:
-    """ Links fragmented tracklets that are separated *in time* using a globally optimal assignment """
+    """Links fragmented tracklets that are separated *in time* using a globally optimal assignment."""
 
     def __init__(self, tracklets: Dict[int, TrackletData], canonical_map: Dict, config: LinkerConfig):
         self.config = config
@@ -576,16 +577,19 @@ class TrackletLinker:
 
         cost_matrix = np.full((n, n), np.inf)
         
-        with alive_bar(n * (n - 1), length=20, title="Cost Matrix", force_tty=True) as bar:
+        with alive_bar(n * n, length=20, title="Cost Matrix", force_tty=True) as bar:
 
             for i in range(n):
                 for j in range(n):
+                    # Skip diagonal (self-linking)
                     if i == j:
+                        bar()
                         continue
 
                     track_a = tracklet_list[i]
                     track_b = tracklet_list[j]
 
+                    # Check temporal ordering and gap
                     frame_gap = track_b.start - track_a.end
 
                     if 1 <= frame_gap <= self.config.MAX_FRAME_GAP:
@@ -593,32 +597,34 @@ class TrackletLinker:
 
                         if cost < self.config.COST_THRESHOLD:
                             cost_matrix[i, j] = cost
-                bar()
+                    bar()
 
         penalized_cost_matrix = self._penalize_ambiguous_links(cost_matrix)
 
-        if np.any(np.all(np.isinf(cost_matrix), axis=1)) or np.any(np.all(np.isinf(cost_matrix), axis=0)):
-            logger.warning("Cost matrix is infeasible. No valid links can be formed. Skipping assignment.")
-            # No links are possible, so every tracklet is its own chain
-            return {t.idx: [t.idx] for t in tracklet_list}
+        # Having rows/cols of all infs is normal (start/end of tracks)
+        # but linear_sum_assignment crashes on infs so we use a huge cost
+        # and we filter out the garbage later using COST_THRESHOLD
+        safe_max_cost = 1e6     # value larger than any possible valid cost + penalty
+        solver_matrix = np.where(np.isinf(penalized_cost_matrix), safe_max_cost, penalized_cost_matrix)
 
-        row_ind, col_ind = linear_sum_assignment(penalized_cost_matrix)
+        row_ind, col_ind = linear_sum_assignment(solver_matrix)
 
         final_links = {}
         for r, c in zip(row_ind, col_ind):
-            
-            cost = penalized_cost_matrix[r, c]
-            
-            if cost < self.config.COST_THRESHOLD:
+            # Check against the original cost matrix (or penalized one)
+            # to ensure we don't accept the dummy safe_max_cost links
+            real_cost = penalized_cost_matrix[r, c]
+
+            if real_cost < self.config.COST_THRESHOLD:
                 id_a, id_b = tracklet_list[r].idx, tracklet_list[c].idx
                 final_links[id_a] = id_b
-                logger.debug(f"  - Link: {id_a} -> {id_b} (Cost: {cost_matrix[r, c]:.2f})")
+                logger.debug(f"  - Link: {id_a} -> {id_b} (Cost: {real_cost:.2f})")
 
         return self._rebuild_chains(final_links)
 
     def _penalize_ambiguous_links(self, cost_matrix: np.ndarray) -> np.ndarray:
         """
-        Identifies and penalizes ambiguous links in the cost matrix
+        Identifies and penalizes ambiguous links in the cost matrix.
 
         An ambiguous link occurs when a tracklet has more than one high-quality
         candidate to link to (either forward or backward in time)
@@ -630,38 +636,41 @@ class TrackletLinker:
         ambiguity_penalty = self.config.AMBIGUITY_PENALTY
         cost_threshold = self.config.COST_THRESHOLD
 
-        # check for forward ambiguity (each row represents an 'ender' tracklet)
+        # Check for forward ambiguity (one ender -> multiple starters)
         for i in range(n):
             row_costs = cost_matrix[i, :]
-            valid_costs = row_costs[row_costs < cost_threshold]
+            valid_indices = np.where(row_costs < cost_threshold)[0]
 
-            if len(valid_costs) > 1:
-                # Get the two smallest costs without a full sort
-                best_cost, second_best_cost = np.partition(valid_costs, 1)[:2]
+            if len(valid_indices) > 1:
+                valid_costs = row_costs[valid_indices]
 
-                # Check if the second best is close to the best
-                if (second_best_cost - best_cost) / best_cost < ambiguity_threshold_ratio:
-                    # This row has ambiguous links. Penalize all of them.
-                    ambiguous_indices = np.where(row_costs < cost_threshold)[0]
-                    penalized_cost_matrix[i, ambiguous_indices] += ambiguity_penalty
+                top_2 = np.partition(valid_costs, 1)[:2]
+                best_cost = min(top_2)
+                second_best_cost = max(top_2)
 
-        # check for backward ambiguity (each column represents a 'starter' tracklet)
+                if (second_best_cost - best_cost) / (best_cost + 1e-6) < ambiguity_threshold_ratio:
+                    penalized_cost_matrix[i, valid_indices] += ambiguity_penalty
+
+        # Check for backward ambiguity (multiple enders -> one starter)
         for j in range(m):
             col_costs = cost_matrix[:, j]
-            valid_costs = col_costs[col_costs < cost_threshold]
+            valid_indices = np.where(col_costs < cost_threshold)[0]
 
-            if len(valid_costs) > 1:
-                best_cost, second_best_cost = np.partition(valid_costs, 1)[:2]
+            if len(valid_indices) > 1:
+                valid_costs = col_costs[valid_indices]
 
-                if (second_best_cost - best_cost) / best_cost < ambiguity_threshold_ratio:
-                    # This column has ambiguous links. Penalize all of them.
-                    ambiguous_indices = np.where(col_costs < cost_threshold)[0]
-                    penalized_cost_matrix[ambiguous_indices, j] += ambiguity_penalty
+                top_2 = np.partition(valid_costs, 1)[:2]
+                best_cost = min(top_2)
+                second_best_cost = max(top_2)
+
+                if (second_best_cost - best_cost) / (best_cost + 1e-6) < ambiguity_threshold_ratio:
+                    penalized_cost_matrix[valid_indices, j] += ambiguity_penalty
 
         return penalized_cost_matrix
 
     def _calculate_link_cost(self, track_a: TrackletData, track_b: TrackletData, frame_gap: int) -> float:
-        """ Calculates a cost for linking tracklet A to B """
+        """Calculates a cost for linking tracklet A to B."""
+        # TODO: This should be revamped
 
         # Get template poses and check for overlap
         kps_a = track_a.template_pose(end=True)
@@ -688,7 +697,9 @@ class TrackletLinker:
         inferred_center_b = common_centroid_b + vec_common_to_center_a
         delta = inferred_center_b - pred_pos_a
 
-        cov_a = np.diag(track_a.uncertainties[-1])
+        # Handle cases where uncertainties might be 0
+        cov_a = np.diag(track_a.uncertainties[-1] + 1e-6)
+
         central_kp_name = min(kps_a.keys(), key=lambda k: np.linalg.norm(kps_a[k] - pred_pos_a))
         p_noise_var = self.config.SMOOTHER_KF_PROCESS_NOISE.get(
             self.canonical_map.get(central_kp_name, 'default'),
@@ -700,10 +711,21 @@ class TrackletLinker:
             inv_cov = np.eye(3)
         else:
             inv_cov = np.linalg.inv(propagated_cov)
+
         mahalanobis_dist_sq = delta.T @ inv_cov @ delta
         motion_cost = np.sqrt(mahalanobis_dist_sq)
 
         # Velocity continuity cost
+        # if tracklets are very short, velocity is noisy so the weight of this cost is reduced
+        # TODO: more magic numbers, I know
+        VERY_SHORT_TRACKLET = 3
+        VERY_SHORT_TRACKLET_UNRELIABILITY = 0.1
+        
+        if len(track_a.frames) < VERY_SHORT_TRACKLET or len(track_b.frames) < VERY_SHORT_TRACKLET:
+            vel_reliability = VERY_SHORT_TRACKLET_UNRELIABILITY
+        else:
+            vel_reliability = 1.0
+
         vel_a_end = track_a.template_velocity(end=True)
         vel_b_start = track_b.template_velocity(end=False)
         velocity_cost = np.linalg.norm(vel_a_end - vel_b_start)
@@ -713,31 +735,49 @@ class TrackletLinker:
         quality_b = np.mean(track_b.healths[:3]) * np.mean(track_b.integrities[:3])
         quality_score = np.sqrt(quality_a * quality_b)
 
+        # Stability bias
+        # TODO: too many magic numbers, this should be reworked
+        QUITE_SHORT_TRACKLET = 5   # haha this is terrible
+        PENALTY_SHORT_SHORT = 10.0
+        PENALTY_LONG_SHORT = 12.0
+        
+        is_a_short = len(track_a.frames) < QUITE_SHORT_TRACKLET
+        is_b_short = len(track_b.frames) < QUITE_SHORT_TRACKLET
+        if is_a_short and is_b_short:
+            # Two quite short tracklets connecting: high risk, but allowed if otherwise a good link
+            risk_penalty = PENALTY_SHORT_SHORT
+        elif is_a_short or is_b_short:
+            # One long one short: Dangerous case
+            risk_penalty = PENALTY_LONG_SHORT
+        else:
+            risk_penalty = 0.0
+
         # Weighted Cost
         total_cost = (self.config.COST_W_MOTION * motion_cost +
                       self.config.COST_W_SHAPE * shape_cost +
-                      self.config.COST_W_VELOCITY * velocity_cost +
-                      self.config.COST_W_QUALITY * quality_score)
+                      self.config.COST_W_VELOCITY * velocity_cost * vel_reliability +
+                      self.config.COST_W_QUALITY * quality_score +
+                      risk_penalty)
 
         return total_cost
 
+
     def _rebuild_chains(self, links: Dict[int, int]) -> Dict[int, List[int]]:
         """
-        Follows the links from the assignment to construct the full tracklet chains
-        (also handles any tracklets that were not part of any link)
+        Follows the links from the assignment to construct the full tracklet chains.
         """
+        all_nodes = set(self.tracklets.keys())
+        linked_destinations = set(links.values())
 
-        if not links:
-            return {track_idx: [track_idx] for track_idx in self.tracklets.keys()}
-
-        all_nodes = set(links.keys()) | set(links.values())
-        start_nodes = all_nodes - set(links.values())
+        # Start nodes are those that are not destinations of any link
+        start_nodes = all_nodes - linked_destinations
 
         chains = {}
         new_track_idx_counter = 0
 
         for start_node in start_nodes:
-            chain, curr = [start_node], start_node
+            chain = [start_node]
+            curr = start_node
 
             while curr in links:
                 curr = links[curr]
@@ -746,18 +786,11 @@ class TrackletLinker:
             chains[new_track_idx_counter] = chain
             new_track_idx_counter += 1
 
-        all_linked_ids = {item for sublist in chains.values() for item in sublist}
-        unlinked_ids = set(self.tracklets.keys()) - all_linked_ids
-
-        for track_idx in unlinked_ids:
-            chains[new_track_idx_counter] = [track_idx]
-            new_track_idx_counter += 1
-
         return chains
 
 
 def load_tracklets(track_data: Dict[int, List[Dict]], config: LinkerConfig) -> Dict[int, TrackletData]:
-    """ Parses the raw tracked data from a file into Tracklet objects """
+    """Parses the raw tracked data from a file into Tracklet objects."""
 
     tracklets = {}
     for track_idx, skeletons_list in track_data.items():
@@ -787,7 +820,7 @@ def combine_chains(
         chains: Dict[int, List[int]],
         tracklet_pool: Dict[int, 'TrackletData']
     ) -> Dict[int, List[Dict]]:
-    """ Combines the skeletons from linked and merged tracklets into final, full tracks """
+    """Combines the skeletons from linked and merged tracklets into final, full tracks."""
 
     final_tracks = {}
     print("\nCombining linked chains into final tracks...")
@@ -816,7 +849,15 @@ def combine_chains(
 
 
 if __name__ == '__main__':
+    import pickle
+    import json
+    import numpy as np
+    from pathlib import Path
 
+    from mokap.utils import fileio
+    from mokap.reconstruction.utils import create_canonical_map
+
+    # Configuration
     folder = Path().home() / 'Desktop' / '3d_ant_data'
     prefix = '240905-1616'
     session = 22
@@ -824,52 +865,84 @@ if __name__ == '__main__':
     linker_cfg = LinkerConfig()
     merger_cfg = MergerConfig()
 
-    input_file = folder / prefix / 'outputs' / f'tracklets_session{session}.pkl'
-    skeleton_input_file = folder / prefix / 'inputs' / 'tracking'
-    stats_file = folder / prefix / 'outputs' / f'bone_stats_session{session}.json'
+    input_dir = folder / prefix / 'inputs' / 'tracking'
+    output_dir = folder / prefix / 'outputs'
 
-    print("Loading data...")
-    keypoints, bones_list, symmetry = fileio.load_skeleton_SLEAP(skeleton_input_file, symmetry=True)
-    with open(stats_file, 'r') as f:
-        bone_stats = json.load(f)
-    with open(input_file, 'rb') as f:
+    # Inputs
+    tracklets_file = output_dir / f'tracklets_session{session}.pkl'
+    stats_file = output_dir / f'bone_stats_session{session}.json'
+
+    # Output
+    final_output_file = output_dir / f'linked_tracks_session{session}.pkl'
+
+    # Load data
+    print(f"Loading tracklets from {tracklets_file}...")
+    if not tracklets_file.exists():
+        print("Tracklets file not found. Run tracking step first.")
+        exit()
+
+    with open(tracklets_file, 'rb') as f:
         all_tracked_data = pickle.load(f)
 
     if not all_tracked_data:
-        print("No tracklets found in the input file. Exiting.")
+        print("Tracklet dictionary is empty. Exiting.")
         exit()
 
+    print(f"Loaded {len(all_tracked_data)} raw tracklet fragments.")
+
+    # Load metadata
+    keypoints, bones_list, symmetry = fileio.load_skeleton_SLEAP(input_dir, symmetry=True)
     canonical_map = create_canonical_map(keypoints, symmetry)
 
-    print("\n--- STAGE 1: Merging Overlapping Fragments ---")
+    with open(stats_file, 'r') as f:
+        bone_stats = json.load(f)
+
+    # Merge overlapping fragments (stage 3a)
+    print("\n[ Stage 3a: fragment merging ]")
+
+    # Convert raw dicts to TrackletData objects
     initial_tracklets = load_tracklets(all_tracked_data, config=linker_cfg)
+    print(f"  -> Filtered to {len(initial_tracklets)} valid tracklets (min length > {linker_cfg.MIN_TRACKLET_LEN}).")
+
     merger = FragmentMerger(initial_tracklets, bone_stats, bones_list, config=merger_cfg)
     merged_tracklets = merger.merge_fragments()
 
-    print("\n--- STAGE 2: Linking Temporal Gaps ---")
+    reduction = 100 * (1 - len(merged_tracklets) / len(initial_tracklets))
+    print(
+        f"  -> Merging complete: {len(initial_tracklets)} -> {len(merged_tracklets)} tracklets ({reduction:.1f}% reduction).")
+
+    # Link temporal gaps (stage 3b)
+    print("\n[ Stage 3b: Temporal linking ]")
     linker = TrackletLinker(merged_tracklets, canonical_map, config=linker_cfg)
     chains = linker.link_tracklets()
 
-    print("\n--- Final Track Chains Summary ---")
-    if chains:
-        sorted_chains = sorted(
-            chains.items(),
-            key=lambda item: sum(len(merged_tracklets[tid].skeletons) for tid in item[1]),
-            reverse=True
-        )
-        for new_id, old_ids in sorted_chains[:10]:
-            total_skeletons = sum(len(merged_tracklets[tid].skeletons) for tid in old_ids)
-            print(f"Track {new_id}: Composed of fragments {old_ids} (Total Skeletons: {total_skeletons})")
-    else:
-        print("No valid links were made.")
-
-    # Final Assembly & saving
+    # Combine and summarize (stage 3c)
+    print("\n[  Stage 3c: Final assembly ]")
     final_linked_tracks = combine_chains(chains, merged_tracklets)
 
-    output_file = folder / prefix / 'outputs' / f'linked_tracks_session{session}.pkl'
-    output_file.parent.mkdir(parents=True, exist_ok=True)
+    # Some statistics
+    num_tracks = len(final_linked_tracks)
+    if num_tracks > 0:
+        lengths = [len(t) for t in final_linked_tracks.values()]
+        total_skeletons = sum(lengths)
+        max_len = max(lengths)
+        median_len = int(np.median(lengths))
 
-    with open(output_file, 'wb') as f:
+        print(f"\n[Summary]")
+        print(f"  Total unique tracks: {num_tracks}")
+        print(f"  Total skeletons:     {total_skeletons}")
+        print(f"  Max track length:    {max_len} frames")
+        print(f"  Median track length: {median_len} frames")
+
+        # Print top 5 longest tracks
+        sorted_ids = sorted(final_linked_tracks.keys(), key=lambda k: len(final_linked_tracks[k]), reverse=True)
+        print(f"  Top 5 longest tracks: {[len(final_linked_tracks[i]) for i in sorted_ids[:5]]}")
+    else:
+        print("\n[Summary] No tracks generated.")
+
+    # Save
+    final_output_file.parent.mkdir(parents=True, exist_ok=True)
+    with open(final_output_file, 'wb') as f:
         pickle.dump(final_linked_tracks, f)
 
-    print(f"\nSaved {len(final_linked_tracks)} final linked tracks to '{output_file}'")
+    print(f"\nSaved final tracks to '{final_output_file}'")

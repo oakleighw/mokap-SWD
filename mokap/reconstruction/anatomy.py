@@ -9,10 +9,10 @@ import numpy as np
 import pandas as pd
 from alive_progress import alive_bar
 from scipy.stats import median_abs_deviation
-from mokap.reconstruction.config import AnatomyConfig
-from mokap.reconstruction.datatypes import SoupPoint, Bone, AssembledSkeleton
-from mokap.reconstruction.utils import create_canonical_map
 
+from mokap.reconstruction.config import AnatomyConfig
+from mokap.reconstruction.datatypes import Bone, AssembledSkeleton, SoupData
+from mokap.reconstruction.utils import create_canonical_map
 
 logger = logging.getLogger(__name__)
 
@@ -21,13 +21,13 @@ class StatsBootstrapper:
     """ Handles the loading, creation, and standardization of anatomical statistics """
 
     def __init__(self,
-            output_path:        Union[str, Path],
-            bones_list:         List[Tuple[str, str]],
-            config:             AnatomyConfig,
-            symmetry_map:       Optional[List[Tuple[str, str]]] = None,
-            prior_stats_path:   Optional[Union[str, Path]] = None,
-            bootstrap_data:     Optional[Dict[int, List[SoupPoint]]] = None
-         ):
+                 output_path: Union[str, Path],
+                 bones_list: List[Tuple[str, str]],
+                 config: AnatomyConfig,
+                 symmetry_map: Optional[List[Tuple[str, str]]] = None,
+                 prior_stats_path: Optional[Union[str, Path]] = None,
+                 bootstrap_data: Optional[SoupData] = None
+                 ):
 
         self.config = config
 
@@ -39,13 +39,13 @@ class StatsBootstrapper:
         keypoints = sorted(list(keypoints))
 
         # Build skeleton graph for degree calculations
-        # TODO: This is also done in the skeleton assembler, that's a bit redundant
         self._skeleton_graph = nx.Graph()
         self._skeleton_graph.add_edges_from([tuple(b) for b in self.bones_list])
         self._degrees = dict(self._skeleton_graph.degree())
 
         self.output_path = Path(output_path)
         self.prior_path = Path(prior_stats_path) if prior_stats_path else None
+
         self.bootstrap_data = bootstrap_data
 
         self.json_delimiter_regex = re.compile(r'[-;, ]')
@@ -55,7 +55,6 @@ class StatsBootstrapper:
         """ Normalizes a bone's keypoint names using the canonical map """
 
         kp1_orig, kp2_orig = tuple(bone)
-
         kp1_canon = self.canonical_map.get(kp1_orig, kp1_orig)
         kp2_canon = self.canonical_map.get(kp2_orig, kp2_orig)
 
@@ -69,38 +68,30 @@ class StatsBootstrapper:
         3. Bootstrap from 3D data if provided
         """
 
-        # try loading a user-provided prior file
+        # Try loading a user-provided prior file
         if self.prior_path and self.prior_path.exists():
             logger.info(f"Loading stats from provided prior file: '{self.prior_path.name}'")
-
             return self._load_and_process_file(self.prior_path)
 
-        # check if the designated output file already exists
+        # Check if the designated output file already exists
         if self.output_path.exists():
             logger.info(f"Loading pre-existing stats file: '{self.output_path.name}'")
-
             with open(self.output_path, 'r') as f:
                 stats = json.load(f)
+            return self._validate_and_normalize_stats(stats)
 
-            return self._validate_and_normalize_stats(stats)  # always validate pre-existing files
-
-        # try to bootstrap from data
-        if self.bootstrap_data:
+        # Try to bootstrap from data
+        if self.bootstrap_data is not None and self.bootstrap_data.num_points > 0:
             logger.info("No stats file provided or found. Bootstrapping from 3D data...")
-
             stats = self._bootstrap_from_data()
             self._save_stats(stats)
-
             return stats
 
         raise ValueError(
             '[ERROR] Could not obtain stats. No prior file provided, no existing stats file found, and no bootstrap data given.')
 
     def _get_most_stable_bone(self, available_bones: set[Bone]) -> Bone:
-        """
-        Selects the most stable bone as defined by the sum of the degrees of the two keypoints forming it
-        This favors central, well-connected bones.
-        """
+        """Selects the most stable bone (sum of degrees of keypoints)."""
 
         if not available_bones:
             raise ValueError("Cannot select a stable bone from an empty set.")
@@ -112,10 +103,7 @@ class StatsBootstrapper:
             kp1, kp2 = tuple(bone)
             if kp1 not in self._degrees or kp2 not in self._degrees:
                 continue
-
-            # Score is the sum of the degrees of the two keypoints
             score = self._degrees[kp1] + self._degrees[kp2]
-
             if score > max_score:
                 max_score = score
                 best_bone = bone
@@ -128,20 +116,17 @@ class StatsBootstrapper:
 
     def _parse_bone_name(self, bone_name: str) -> Bone:
         parts = [str(p).strip() for p in self.json_delimiter_regex.split(bone_name) if str(p).strip()]
-
         if len(parts) != 2:
             raise ValueError(
                 f"Could not parse bone name '{bone_name}'. Expected two keypoints separated by a delimiter.")
-
         return frozenset(parts)
 
     def _load_and_process_file(self, file_path: Path) -> Dict:
-        """ Loads a JSON or CSV file, normalises it, and ensures std dev exists """
+        """Loads a JSON or CSV file, normalises it, and ensures std dev exists."""
 
         if file_path.suffix == '.csv':
             df = pd.read_csv(file_path)
             df.columns = df.columns.str.strip().str.lower()
-
             if not {'bone', 'length'}.issubset(df.columns):
                 raise ValueError("CSV file must contain 'bone' and 'length' columns.")
 
@@ -150,11 +135,9 @@ class StatsBootstrapper:
         elif file_path.suffix == '.json':
             with open(file_path, 'r') as f:
                 json_data = json.load(f)
-
             if 'bones_ratios' in json_data:
                 print("[INFO] File is already in final stats format. Validating...")
                 return self._validate_and_normalize_stats(json_data)
-
             bone_data = json_data
 
         else:
@@ -166,7 +149,7 @@ class StatsBootstrapper:
         return stats
 
     def _normalize_lengths(self, bones_data: Dict[str, float]) -> Dict:
-        """ Normalises a dictionary of bone lengths using a reference bone """
+        """Normalises a dictionary of bone lengths using a reference bone."""
 
         parsed_bones_data = {self._parse_bone_name(name): length for name, length in bones_data.items()}
 
@@ -186,7 +169,7 @@ class StatsBootstrapper:
             bone_key = ';'.join(sorted(list(name)))  # we want to serialize with consistent sorting
             bones_ratios[bone_key] = {
                 'median_ratio': float(median_ratio),
-                'mad_ratio': float(median_ratio * generic_mad_ratio)  # Default MAD
+                'mad_ratio': float(median_ratio * generic_mad_ratio)  # default MAD
             }
 
         logger.info(f"Using data-driven reference bone: '{'-'.join(ref_bone)}' (length: {ref_bone_len:.2f})")
@@ -197,19 +180,19 @@ class StatsBootstrapper:
         }
 
     def _validate_and_normalize_stats(self, stats: Dict) -> Dict:
-        """ Checks a fully-formatted stats dict and adds missing deviation """
+        """Checks a fully-formatted stats dict and adds missing deviation."""
 
         generic_mad_ratio = self.config.BOOTSTRAP_GENERIC_MAD_RATIO
         updated = False
 
-        # Standardize keys first, in case they come from a file with mixed delimiters
+        # Standardize keys first (in case they come from a file with mixed delimiters)
         standardized_ratios = {
             ';'.join(sorted(list(self._parse_bone_name(k)))): v
             for k, v in stats['bones_ratios'].items()
         }
         stats['bones_ratios'] = standardized_ratios
 
-        # Now check for missing MAD values
+        # Check for missing MAD values
         for bone_key, bone_stats in stats['bones_ratios'].items():
             if 'mad_ratio' not in bone_stats or not np.isfinite(bone_stats['mad_ratio']) or bone_stats[
                 'mad_ratio'] == 0:
@@ -223,98 +206,114 @@ class StatsBootstrapper:
 
         return stats
 
-    def _greedy_assembler(self, frame_points: List[SoupPoint]) -> List[dict]:
-        """ Simplified assembler for bootstrapping stats. Builds skeletons greedily from the central keypoint """
+    def _greedy_assembler(self, frame_soup: SoupData) -> List[Dict[str, np.ndarray]]:
+        """
+        Greedy assembler for bootstrapping stats. Ignores Orphan Rays (requires high confidence).
+        """
 
-        if not frame_points:
+        if frame_soup.num_points == 0:
             return []
 
-        points_by_kp = defaultdict(list)
-        for p in frame_points:
-            points_by_kp[p.keypoint_type].append(p)
-
         skeletons = []
-        used_point_ids = set()  # (kp_name, idx) of used points
+        used_indices = set()
 
-        # Iterate through every point of every type as a potential seed
-        for seed_kp, seed_points_list in points_by_kp.items():
+        # Pre-group indices by keypoint type
+        kp_to_indices = defaultdict(list)
+        for i in range(frame_soup.num_points):
+            kp_to_indices[frame_soup.kp_types[i]].append(i)
 
-            for seed_point in seed_points_list:
-                seed_id = (seed_point.keypoint_type, seed_point.idx)
+        # Iterate through every point as a potential seed
+        for seed_kp_type_idx in kp_to_indices:
+            seed_kp_name = frame_soup.keypoint_names[seed_kp_type_idx]
 
-                if seed_id in used_point_ids:
+            for seed_idx in kp_to_indices[seed_kp_type_idx]:
+                if seed_idx in used_indices:
                     continue
 
-                center_pos = seed_point.position
-                skeleton = {'keypoints': {seed_kp: center_pos}}
+                seed_pos = frame_soup.positions[seed_idx]
+
+                # Start a skeleton dict mapping Name -> Position
+                skeleton_kps = {seed_kp_name: seed_pos}
 
                 # Greedily find the closest available keypoint of each other type
-                for kp_name, points_list in points_by_kp.items():
-
-                    if kp_name == seed_kp or not points_list:
+                for other_kp_type_idx, candidate_indices in kp_to_indices.items():
+                    if other_kp_type_idx == seed_kp_type_idx:
                         continue
 
-                    positions = np.array([p.position for p in points_list])
-                    distances = np.linalg.norm(positions - center_pos, axis=1)
-                    best_idx = np.argmin(distances)
+                    other_kp_name = frame_soup.keypoint_names[other_kp_type_idx]
 
-                    if distances[best_idx] < self.config.BOOTSTRAP_MAX_BONE_LEN:
-                        skeleton['keypoints'][kp_name] = points_list[best_idx].position
+                    # Distance check
+                    candidates_pos = frame_soup.positions[candidate_indices]
+                    distances = np.linalg.norm(candidates_pos - seed_pos, axis=1)
 
-                if len(skeleton['keypoints']) >= 2:
-                    skeletons.append(skeleton)
+                    best_local_idx = np.argmin(distances)
+                    min_dist = distances[best_local_idx]
 
-                # Mark all points used in this new skeleton so they aren't used as seeds again
-                for kp, point_pos in skeleton['keypoints'].items():
-                    # Find the original SoupPoint to get its ID
-                    for p in points_by_kp[kp]:
-                        if np.array_equal(p.position, point_pos):
-                            used_point_ids.add((p.keypoint_type, p.idx))
-                            break
+                    if min_dist < self.config.BOOTSTRAP_MAX_BONE_LEN:
+                        skeleton_kps[other_kp_name] = candidates_pos[best_local_idx]
+
+                if len(skeleton_kps) >= 2:
+                    skeletons.append({'keypoints': skeleton_kps})
+
+                # Note: this is bootstrapping so we don't care about 'using' points.
+                # We just mark the seed to prevent identical iterations.
+                used_indices.add(seed_idx)
+
         return skeletons
 
     def _bootstrap_from_data(self) -> Dict:
-        """ Performs data-driven bootstrapping using symmetry to create robust stats """
+        """Performs data-driven bootstrapping (using symmetry)."""
 
         canonical_bone_lengths = defaultdict(list)
         canonical_to_original_map = defaultdict(set)
 
-        with alive_bar(title='Gathering bone measurements...', length=20, total=len(self.bootstrap_data), force_tty=True) as bar:
-            for frame_data in self.bootstrap_data.values():
-                fragments = self._greedy_assembler(frame_data)
+        unique_frames = np.unique(self.bootstrap_data.frame_indices)
+
+        # Limit sampling if dataset is huge
+        MAX_BOOTSTRAP_FRAMES = 1000 # TODO: Make this configurable
+        if len(unique_frames) > MAX_BOOTSTRAP_FRAMES:
+            unique_frames = np.random.choice(unique_frames, MAX_BOOTSTRAP_FRAMES, replace=False)
+            logger.info(f"Bootstrapping from a random subset of {len(unique_frames)} frames.")
+
+        with alive_bar(title='Gathering bone measurements...', length=20, total=len(unique_frames),
+                       force_tty=True) as bar:
+            for frame_idx in unique_frames:
+
+                frame_soup = self.bootstrap_data.get_frame_slice(frame_idx)
+
+                fragments = self._greedy_assembler(frame_soup)
+
                 for frag in fragments:
+                    kps = frag['keypoints']
                     for original_bone in self.bones_list:
-                        if original_bone.issubset(frag['keypoints']):
+                        if original_bone.issubset(kps):
                             kp1, kp2 = tuple(original_bone)
-                            length = np.linalg.norm(frag['keypoints'][kp1] - frag['keypoints'][kp2])
+                            length = np.linalg.norm(kps[kp1] - kps[kp2])
+
                             if length > 1e-3:
                                 canonical_bone = self._symmetrise_bone_names(original_bone)
                                 canonical_bone_lengths[canonical_bone].append(length)
-
-                                # and store the mapping
                                 canonical_to_original_map[canonical_bone].add(original_bone)
                 bar()
 
         # Calculate stats for canonical bones
-        valid_canonical_bones = {b for b, lengths in canonical_bone_lengths.items() if
-                                 len(lengths) >= self.config.BOOTSTRAP_MIN_SAMPLES}
+        valid_canonical_bones = {b for b, lengths in canonical_bone_lengths.items()
+                                 if len(lengths) >= self.config.BOOTSTRAP_MIN_SAMPLES}
+
         median_lengths = {b: np.median(canonical_bone_lengths[b]) for b in valid_canonical_bones}
 
         if not median_lengths:
             raise ValueError("Bootstrap failed: Not enough valid bone samples found in the data.")
 
+        # Determine reference bone based on graph stability
         canonical_graph = nx.Graph()
         canonical_degrees = defaultdict(int)
 
         for bone in self.bones_list:
             canonical_bone = self._symmetrise_bone_names(bone)
-
-            # only add edges if the canonical bone is valid (has 2 parts)
             if len(canonical_bone) == 2:
                 canonical_graph.add_edge(*tuple(canonical_bone))
 
-        # map original degrees to canonical degrees
-        # (a canonical kp's degree is the sum of degrees of its original constituent parts)
         for kp, deg in self._degrees.items():
             if self.canonical_map and kp in self.canonical_map:
                 canonical_degrees[self.canonical_map[kp]] += deg
@@ -334,8 +333,9 @@ class StatsBootstrapper:
         canonical_ref_bone = get_best_canonical_ref(set(median_lengths.keys()))
         ref_len = median_lengths[canonical_ref_bone]
 
-        # Pick any original bone that corresponds to the canonical reference
+        # Fallback to arbitrary original bone for final name
         reference_bone = list(canonical_to_original_map[canonical_ref_bone])[0]
+
         logger.info(
             f"Bootstrap determined stability-driven canonical reference '{' - '.join(canonical_ref_bone)}'. "
             f"Saving final reference as '{' - '.join(reference_bone)}' (median length: {ref_len:.2f})"
@@ -350,7 +350,7 @@ class StatsBootstrapper:
                 'mad_ratio': float(median_abs_deviation(ratios_dist))
             }
 
-        # Map the canonical stats back to original bone names
+        # Map the stats back to the original bone names
         final_bones_ratios = {}
         for canonical_bone, stats in canonical_stats.items():
             original_bones = canonical_to_original_map[canonical_bone]
@@ -366,7 +366,7 @@ class StatsBootstrapper:
         return self._validate_and_normalize_stats(final_stats)
 
     def _save_stats(self, stats: Dict):
-        """ Saves the generated stats to the specified JSON file """
+        """Saves the generated stats to the specified JSON file."""
         print(f"[INFO] Saving processed stats to '{self.output_path}'...")
 
         with open(self.output_path, 'w') as f:
@@ -374,37 +374,36 @@ class StatsBootstrapper:
 
 
 class AnatomyLearner:
+    """
+    Online learner that refines bone lengths based on high-confidence tracked skeletons.
+    """
+
     def __init__(self, initial_stats: dict, config: AnatomyConfig):
 
         self.reference_bone: Bone = frozenset(initial_stats['reference_bone'])
         self.config = config
-        
-        # Store raw measurements to re-calculate stats on the fly
+
         self.ref_lengths = []
         self.bones_ratios: Dict[Bone, List[float]] = defaultdict(list)
 
-        # Keep track of the current stats to avoid re-computing every frame
         self.current_stats = initial_stats
-        self.is_stale = True  # flag to indicate that stats need re-computing
-
+        self.is_stale = True
         self.measurements_count = 0
 
     def add_sample(self, skeleton: AssembledSkeleton):
-        """ Adds a new high-quality skeleton to the measurement pool """
+        """Adds a new high-quality skeleton to the measurement pool."""
 
-        # Quality gate
         if skeleton.score < self.config.LEARNER_MIN_SCORE_FOR_LEARNING:
             return
 
         if not self.reference_bone.issubset(skeleton.keypoints):
             return
 
-        # Add measurements
         kp1_name, kp2_name = tuple(self.reference_bone)
         p1, p2 = skeleton.keypoints[kp1_name], skeleton.keypoints[kp2_name]
         ref_len = np.linalg.norm(p1 - p2)
 
-        # sanity check
+        # small sanity check
         if not (self.config.LEARNER_MIN_REF_BONE_LEN < ref_len < self.config.LEARNER_MAX_REF_BONE_LEN):
             return
 
@@ -421,12 +420,11 @@ class AnatomyLearner:
             self.is_stale = True
 
     def get_stats(self) -> dict:
-        """ Returns the current best stats, re-computing them if enough new data has arrived """
+        """Returns the current best stats, re-computing them if enough new data has arrived."""
 
         if not self.is_stale:
             return self.current_stats
 
-        # Recompute stats from the full pool of measurements
         new_bones_ratios = {
             ';'.join(sorted(list(b))): {'median_ratio': float(np.median(r)),
                                         'mad_ratio': float(median_abs_deviation(r))}
