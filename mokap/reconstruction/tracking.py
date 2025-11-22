@@ -1,6 +1,7 @@
 import logging
 from typing import Tuple, Optional, Dict, List, FrozenSet
 from itertools import combinations
+from collections import defaultdict
 import networkx as nx
 import numpy as np
 from alive_progress import alive_bar
@@ -1021,7 +1022,6 @@ if __name__ == '__main__':
     import pickle
     import json
     from pathlib import Path
-    from collections import defaultdict
     import numpy as np
 
     from mokap.reconstruction.anatomy import StatsBootstrapper, AnatomyLearner
