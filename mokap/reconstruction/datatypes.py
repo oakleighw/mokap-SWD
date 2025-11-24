@@ -14,6 +14,7 @@ class SoupData:
     # 3D points
     positions: np.ndarray           # (N, 3) float32
     confidences: np.ndarray         # (N,) float32
+    reprojection_errors: np.ndarray # (N,) float32
     kp_types: np.ndarray            # (N,) int16, maps to keypoint_names
     frame_indices: np.ndarray       # (N,) int32, frame index for batch processing
     camera_masks: np.ndarray        # (N,) uint32, bitmask (bit 0 = cam1, bit 1 = cam2, etc), maps to camera_names
@@ -50,6 +51,7 @@ class SoupData:
         return SoupData(
             positions=self.positions[start_p:end_p],
             confidences=self.confidences[start_p:end_p],
+            reprojection_errors=self.reprojection_errors[start_p:end_p],
             kp_types=self.kp_types[start_p:end_p],
             frame_indices=self.frame_indices[start_p:end_p],
             camera_masks=self.camera_masks[start_p:end_p],
@@ -78,6 +80,7 @@ class SoupData:
         return SoupData(
             positions=np.concatenate([s.positions for s in soups]),
             confidences=np.concatenate([s.confidences for s in soups]),
+            reprojection_errors=np.concatenate([s.reprojection_errors for s in soups]),
             kp_types=np.concatenate([s.kp_types for s in soups]),
             frame_indices=np.concatenate([s.frame_indices for s in soups]),
             camera_masks=np.concatenate([s.camera_masks for s in soups]),

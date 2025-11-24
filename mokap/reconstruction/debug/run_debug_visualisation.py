@@ -6,7 +6,7 @@ import jax.numpy as jnp
 from pathlib import Path
 from mokap.utils import fileio
 from mokap.reconstruction.config import ReconstructorConfig
-from mokap.reconstruction.reconstruction_soa import Reconstructor
+from mokap.reconstruction.reconstruction import Reconstructor
 from mokap.reconstruction.utils import prepare_reconstruction_input
 from mokap.reconstruction.debug.visualisation import (
     ReconstructorVisualizer, run_sequence_viewer, convert_track_centric_to_frame_centric, view_soup_frame

@@ -84,6 +84,7 @@ class Reconstructor:
         self.EMPTY_RESULT = (
             self.NULL_POINT3D_NP,
             self.EMPTY_F32_NP,
+            self.EMPTY_F32_NP,
             [],  # indices list
             self.EMPTY_U32_NP
         )
@@ -109,6 +110,16 @@ class Reconstructor:
         # Extrinsics: Camera-to-world (ror ray casting / back proj)
         self.Es_c2w = extrinsics_matrix(self.rvecs_c2w, self.tvecs_c2w)
 
+    @property
+    def max_point_score(self) -> float:
+        """
+        Returns the theoretical maximum score a single 3D point can achieve.
+        Assumes visibility in all cameras with perfect confidence and zero error.
+        """
+        # Score = (Views * W_views) + (Sum_Conf * W_conf) + (Error * W_error)
+        return (self.num_cams * self.config.view_count_weight) + \
+            (self.num_cams * 1.0 * self.config.detection_confidence_weight)
+
     def reconstruct_batch(self, inputs: Dict[str, np.ndarray], keypoint_names: List[str]) -> SoupData:
         """
         Reconstructs 3D points from a dictionary of flat arrays (Structure of Arrays).
@@ -117,8 +128,12 @@ class Reconstructor:
         total_detections = len(inputs['kp_type_ids'])
         is_used = np.zeros(total_detections, dtype=bool)
 
-        out_positions, out_confs = [], []
-        out_kp_types, out_frame_indices, out_cam_masks = [], [], []
+        out_positions = []
+        out_confs = []
+        out_errs = []
+        out_kp_types = []
+        out_frame_indices = []
+        out_cam_masks = []
 
         unique_frames = np.unique(inputs['frame_indices'])
 
@@ -152,7 +167,7 @@ class Reconstructor:
                 curr_scores_jax = jnp.array(curr_scores_np)
 
                 # Core reconstruction
-                final_pts, final_confs, used_indices_list, cam_masks = self._reconstruct_keypoint(
+                final_pts, final_confs, final_errors, used_indices_list, cam_masks = self._reconstruct_keypoint(
                     curr_coords_np, curr_cam_ids_np, curr_indices_np,
                     curr_coords_jax, curr_scores_jax
                 )
@@ -161,6 +176,7 @@ class Reconstructor:
                     n_pts = len(final_pts)
                     out_positions.append(final_pts)
                     out_confs.append(final_confs)
+                    out_errs.append(final_errors)
                     out_kp_types.append(np.full(n_pts, kp_id, dtype=np.int16))
                     out_frame_indices.append(np.full(n_pts, frame_idx, dtype=np.int32))
                     out_cam_masks.append(cam_masks)
@@ -172,12 +188,14 @@ class Reconstructor:
         if out_positions:
             soup_pos = np.vstack(out_positions)
             soup_conf = np.concatenate(out_confs)
+            soup_errs = np.concatenate(out_errs)
             soup_kp = np.concatenate(out_kp_types)
             soup_frame = np.concatenate(out_frame_indices)
             soup_mask = np.concatenate(out_cam_masks)
         else:
             soup_pos = self.NULL_POINT3D_NP
             soup_conf = self.EMPTY_F32_NP
+            soup_errs = self.EMPTY_F32_NP
             soup_kp = self.EMPTY_I16_NP
             soup_frame = self.EMPTY_I32_NP
             soup_mask = self.EMPTY_U32_NP
@@ -208,6 +226,7 @@ class Reconstructor:
         return SoupData(
             positions=soup_pos.astype(np.float32),
             confidences=soup_conf.astype(np.float32),
+            reprojection_errors=soup_errs.astype(np.float32),
             kp_types=soup_kp.astype(np.int16),
             frame_indices=soup_frame.astype(np.int32),
             camera_masks=soup_mask.astype(np.uint32),
@@ -259,7 +278,7 @@ class Reconstructor:
                               indices_np: np.ndarray,
                               coords_jax: jnp.ndarray,
                               scores_jax: jnp.ndarray
-                              ) -> Tuple[np.ndarray, np.ndarray, List[List[int]], np.ndarray]:
+                              ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[List[int]], np.ndarray]:
         """
         Runs reconstruction pipeline for a keypoint.
         Accepts both numpy (for Graph logic) and JAX (for geometry logic).
@@ -273,12 +292,12 @@ class Reconstructor:
             return self.EMPTY_RESULT
 
         # Filter hypotheses and merge redundancies
-        final_pts, final_confs, final_indices, final_masks = self._filter_and_merge(
+        final_pts, final_confs, final_errors, final_indices, final_masks = self._filter_and_merge(
             all_pts_jax, view_counts, summed_confs, all_errors, all_groups,
             cam_ids_np, indices_np
         )
 
-        return final_pts, final_confs, final_indices, final_masks
+        return final_pts, final_confs, final_errors, final_indices, final_masks
 
     def _generate_hypotheses(self,
                              coords_np: np.ndarray,
@@ -724,8 +743,11 @@ class Reconstructor:
         clustering = DBSCAN(eps=self.config.cluster_radius, min_samples=1).fit(winner_points_3d)
         labels = clustering.labels_
 
-        final_points, final_scores = [], []
-        final_indices_list, final_cam_masks = [], []
+        final_points = []
+        final_scores = []
+        final_errors = []
+        final_indices_list = []
+        final_cam_masks = []
 
         def process_group(group_idxs):
             """Helper to get global indices and mask from a local group list"""
@@ -766,8 +788,12 @@ class Reconstructor:
                         merged_global_indices.extend(g_idxs)
                         merged_mask |= mask
 
+                    # Calculate weighted average of errors too
+                    averaged_error = np.sum(errors[winner_indices[local_indices]] * weights)
+
                     final_points.append(averaged_point)
                     final_scores.append(averaged_score)
+                    final_errors.append(averaged_error)
                     final_indices_list.append(merged_global_indices)
                     final_cam_masks.append(merged_mask)
                     merged = True
@@ -776,12 +802,14 @@ class Reconstructor:
                 for idx in local_indices:
                     final_points.append(winner_points_3d[idx])
                     final_scores.append(winner_scores[idx])
+                    final_errors.append(errors[winner_indices[idx]])
                     g_idxs, mask = process_group(winner_groups[idx])
                     final_indices_list.append(g_idxs)
                     final_cam_masks.append(mask)
 
         return (np.array(final_points, dtype=np.float32),
                 np.array(final_scores, dtype=np.float32),
+                np.array(final_errors, dtype=np.float32),
                 final_indices_list,
                 np.array(final_cam_masks, dtype=np.uint32))
 
