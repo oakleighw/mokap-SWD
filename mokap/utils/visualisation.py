@@ -1,15 +1,17 @@
 from typing import Optional, Any, Dict, Iterable, Sequence, Union
 import matplotlib
+
 import numpy as np
-from mokap.utils.geometry.fitting import rays_intersection_3d
-from mokap.utils.geometry.projective import back_projection_batched
-from mokap.utils.geometry.transforms import extrinsics_matrix, invert_extrinsics_matrix
 np.set_printoptions(precision=3, suppress=True, threshold=150)
+from mokap.utils.geometry.backend import xp, ArrayLike
+
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
-from jax.typing import ArrayLike
-import jax.numpy as jnp
+
+from mokap.utils.geometry.fitting import rays_intersection_3d
+from mokap.utils.geometry.projective import back_projection
+from mokap.utils.geometry.transforms import extrinsics_matrix
 
 
 CUSTOM_COLORS = ['#9B5DE5', '#EF476F', '#FFD166', '#00BBF9', '#00F5D4', '#118ab2', '#073b4c', '#ee6c4d']
@@ -145,8 +147,8 @@ def plot_cameras_3d(
     # First, find the shared focal point. The calculation is independent of the initial depth
     # used for back-projection, we only need the normalized direction vectors
     # so we use a dummy depth of 1.0 to get the directions
-    frustums_for_direction = back_projection_batched(
-        frustums_2d, jnp.ones(C), camera_matrices, E_c2w, dist_coeffs, distortion_model='full'
+    frustums_for_direction = back_projection(
+        frustums_2d, xp.ones(C), camera_matrices, E_c2w, dist_coeffs, distortion_model='full'
     )
 
     directions = frustums_for_direction[:, -1] - tvecs_c2w
@@ -156,14 +158,14 @@ def plot_cameras_3d(
     # Determine the plotting depths
     if depth is None:
         # Automatic mode: depth is 3/4 the distance from each camera to the focal point
-        distances_to_focal = jnp.linalg.norm(tvecs_c2w - focal_point, axis=1)
+        distances_to_focal = xp.linalg.norm(tvecs_c2w - focal_point, axis=1)
         plot_depths = distances_to_focal * depth_ratio
     else:
         # Manual override: use the fixed depth for all cameras
-        plot_depths = jnp.array([depth] * C)
+        plot_depths = xp.array([depth] * C)
 
     # Calculate the final frustums for plotting using the determined depths
-    frustums_3d = back_projection_batched(
+    frustums_3d = back_projection(
         frustums_2d,
         plot_depths,
         camera_matrices,
@@ -351,7 +353,7 @@ def plot_points2d_3d(
         colors = CUSTOM_COLORS
 
     E_c2w = extrinsics_matrix(rvecs_c2w, tvecs_c2w)
-    points2d_3d = back_projection_batched(points2d, jnp.asarray([depth] * C), camera_matrices, E_c2w, dist_coeffs, distortion_model='full')
+    points2d_3d = back_projection(points2d, xp.asarray([depth] * C), camera_matrices, E_c2w, dist_coeffs, distortion_model='full')
 
     for n in range(C):
 
@@ -485,18 +487,18 @@ def plot_triangulation_scene(
 
     # Calculate dynamic depth for back-projection
     # Vector from each camera center to each 3D point -> shape (C, N, 3)
-    cam_to_point_vectors = jnp.asarray(points3d)[None, :, :] - jnp.asarray(tvecs_c2w)[:, None, :]
+    cam_to_point_vectors = xp.asarray(points3d)[None, :, :] - xp.asarray(tvecs_c2w)[:, None, :]
 
     # Distance from each camera to each 3D point -> shape (C, N)
-    depths_to_3d_points = jnp.linalg.norm(cam_to_point_vectors, axis=2)
+    depths_to_3d_points = xp.linalg.norm(cam_to_point_vectors, axis=2)
 
     # Scale these depths to plot the back-projected points slightly closer to the camera
     plot_depths = depths_to_3d_points * detections_depth
 
     # Back-project the 2D points using the calculated dynamic depths
     E_c2w = extrinsics_matrix(rvecs_c2w, tvecs_c2w)
-    points2d_in_3d = back_projection_batched(
-        jnp.asarray(points2d_plot), plot_depths, camera_matrices, E_c2w, dist_coeffs, distortion_model='full'
+    points2d_in_3d = back_projection(
+        xp.asarray(points2d_plot), plot_depths, camera_matrices, E_c2w, dist_coeffs, distortion_model='full'
     )
     points2d_in_3d = np.asarray(points2d_in_3d)  # convert to numpy for plotting
 

@@ -4,33 +4,36 @@ from functools import partial
 from typing import Dict, List, Set, Tuple
 import itertools
 
-import jax
-import jax.numpy as jnp
-import numpy as np
 import networkx as nx
 from networkx.algorithms.clique import find_cliques
 from scipy.sparse.csgraph import connected_components
 from scipy.sparse import csr_matrix
 from sklearn.cluster import DBSCAN
 
+import numpy as np
+from mokap.utils.geometry.backend import xp, jit, set_at
+
 from mokap.reconstruction.config import ReconstructorConfig
 from mokap.reconstruction.datatypes import SoupData
 from mokap.reconstruction.utils import solve_mwis_networkx, prepare_reconstruction_input
-from mokap.utils.geometry.fitting import bundle_intersection_AABB
+
 from mokap.utils.geometry.projective import (
-    back_projection_batched, triangulate_points_from_projections,
-    project_to_multiple_cameras, undistort_multiple, project_points, undistort_points
+    back_projection, triangulate_points_from_projections,
+    project_to_multiple_cameras, undistort_points, project_points
 )
+
 from mokap.utils.geometry.transforms import (
     extrinsics_matrix, projection_matrix, invert_rtvecs,
     extmat_to_rtvecs, invert_extrinsics_matrix
 )
 
+from mokap.utils.geometry.fitting import ray_intersection_AABB
+
 logger = logging.getLogger(__name__)
 
 
 # JAX padding to prevent recompilation when running on GPU
-USE_PADDING = False
+USE_PADDING = True
 MAX_DETS_PER_CAM = 32    # Max detections per view to consider for grouping
 PAD_BLOCK_SIZE = 64    # Pad hypothesis count to multiples of this
 
@@ -59,8 +62,8 @@ class Reconstructor:
 
         self.update_camera_parameters(camera_parameters)
 
-        self.aabb_min = jnp.array([self.volume_bounds[axis][0] for axis in ['x', 'y', 'z']])
-        self.aabb_max = jnp.array([self.volume_bounds[axis][1] for axis in ['x', 'y', 'z']])
+        self.aabb_min = xp.array([self.volume_bounds[axis][0] for axis in ['x', 'y', 'z']])
+        self.aabb_max = xp.array([self.volume_bounds[axis][1] for axis in ['x', 'y', 'z']])
 
         # Pre-allocate empty arrays to avoid overhead
         self._init_emptys()
@@ -68,10 +71,10 @@ class Reconstructor:
     def _init_emptys(self):
         """Initialise reusable empty arrays/tuples to reduce garbage collection overhead."""
 
-        self.EMPTY_F32_JAX = jnp.array([], dtype=jnp.float32)
+        self.EMPTY_F32_XP = xp.array([], dtype=xp.float32)
 
-        self.NULL_POINT2D_JAX = jnp.empty((0, 2), dtype=jnp.float32)
-        self.NULL_POINT3D_JAX = jnp.empty((0, 3), dtype=jnp.float32)
+        self.NULL_POINT2D_XP = xp.empty((0, 2), dtype=xp.float32)
+        self.NULL_POINT3D_XP = xp.empty((0, 3), dtype=xp.float32)
 
         self.EMPTY_F32_NP = np.array([], dtype=np.float32)
         self.EMPTY_U32_NP = np.array([], dtype=np.uint32)
@@ -96,12 +99,12 @@ class Reconstructor:
         self.num_cams = len(self.camera_names)
 
         # Convert all params to JAX arrays
-        self.Ks = jnp.stack([camera_parameters[name]['camera_matrix'] for name in self.camera_names])
-        self.Ds = jnp.stack([camera_parameters[name]['dist_coeffs'] for name in self.camera_names])
+        self.Ks = xp.stack([camera_parameters[name]['camera_matrix'] for name in self.camera_names])
+        self.Ds = xp.stack([camera_parameters[name]['dist_coeffs'] for name in self.camera_names])
 
         # Extrinsics: World-to-camera (for projection/triangulation)
-        self.rvecs_c2w = jnp.stack([camera_parameters[name]['rvec'] for name in self.camera_names])
-        self.tvecs_c2w = jnp.stack([camera_parameters[name]['tvec'] for name in self.camera_names])
+        self.rvecs_c2w = xp.stack([camera_parameters[name]['rvec'] for name in self.camera_names])
+        self.tvecs_c2w = xp.stack([camera_parameters[name]['tvec'] for name in self.camera_names])
 
         self.rvecs_w2c, self.tvecs_w2c = invert_rtvecs(self.rvecs_c2w, self.tvecs_c2w)
         self.Es = extrinsics_matrix(self.rvecs_w2c, self.tvecs_w2c)
@@ -163,13 +166,13 @@ class Reconstructor:
                 curr_indices_np = f_global_indices[kp_mask]
 
                 # Convert to JAX once
-                curr_coords_jax = jnp.array(curr_coords_np)
-                curr_scores_jax = jnp.array(curr_scores_np)
+                curr_coords_xp = xp.array(curr_coords_np)
+                curr_scores_xp = xp.array(curr_scores_np)
 
                 # Core reconstruction
                 final_pts, final_confs, final_errors, used_indices_list, cam_masks = self._reconstruct_keypoint(
                     curr_coords_np, curr_cam_ids_np, curr_indices_np,
-                    curr_coords_jax, curr_scores_jax
+                    curr_coords_xp, curr_scores_xp
                 )
 
                 if final_pts.shape[0] > 0:
@@ -241,7 +244,7 @@ class Reconstructor:
             camera_names=self.camera_names
         )
 
-    @partial(jax.jit, static_argnums=(0,))
+    @partial(jit, static_argnums=(0,))
     def _compute_rays(self, cam_ids, coords):
         """
         Computes 3D rays for 2D points using vmap to handle per-point camera parameters.
@@ -252,23 +255,22 @@ class Reconstructor:
         Es_c2w_batch = self.Es_c2w[cam_ids]  # (N, 4, 4)
         Ds_batch = self.Ds[cam_ids]  # (N, k)
 
-        pts_uv = jnp.array(coords)  # (N, 2)
+        pts_uv = xp.array(coords)  # (N, 2)
 
-        world_pts = back_projection_batched(
+        world_pts = back_projection(
             pts_uv,
-            jnp.ones(len(cam_ids)),
+            xp.ones(len(cam_ids)),
             Ks_batch,
             Es_c2w_batch,
             Ds_batch
         )
-        world_pts = world_pts.squeeze(1)
 
         # Compute directions
         # Camera centers are the translation component of C2W
         origins = Es_c2w_batch[:, :3, 3]
 
         ray_vecs = world_pts - origins
-        ray_dirs = ray_vecs / (jnp.linalg.norm(ray_vecs, axis=1, keepdims=True) + 1e-8)
+        ray_dirs = ray_vecs / (xp.linalg.norm(ray_vecs, axis=1, keepdims=True) + 1e-8)
 
         return origins, ray_dirs
 
@@ -276,24 +278,24 @@ class Reconstructor:
                               coords_np: np.ndarray,
                               cam_ids_np: np.ndarray,
                               indices_np: np.ndarray,
-                              coords_jax: jnp.ndarray,
-                              scores_jax: jnp.ndarray
+                              coords_xp: xp.ndarray,
+                              scores_xp: xp.ndarray
                               ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, List[List[int]], np.ndarray]:
         """
         Runs reconstruction pipeline for a keypoint.
         Accepts both numpy (for Graph logic) and JAX (for geometry logic).
         """
 
-        all_pts_jax, all_groups, view_counts, summed_confs, all_errors = self._generate_hypotheses(
-            coords_np, cam_ids_np, coords_jax, scores_jax
+        all_pts_xp, all_groups, view_counts, summed_confs, all_errors = self._generate_hypotheses(
+            coords_np, cam_ids_np, coords_xp, scores_xp
         )
 
-        if all_pts_jax.shape[0] == 0:
+        if all_pts_xp.shape[0] == 0:
             return self.EMPTY_RESULT
 
         # Filter hypotheses and merge redundancies
         final_pts, final_confs, final_errors, final_indices, final_masks = self._filter_and_merge(
-            all_pts_jax, view_counts, summed_confs, all_errors, all_groups,
+            all_pts_xp, view_counts, summed_confs, all_errors, all_groups,
             cam_ids_np, indices_np
         )
 
@@ -302,9 +304,9 @@ class Reconstructor:
     def _generate_hypotheses(self,
                              coords_np: np.ndarray,
                              cam_ids_np: np.ndarray,
-                             coords_jax: jnp.ndarray,
-                             scores_jax: jnp.ndarray
-                             ) -> Tuple[jnp.ndarray, List[List[int]], jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+                             coords_xp: xp.ndarray,
+                             scores_xp: xp.ndarray
+                             ) -> Tuple[xp.ndarray, List[List[int]], xp.ndarray, xp.ndarray, xp.ndarray]:
         """
         Generates all plausible 3D points hypotheses from 2D detections.
         """
@@ -313,14 +315,13 @@ class Reconstructor:
         # groups is a list of lists of integers (indices into coords_np)
 
         if USE_PADDING:
-            groups = self._group_points_pad(coords_np, cam_ids_np, coords_jax)
+            groups = self._group_points_pad(coords_np, cam_ids_np, coords_xp)
         else:
-            groups = self._group_points(coords_np, cam_ids_np, coords_jax)
+            groups = self._group_points(coords_np, cam_ids_np, coords_xp)
 
         M = len(groups)
         if M == 0:
-            return self.NULL_POINT3D_JAX, [], self.EMPTY_F32_JAX, self.EMPTY_F32_JAX, self.EMPTY_F32_JAX
-
+            return self.NULL_POINT3D_XP, [], self.EMPTY_F32_XP, self.EMPTY_F32_XP, self.EMPTY_F32_XP
 
         # Convert List[List[int]] to flat index arrays for scattering
         group_lengths = [len(g) for g in groups]
@@ -332,12 +333,11 @@ class Reconstructor:
         # We pad M to the next multiple of PAD_BLOCK_SIZE
         M_padded = ((M + PAD_BLOCK_SIZE - 1) // PAD_BLOCK_SIZE) * PAD_BLOCK_SIZE
 
+        matched_uvs = xp.full((self.num_cams, M_padded, 2), xp.nan, dtype=xp.float32)
+        matched_uvs = set_at(matched_uvs, (idx_cam, idx_group), coords_xp[idx_val])
 
-        matched_uvs = jnp.full((self.num_cams, M_padded, 2), jnp.nan, dtype=jnp.float32)
-        matched_uvs = matched_uvs.at[idx_cam, idx_group].set(coords_jax[idx_val])
-
-        tri_weights = jnp.zeros((self.num_cams, M_padded), dtype=jnp.float32)
-        tri_weights = tri_weights.at[idx_cam, idx_group].set(scores_jax[idx_val])
+        tri_weights = xp.zeros((self.num_cams, M_padded), dtype=xp.float32)
+        tri_weights = set_at(tri_weights, (idx_cam, idx_group), scores_xp[idx_val])
 
         # Run geometry kernels (JIT compiled for M_padded sizes)
         points3d, view_counts, summed_confs, reproj_errors, valid_mask = self._triangulate_and_check(
@@ -351,50 +351,49 @@ class Reconstructor:
         reproj_errors = reproj_errors[:M]
         valid_mask = valid_mask[:M]
 
-        valid_indices_jax = jnp.where(valid_mask)[0]
-        valid_indices_np = np.array(valid_indices_jax)
+        valid_indices_xp = xp.where(valid_mask)[0]
+        valid_indices_np = np.array(valid_indices_xp)
 
         if valid_indices_np.size == 0:
-            return self.NULL_POINT3D_JAX, [], self.EMPTY_F32_JAX, self.EMPTY_F32_JAX, self.EMPTY_F32_JAX
+            return self.NULL_POINT3D_XP, [], self.EMPTY_F32_XP, self.EMPTY_F32_XP, self.EMPTY_F32_XP
 
         valid_groups = [groups[i] for i in valid_indices_np]
 
-        return (points3d[valid_indices_jax], valid_groups, view_counts[valid_indices_jax],
-                summed_confs[valid_indices_jax], reproj_errors[valid_indices_jax])
+        return (points3d[valid_indices_xp], valid_groups, view_counts[valid_indices_xp],
+                summed_confs[valid_indices_xp], reproj_errors[valid_indices_xp])
 
-    @partial(jax.jit, static_argnums=(0,))
+    @partial(jit, static_argnums=(0,))
     def _triangulate_and_check(self, matched_uvs, tri_weights):
-        """JIT-compiled core geometry."""
 
-        undistorted_uvs = undistort_multiple(matched_uvs, self.Ks, self.Ds)
+        undistorted_uvs = undistort_points(matched_uvs, self.Ks, self.Ds)
         points3d = triangulate_points_from_projections(undistorted_uvs, self.Ps, weights=tri_weights)
 
         # Validation
-        valid_triangulation = ~jnp.any(jnp.isnan(points3d), axis=1)
+        valid_triangulation = ~xp.any(xp.isnan(points3d), axis=1)
 
         all_reprojected, proj_validity = project_to_multiple_cameras(
             points3d, self.rvecs_w2c, self.tvecs_w2c, self.Ks, self.Ds
         )
 
         # Errors
-        orig_vis_mask = ~jnp.isnan(matched_uvs[:, :, 0])
-        combined_mask = orig_vis_mask.astype(jnp.float32) * proj_validity
+        orig_vis_mask = ~xp.isnan(matched_uvs[:, :, 0])
+        combined_mask = orig_vis_mask.astype(xp.float32) * proj_validity
         diffs = all_reprojected - matched_uvs
-        valid_diffs = jnp.where(combined_mask[..., None], diffs, 0.0)
-        distances = jnp.linalg.norm(valid_diffs, axis=-1)
+        valid_diffs = xp.where(combined_mask[..., None], diffs, 0.0)
+        distances = xp.linalg.norm(valid_diffs, axis=-1)
 
-        num_views = jnp.sum(combined_mask, axis=0)
-        reproj_errors = jnp.sum(distances, axis=0) / jnp.maximum(num_views, 1)
+        num_views = xp.sum(combined_mask, axis=0)
+        reproj_errors = xp.sum(distances, axis=0) / xp.maximum(num_views, 1)
 
         # Aggregates
-        view_counts = jnp.sum(orig_vis_mask, axis=0)
-        summed_confs = jnp.sum(jnp.where(orig_vis_mask, tri_weights, 0), axis=0)
+        view_counts = xp.sum(orig_vis_mask, axis=0)
+        summed_confs = xp.sum(xp.where(orig_vis_mask, tri_weights, 0), axis=0)
 
         final_mask = valid_triangulation & (reproj_errors < self.config.repro_thresh) & (num_views > 0)
 
         return points3d, view_counts, summed_confs, reproj_errors, final_mask
 
-    def _group_points(self, coords_np, cam_ids_np, coords_jax):
+    def _group_points(self, coords_np, cam_ids_np, coords_xp):
         """CPU-friendly version of points grouping (no padding)"""
 
         total_dets = len(coords_np)
@@ -411,14 +410,14 @@ class Reconstructor:
             if n_i == 0: continue
 
             # On CPU it is faster to slice the JAX array directly than to pad it
-            d_i = coords_jax[idxs_i]
+            d_i = coords_xp[idxs_i]
 
             for j in range(i + 1, self.num_cams):
                 idxs_j = cam_indices_map[j]
                 n_j = len(idxs_j)
                 if n_j == 0: continue
 
-                d_j = coords_jax[idxs_j]
+                d_j = coords_xp[idxs_j]
 
                 # JAX will compile a version for (1,1), (2,2), (4,4) etc
                 # When n_i and n_j are small (1-5), this hits the cache 99% of the time
@@ -487,7 +486,7 @@ class Reconstructor:
 
         return all_final_groups
 
-    @partial(jax.jit, static_argnums=(0, 3, 4))
+    @partial(jit, static_argnums=(0, 3, 4))
     def _compute_cost_matrix(self, dets_i, dets_j, i, j):
         """
         Dynamic shape cost matrix. No padding computations, a bit more CPU-friendly.
@@ -503,28 +502,29 @@ class Reconstructor:
         cam_center_i = E_c2w_i[:3, 3]
 
         # Back project
-        p_3d_on_ray = back_projection_batched(
+        p_3d_on_ray = back_projection(
             dets_i,
-            jnp.ones(Ni),
-            jnp.stack([K_i] * Ni) if Ni > 0 else jnp.empty((0, 3, 3)),
-            jnp.stack([E_c2w_i] * Ni) if Ni > 0 else jnp.empty((0, 4, 4)),
-            jnp.stack([D_i] * Ni) if Ni > 0 else jnp.empty((0, D_i.shape[0]))
+            xp.ones(Ni),
+            K_i,
+            E_c2w_i,
+            D_i
         )
-        p_3d_on_ray = p_3d_on_ray.squeeze(1)
 
         ray_dirs = p_3d_on_ray - cam_center_i
 
         # Safe normalise
-        ray_dirs /= (jnp.linalg.norm(ray_dirs, axis=-1, keepdims=True) + 1e-8)
+        ray_dirs /= (xp.linalg.norm(ray_dirs, axis=-1, keepdims=True) + 1e-8)
 
-        p_near_3d, p_far_3d, has_intersection = bundle_intersection_AABB(
+        p_near_3d, p_far_3d, has_intersection = ray_intersection_AABB(
             cam_center_i, ray_dirs, self.aabb_min, self.aabb_max
         )
-        segments_3d = jnp.vstack([p_near_3d, p_far_3d])
+        segments_3d = xp.vstack([p_near_3d, p_far_3d])
+
+        segments_3d = xp.nan_to_num(segments_3d)
 
         # Project segments to camera j
         segments_2d, _ = project_points(
-            segments_3d, rvec_w2c_j, tvec_w2c_j, K_j, jnp.zeros_like(D_j), 'none'
+            segments_3d, rvec_w2c_j, tvec_w2c_j, K_j, xp.zeros_like(D_j), 'none'
         )
 
         a_pts = segments_2d[:Ni]
@@ -536,17 +536,18 @@ class Reconstructor:
         ab = b - a
         ap = p - a
 
-        denom = jnp.einsum('ijk,ijk->ij', ab, ab)
-        t = jnp.einsum('ijk,ijk->ij', ap, ab) / (denom + 1e-6)
-        t_clamped = jnp.clip(t, 0.0, 1.0)
+        denom = xp.sum(ab * ab, axis=-1)  # shape (Ni, 1)
+        numer = xp.sum(ap * ab, axis=-1)  # shape (Ni, Nj)
+        t = numer / (denom + 1e-6)  # shape (Ni, Nj)
+        t_clamped = xp.clip(t, 0.0, 1.0)
         closest_points = a + t_clamped[..., None] * ab
-        dists = jnp.linalg.norm(p - closest_points, axis=-1)
+        dists = xp.linalg.norm(p - closest_points, axis=-1)
 
-        final_costs = jnp.where(has_intersection[:, None], dists, 1e6)
+        final_costs = xp.where(has_intersection[:, None], dists, 1e6)
 
         return final_costs
 
-    def _group_points_pad(self, coords_np, cam_ids_np, coords_jax):
+    def _group_points_pad(self, coords_np, cam_ids_np, coords_xp):
         """GPU-friendly version of points grouping (with padding)"""
 
         total_dets = len(coords_np)
@@ -573,9 +574,9 @@ class Reconstructor:
 
             pad_i = MAX_DETS_PER_CAM - n_i
 
-            d_i = coords_jax[idxs_i]
+            d_i = coords_xp[idxs_i]
             if pad_i > 0:
-                d_i = jnp.pad(d_i, ((0, pad_i), (0, 0)), constant_values=jnp.nan)
+                d_i = xp.pad(d_i, ((0, pad_i), (0, 0)), constant_values=xp.nan)
 
             for j in range(i + 1, self.num_cams):
                 idxs_j = cam_indices_map[j]
@@ -587,9 +588,9 @@ class Reconstructor:
                     n_j = MAX_DETS_PER_CAM
 
                 pad_j = MAX_DETS_PER_CAM - n_j
-                d_j = coords_jax[idxs_j]
+                d_j = coords_xp[idxs_j]
                 if pad_j > 0:
-                    d_j = jnp.pad(d_j, ((0, pad_j), (0, 0)), constant_values=jnp.nan)
+                    d_j = xp.pad(d_j, ((0, pad_j), (0, 0)), constant_values=xp.nan)
 
                 # JIT function with the fixed shapes (MAX_DETS, 2)
                 cost_mat_padded = self._compute_cost_matrix_pad(d_i, d_j, i, j)
@@ -657,7 +658,7 @@ class Reconstructor:
 
         return all_final_groups
 
-    @partial(jax.jit, static_argnums=(0, 3, 4))
+    @partial(jit, static_argnums=(0, 3, 4))
     def _compute_cost_matrix_pad(self, dets_i_padded, dets_j_padded, i, j):
         """
         Calculates cost matrix on fixed size arrays (MAX_DETS x MAX_DETS).
@@ -674,20 +675,19 @@ class Reconstructor:
         cam_center_i = E_c2w_i[:3, 3]
 
         # Back project
-        p_3d_on_ray = back_projection_batched(dets_i_padded, jnp.ones(Ni), jnp.stack([K_i] * Ni),
-                                              jnp.stack([E_c2w_i] * Ni), jnp.stack([D_i] * Ni))
-        p_3d_on_ray = p_3d_on_ray.squeeze(1)
+        p_3d_on_ray = back_projection(dets_i_padded, xp.ones(Ni), xp.stack([K_i] * Ni),
+                                              xp.stack([E_c2w_i] * Ni), xp.stack([D_i] * Ni))
 
         ray_dirs = p_3d_on_ray - cam_center_i
-        ray_dirs /= (jnp.linalg.norm(ray_dirs, axis=-1, keepdims=True) + 1e-8)
+        ray_dirs /= (xp.linalg.norm(ray_dirs, axis=-1, keepdims=True) + 1e-8)
 
-        p_near_3d, p_far_3d, has_intersection = bundle_intersection_AABB(cam_center_i, ray_dirs, self.aabb_min,
+        p_near_3d, p_far_3d, has_intersection = ray_intersection_AABB(cam_center_i, ray_dirs, self.aabb_min,
                                                                          self.aabb_max)
-        segments_3d = jnp.vstack([p_near_3d, p_far_3d])
-        segments_3d = jnp.nan_to_num(segments_3d)       # Prevent projection issues
+        segments_3d = xp.vstack([p_near_3d, p_far_3d])
+        segments_3d = xp.nan_to_num(segments_3d)       # Prevent projection issues
 
         # Project segments to camera J
-        segments_2d, _ = project_points(segments_3d, rvec_w2c_j, tvec_w2c_j, K_j, jnp.zeros_like(D_j), 'none')
+        segments_2d, _ = project_points(segments_3d, rvec_w2c_j, tvec_w2c_j, K_j, xp.zeros_like(D_j), 'none')
 
         a_pts = segments_2d[:Ni]
         b_pts = segments_2d[Ni:]
@@ -698,17 +698,18 @@ class Reconstructor:
         ab = b - a
         ap = p - a
 
-        denom = jnp.einsum('ijk,ijk->ij', ab, ab)
-        t = jnp.einsum('ijk,ijk->ij', ap, ab) / (denom + 1e-6)
-        t_clamped = jnp.clip(t, 0.0, 1.0)
+        denom = xp.sum(ab * ab, axis=-1)
+        numer = xp.sum(ap * ab, axis=-1)
+        t = numer / (denom + 1e-6)
+        t_clamped = xp.clip(t, 0.0, 1.0)
         closest_points = a + t_clamped[..., None] * ab
-        dists = jnp.linalg.norm(p - closest_points, axis=-1)
+        dists = xp.linalg.norm(p - closest_points, axis=-1)
 
         # Filter rays that didn't intersect AABB or were padded nans
-        final_costs = jnp.where(has_intersection[:, None], dists, 1e6)
+        final_costs = xp.where(has_intersection[:, None], dists, 1e6)
 
         # Also ensure nan inputs (padding) result in high cost
-        final_costs = jnp.nan_to_num(final_costs, nan=1e6)
+        final_costs = xp.nan_to_num(final_costs, nan=1e6)
 
         return final_costs
 

@@ -1,18 +1,23 @@
 import logging
-
-import jax
-import numpy as np
-import jax.numpy as jnp
 from typing import List, Optional, Union, Dict
 from PySide6.QtCore import QTimer, Slot, Signal
-from numpy.typing import ArrayLike
+
+import numpy as np
+from mokap.utils.geometry.backend import xp, ArrayLike
+
 from mokap.calibration.multiview import MultiviewCalibrationTool
 from mokap.gui.workers.workers_base import CalibrationProcessingWorker
+
 from mokap.utils.datatypes import (CalibrationData, DetectionPayload, ExtrinsicsPayload, IntrinsicsPayload,
                                    ChessBoard, CharucoBoard)
-from mokap.utils.geometry.projective import back_projection_batched, back_projection
-from mokap.utils.geometry.transforms import extrinsics_matrix, invert_rtvecs, rotate_extrinsics_matrix, rotate_points3d, \
-    rotate_extrinsics_matrices, Rmat_from_angle, invert_extrinsics_matrix, rotate_points3d_sets, rodrigues
+
+from mokap.utils.geometry.projective import back_projection
+
+from mokap.utils.geometry.transforms import (
+    extrinsics_matrix, invert_rtvecs, rotate_extrinsics_matrix, rotate_points3d,
+    Rmat_from_angle, invert_extrinsics_matrix, rodrigues
+)
+
 
 logger = logging.getLogger(__name__)
 
@@ -67,7 +72,7 @@ class MultiviewWorker(CalibrationProcessingWorker):
              [0, h]             # Bottom-left corner
              ] for w, h in sources_shapes_wh.values()], dtype=np.float32)
 
-        self._img_points_2d = jnp.asarray(img_points_2d)  # (C, 5, 2)
+        self._img_points_2d = xp.asarray(img_points_2d)  # (C, 5, 2)
 
         # Buffer for per-frame 2D detections for visualization
         self._points_2d: Dict[str, np.ndarray] = {name: np.zeros((0, 2)) for name in self._cameras_names}
@@ -180,15 +185,15 @@ class MultiviewWorker(CalibrationProcessingWorker):
         cam_centres = Es_c2w[:, :3, 3]
 
         # Back-project the 5 points (principal + 4 corners) into 3D space
-        frustums_points_all = back_projection_batched(self._img_points_2d,
-                                                      jnp.asarray([40] * Ks.shape[0]),
-                                                      Ks, Es_c2w, jnp.zeros_like(Ds),   # TODO: No need to create this at each call
+        frustums_points_all = back_projection(self._img_points_2d,
+                                                      xp.asarray([40] * Ks.shape[0]),
+                                                      Ks, Es_c2w, xp.zeros_like(Ds),   # TODO: No need to create this at each call
                                                       distortion_model='full')
 
         # Safety Check
         # Mask out frustums for cameras whose intrinsics haven't arrived yet
         # This prevents rendering a valid pose with an invalid (identity) K matrix
-        masked_frustums = jnp.where(
+        masked_frustums = xp.where(
             ready_mask[:, None, None],
             frustums_points_all,
             cam_centres[:, None, :]  # Collapse the frustum to a single point if not ready
@@ -198,8 +203,8 @@ class MultiviewWorker(CalibrationProcessingWorker):
         principal_points = masked_frustums[:, 0, :]
         frustum_corners = masked_frustums[:, 1:, :]
 
-        frustums_points_3d = jnp.concatenate([cam_centres[:, None, :], frustum_corners], axis=1)
-        optical_axes_3d = jnp.stack([cam_centres, principal_points], axis=1)
+        frustums_points_3d = xp.concatenate([cam_centres[:, None, :], frustum_corners], axis=1)
+        optical_axes_3d = xp.stack([cam_centres, principal_points], axis=1)
 
         # --- Stage-dependent visualisation logic ---
         board_3d = None
@@ -245,12 +250,12 @@ class MultiviewWorker(CalibrationProcessingWorker):
         def to_gl(points):
             if points is None or points.shape[0] == 0:
                 return points
-            return rotate_points3d(points, 180, 'x')
+            return rotate_points3d(points, angle_degrees=180, axis=[1.0, 0.0, 0.0])
 
         def to_gl_batch(points_batch):
             if points_batch is None or points_batch.shape[0] == 0:
                 return points_batch
-            return rotate_points3d_sets(points_batch, 180, 'x')
+            return rotate_points3d(points_batch, angle_degrees=180, axis=[1.0, 0.0,  0.0])
 
         scene_data = {
             'ready_mask': ready_mask,

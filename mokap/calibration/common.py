@@ -1,7 +1,9 @@
 import logging
 import cv2
+
 import numpy as np
-from jax import numpy as jnp
+from mokap.utils.geometry.backend import xp
+
 from typing import Tuple, Optional, Literal, Union, Sequence
 from mokap.utils.geometry.projective import project_points, reprojection_errors
 from mokap.utils.geometry.fitting import generate_ambiguous_pose
@@ -101,29 +103,32 @@ def solve_pnp_robust(
             if candidate_rvec is not None and candidate_tvec is not None:
                 rvec1, tvec1 = candidate_rvec, candidate_tvec
 
-                rvec1_j, tvec1_j = jnp.asarray(rvec1.squeeze()), jnp.asarray(tvec1.squeeze())
-                obj_pts_j, img_pts_j = jnp.asarray(obj_pts_np), jnp.asarray(img_pts_np)
-                cam_mat_j, dist_j = jnp.asarray(cam_mat_np), jnp.asarray(dist_np)
+                rvec1_xp = xp.asarray(rvec1).squeeze()
+                tvec1_xp = xp.asarray(tvec1).squeeze()
+                obj_pts_xp = xp.asarray(obj_pts_np)
+                img_pts_xp = xp.asarray(img_pts_np)
+                cam_mat_xp = xp.asarray(cam_mat_np)
+                dist_xp = xp.asarray(dist_np)
 
-                rvec2_j, tvec2_j = generate_ambiguous_pose(rvec1_j, tvec1_j)
+                rvec2_xp, tvec2_xp = generate_ambiguous_pose(rvec1_xp, tvec1_xp)
 
-                if tvec2_j[2] <= 0:
+                if tvec2_xp[2] <= 0:
                     # The ambiguous pose is invalid, so the candidate is probably correct
                     best_rvec, best_tvec = rvec1, tvec1
                 else:
                     # if both are valid, compare their errors
-                    reproj1, _ = project_points(obj_pts_j, rvec1_j, tvec1_j, cam_mat_j, dist_j)
-                    reproj2, _ = project_points(obj_pts_j, rvec2_j, tvec2_j, cam_mat_j, dist_j)
+                    reproj1, _ = project_points(obj_pts_xp, rvec1_xp, tvec1_xp, cam_mat_xp, dist_xp)
+                    reproj2, _ = project_points(obj_pts_xp, rvec2_xp, tvec2_xp, cam_mat_xp, dist_xp)
 
-                    errors1 = reprojection_errors(img_pts_j, reproj1)
-                    errors2 = reprojection_errors(img_pts_j, reproj2)
+                    errors1 = reprojection_errors(img_pts_xp, reproj1)
+                    errors2 = reprojection_errors(img_pts_xp, reproj2)
 
                     # Compare using the standard RMS error
                     if errors1['rms'] <= errors2['rms']:
                         best_rvec, best_tvec = rvec1, tvec1
                         best_error = errors1
                     else:
-                        best_rvec, best_tvec = np.asarray(rvec2_j).reshape(3, 1), np.asarray(tvec2_j).reshape(3, 1)
+                        best_rvec, best_tvec = np.asarray(rvec2_xp).reshape(3, 1), np.asarray(tvec2_xp).reshape(3, 1)
                         best_error = errors2
 
         if best_rvec is None or best_tvec is None:

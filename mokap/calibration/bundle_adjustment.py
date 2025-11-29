@@ -2,21 +2,24 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.sparse import lil_matrix, csr_matrix
 from typing import Tuple, Dict, Optional
+
+from mokap.utils.geometry import USE_JAX
+if not USE_JAX:
+    print('[WARNING] Mokap math backend set to NumPy. Enabling JAX for the Bundle Adjustment module only.')
+
 import jax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
+
 from functools import partial
 from mokap.utils import CallbackOutputStream
 from mokap.utils.datatypes import DistortionModel
-from alive_progress import alive_bar
+# from alive_progress import alive_bar
 
-from mokap.utils.geometry.projective import project_object_views_batched, project_to_multiple_cameras, \
-    project_multiple_to_multiple
+from mokap.utils.geometry.projective import project_object_views_batched, project_multiple_to_multiple
 from mokap.utils.geometry.transforms import invert_rtvecs
 
 DIST_MODEL_MAP = {'none': 0, 'simple': 4, 'standard': 5, 'full': 8, 'rational': 8}
-
-# TODO: Kinda want to test Deepmind's Optax solvers here instead of scipy...
 
 
 def _get_parameter_spec(
@@ -27,7 +30,7 @@ def _get_parameter_spec(
         origin_idx:               int,
         fix_cameras_intrinsics:   bool,
         fix_cameras_extrinsics:   bool,
-        fix_object_points:             bool,
+        fix_object_points:        bool,
         fix_poses:                bool,
         fix_aspect_ratio:         bool,
         time_independent_points:  bool,
@@ -83,6 +86,7 @@ def _get_parameter_spec(
 
     spec['total_size'] = current_offset
     return spec
+
 
 def _get_parameter_scales(
         spec: Dict,
@@ -242,6 +246,7 @@ def _get_bounds(
 
     # Extrinsics, poses and points are left unbounded
     return lower_bounds, upper_bounds
+
 
 def _pack_params(
         camera_matrices:    jnp.ndarray,
@@ -643,19 +648,13 @@ def cost_function(
     # Cameras extrinsics priors
     if prior_weight_r > 0.0 or prior_weight_t > 0.0:
         origin_idx = spec['config']['origin_idx']
-        cam_mask = jnp.arange(spec['config']['nb_cams']) != origin_idx
 
-        # # Calculate difference for all cameras
-        # rvec_diff = cam_r - fixed_params['cam_r_init']
-        # tvec_diff = cam_t - fixed_params['cam_t_init']
-        #
-        # # Apply mask to zero-out the residual for the fixed origin camera
-        # # (ensures the residual vector maintains a consistent shape)
-        # rvec_resid = (rvec_diff * cam_mask[:, None]).ravel() * prior_weight_r
-        # tvec_resid = (tvec_diff * cam_mask[:, None]).ravel() * prior_weight_t
+        # Explicit integer indexing (deletion) instead of boolean masking to ensure concrete shapes for JITting
+        all_indices = jnp.arange(spec['config']['nb_cams'])
+        optim_indices = jnp.delete(all_indices, origin_idx)
 
-        rvec_resid = (cam_r[cam_mask] - fixed_params['cam_r_init'][cam_mask]).ravel() * prior_weight_r
-        tvec_resid = (cam_t[cam_mask] - fixed_params['cam_t_init'][cam_mask]).ravel() * prior_weight_t
+        rvec_resid = (cam_r[optim_indices] - fixed_params['cam_r_init'][optim_indices]).ravel() * prior_weight_r
+        tvec_resid = (cam_t[optim_indices] - fixed_params['cam_t_init'][optim_indices]).ravel() * prior_weight_t
 
         all_residuals.extend([rvec_resid, tvec_resid])
 

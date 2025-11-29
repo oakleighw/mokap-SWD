@@ -1,540 +1,605 @@
 from functools import partial
 from typing import Tuple, Dict
-import jax
-import numpy as np
-from jax import numpy as jnp
-
-from mokap.utils.geometry.transforms import ID_QUAT, ZERO_T, quaternions_angular_distance, rodrigues, inverse_rodrigues
+from .backend import USE_JAX, xp, jit, lax, vmap, _tiny
+from .transforms import quaternions_angular_distance, rodrigues, inverse_rodrigues
 
 
-@jax.jit
-def find_rigid_transform(
-    points_A: jnp.ndarray,  # (M, 3)
-    points_B: jnp.ndarray   # (M, 3)
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+@jit
+def weighted_median(data: xp.ndarray, weights: xp.ndarray) -> xp.ndarray:
     """
-    Estimates the rigid transformation (rotation R, translation t) between two
-    sets of corresponding 3D points (A and B) using the Kabsch algorithm
-    It finds T such that: B ~ T(A) = R @ A + t
+    Computes the weighted median of data.
+    Works for both continuous weights and binary masks (0/1)
 
     Args:
-        points_A: Source points (M, 3)
-        points_B: Destination points (M, 3)
+        data: (N,) values
+        weights: (N,) weights or mask
 
     Returns:
-        R: Rotation matrix (3, 3)
-        t: Translation vector (3,)
+        The weighted median value
     """
-    # Find centroids
-    centroid_A = jnp.mean(points_A, axis=0)
-    centroid_B = jnp.mean(points_B, axis=0)
+
+    sort_idx = xp.argsort(data)
+    sorted_data = data[sort_idx]
+    sorted_weights = weights[sort_idx]
+
+    cumsum = xp.cumsum(sorted_weights)
+    total_weight = cumsum[-1]
+
+    # We want the first index where cumulative weight >= 0.5 * total
+    median_idx = xp.searchsorted(cumsum, 0.5 * total_weight)
+
+    # Clip to ensure valid index (handles empty/zero-weight cases)
+    median_idx = xp.clip(median_idx, 0, data.shape[0] - 1)
+
+    return sorted_data[median_idx]
+
+
+@jit
+def find_rigid_transform(
+        points_A: xp.ndarray,
+        points_B: xp.ndarray
+) -> Tuple[xp.ndarray, xp.ndarray]:
+    """
+    Estimates the rigid transformation (rotation R, translation t) between two
+    sets of corresponding 3D points using the Kabsch algorithm.
+    Finds T such that: B ~ T(A) = R @ A + t
+
+    Args:
+        points_A: Source points (..., N, 3)
+        points_B: Destination points (..., N, 3)
+
+    Returns:
+        R: Rotation matrix (..., 3, 3)
+        t: Translation vector (..., 3)
+    """
+
+    # Compute centroids (N dim)
+    centroid_A = xp.mean(points_A, axis=-2, keepdims=True)
+    centroid_B = xp.mean(points_B, axis=-2, keepdims=True)
 
     # Center the points
     A_centered = points_A - centroid_A
     B_centered = points_B - centroid_B
 
-    # Compute the covariance matrix H
-    H = A_centered.T @ B_centered
+    # Compute Covariance Matrix H
+    # swap axes to perform the transpose of A_centered: (..., 3, N) @ (..., N, 3) -> (..., 3, 3)
+    H = xp.matmul(xp.swapaxes(A_centered, -1, -2), B_centered)
 
     # Find the rotation using SVD
-    U, S, Vt = jnp.linalg.svd(H)
-    R = Vt.T @ U.T
+    U, S, Vt = xp.linalg.svd(H)
 
-    # If the determinant is -1, it's a reflection
-    # We must flip the sign of the last column of U or V
-    det_R = jnp.linalg.det(R)
-    # diagonal matrix to flip the sign if needed
-    correction = jnp.array([[1, 0, 0], [0, 1, 0], [0, 0, det_R]])
-    R_corrected = Vt.T @ correction @ U.T
+    # Compute Rotation R = Vt.T @ U.T
+    # Note: V from svd is V^T (Vt), so we need Vt.T @ U.T
+    R = xp.matmul(xp.swapaxes(Vt, -1, -2), xp.swapaxes(U, -1, -2))
+
+    # Reflection Correction (if det(R) < 0)
+    det_R = xp.linalg.det(R)
+
+    # Need to scale the last column of U by sign(det_R) * 1.0 (since det is -1 or 1 usually)
+    ones = xp.ones_like(det_R)
+    s = xp.stack([ones, ones, det_R], axis=-1)  # (..., 3)
+
+    # Apply scaling to U before recomputing R
+    # U is (..., 3, 3), we want to scale the 3rd column
+    s_mat = s[..., None, :]
+    U_corrected = U * s_mat
+
+    R_corrected = xp.matmul(xp.swapaxes(Vt, -1, -2), xp.swapaxes(U_corrected, -1, -2))
 
     # Compute translation
-    t = centroid_B - R_corrected @ centroid_A
+    # t = centroid_B - R @ centroid_A
+    cA_t = xp.swapaxes(centroid_A, -1, -2)
+    cB_t = xp.swapaxes(centroid_B, -1, -2)
+
+    t_t = cB_t - xp.matmul(R_corrected, cA_t)
+    t = t_t.squeeze(-1)  # (..., 3)
 
     return R_corrected, t
 
-# batched version for multiple point sets
-find_rigid_transform_batched = jax.vmap(find_rigid_transform)
 
-
-@jax.jit
+@jit
 def find_affine_transform(
-    points_A: jnp.ndarray, # (M, 3)
-    points_B: jnp.ndarray  # (M, 3)
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        points_A: xp.ndarray,
+        points_B: xp.ndarray
+) -> Tuple[xp.ndarray, xp.ndarray]:
     """
-    Estimates the affine transformation (A, t) between two sets of corresponding 3D points
-    Finds T such that: B ~ T(A) = A @ A.T + t
+    Estimates the affine transformation (A, t) between two sets of corresponding 3D points.
+    Finds T such that: B ~ T(A) = A @ A.T + t. Uses linear least squares.
 
     Args:
-        points_A: Source points (M, 3)
-        points_B: Destination points (M, 3)
+        points_A: Source points (..., M, 3)
+        points_B: Destination points (..., M, 3)
 
     Returns:
-        A_mat: The affine transformation matrix (3, 3)
-        t_vec: The translation vector (3,)
+        A_mat: The affine transformation matrix (..., 3, 3)
+        t_vec: The translation vector (..., 3)
     """
-    M, _ = points_A.shape
-    ones = jnp.ones((M, 1), dtype=points_A.dtype)
-    X = jnp.concatenate([points_A, ones], axis=1)  # (M, 4)
 
-    # Solve X @ T = points_B
-    T, *_ = jnp.linalg.lstsq(X, points_B, rcond=None)  # T is (4, 3)
+    # Construct Design Matrix X: [x, y, z, 1]
+    ones = xp.ones(points_A.shape[:-1] + (1,), dtype=points_A.dtype)
+    X = xp.concatenate([points_A, ones], axis=-1)  # (..., M, 4)
 
-    A_mat = T[:3, :].T  # (3, 3)
-    t_vec = T[3, :]     # (3,)
+    # Solve T = (X^T X)^-1 X^T B
+    XT = xp.swapaxes(X, -1, -2)  # (..., 4, M)
+
+    XTX = xp.matmul(XT, X)
+    XTB = xp.matmul(XT, points_B)
+
+    # Solve (..., 4, 4) * T = (..., 4, 3)
+    eye_reg = xp.eye(4) * 1e-6  # small regularization to diagonal for stability
+    T = xp.linalg.solve(XTX + eye_reg, XTB)  # (..., 4, 3)
+
+    # Extract A and t
+    # T is [ A.T ]
+    #      [  t  ]
+    A_mat_T = T[..., :3, :]  # (..., 3, 3)
+    t_vec = T[..., 3, :]  # (..., 3)
+
+    A_mat = xp.swapaxes(A_mat_T, -1, -2)
+
     return A_mat, t_vec
 
-# batched version for multiple sets of points
-find_affine_transform_batched = jax.vmap(find_affine_transform, in_axes=(0, 0), out_axes=(0, 0))
 
-
-@jax.jit
+@jit
 def interpolate3d(
-    points3d:               jnp.ndarray,
-    visibility_mask:        jnp.ndarray,
-    points3d_theoretical:   jnp.ndarray
-) -> jnp.ndarray:
+        points3d: xp.ndarray,
+        visibility_mask: xp.ndarray,
+        points3d_theoretical: xp.ndarray
+) -> xp.ndarray:
     """
-    Use triangulated 3D points and theoretical point layout (e.g. the calibration grid) to interpolate missing points
+    Fills in missing points in a cloud using a theoretical template.
+    Uses Weighted Least Squares (via Normal Equations) to align the template to visible points.
 
     Args:
-        points3d: the N 3D points (N, 3)
-        visibility_mask: the visibility mask of the N points (N,)
-        points3d_theoretical: the full set of N theoretical point coordinates (N, 3)
+        points3d: Observed points (N, 3)
+        visibility_mask: Visibility (N,)
+        points3d_theoretical: Template points (N, 3)
 
     Returns:
-        filled: (N, 3) filled-in points
+        Completed point cloud (N, 3)
     """
 
     N = points3d.shape[0]
-    mask = visibility_mask.astype(bool)  # (N,)
+    mask = visibility_mask.astype(xp.float32)
 
-    # Build design matrix [X_th | 1]
-    ones = jnp.ones((N, 1), dtype=points3d.dtype)
-    A = jnp.concatenate([points3d_theoretical, ones], axis=1)  # (N, 4)
+    # Design matrix [X_th | 1]
+    ones = xp.ones((N, 1), dtype=points3d.dtype)
+    A = xp.concatenate([points3d_theoretical, ones], axis=1)  # (N, 4)
 
-    # zeroify just the rows we did observe for the weighted least squares
-    A_obs = jnp.where(mask[:, None], A, 0.0)  # (N, 4)
-    Y_obs = jnp.where(mask[:, None], points3d, 0.0)  # (N, 3)
+    # We want to solve A * T = Y, but weighted by mask
+    # W is diagonal of mask
+    # Normal eq: (A.T W A) T = A.T W Y
 
-    # Solve A_obs @ T ~ Y_obs
-    T, *_ = jnp.linalg.lstsq(A_obs, Y_obs, rcond=None)  # (4, 3)
+    # Multiply A and Y by sqrt(weights) (which is just mask (0 or 1) here)
+    # Broadcasting mask: (N, 1)
+    mask_col = mask[:, None]
 
-    # Predict N with that T
-    filled_all = A @ T  # (N, 3)
+    A_weighted = A * mask_col
+    Y_weighted = points3d * mask_col
 
-    # And only replace the originally missing rows
-    return jnp.where(mask[:, None], points3d, filled_all)
+    # Solve
+    AT_W_A = A_weighted.T @ A_weighted
+    AT_W_Y = A_weighted.T @ Y_weighted
+
+    # Regularize slightly
+    eps = 1e-6 * xp.eye(4)
+    T = xp.linalg.solve(AT_W_A + eps, AT_W_Y)  # (4, 3)
+
+    # Predict all
+    filled_all = A @ T
+
+    # Combine original and filled
+    return xp.where(mask_col.astype(bool), points3d, filled_all)
 
 
-@jax.jit
-def huber_weight(residual_norm: jnp.ndarray, delta: float = 1.0) -> jnp.ndarray:
+@jit
+def huber_weight(residual_norm: xp.ndarray, delta: float = 1.0) -> xp.ndarray:
     """
     Compute Huber weight for each ||error||
 
         w = 1                   if ||error|| <= delta
         w = delta / ||error||   if ||error|| > delta
     """
-    return jnp.where(residual_norm <= delta,1.0, delta / (residual_norm + 1e-12))
+    return xp.where(residual_norm <= delta, 1.0, delta / (residual_norm + 1e-12))
 
 
-@jax.jit
+@jit
 def translation_average(
-        t_samples:  jnp.ndarray,
-        num_iters:  int = 3,
-        delta:      float = 1.0
-    ) -> jnp.ndarray:
+        t_samples: xp.ndarray,  # (M, 3)
+        num_iters: int = 3,
+        delta: float = 1.0
+) -> xp.ndarray:
     """
-    Compute a Huber‐weighted mean of M translation samples (M, 3) with IRLS
-    If M == 0, it returns [0, 0, 0]
+    Computes Huber-weighted mean of translations using IRLS.
     """
     M = t_samples.shape[0]
 
-    def no_data():
-        return jnp.zeros((3,), dtype=t_samples.dtype)
+    # Handle empty input safely
+    if M == 0:
+        return xp.zeros((3,), dtype=t_samples.dtype)
 
-    def with_data():
-        # Initialize t0 as component wise median
-        t0 = jnp.median(t_samples, axis=0)          # (3,)
+    # Initial guess: Median
+    t0 = xp.median(t_samples, axis=0)
 
-        def body_fn(i_t):
-            i, t_curr = i_t
-            res = t_samples - t_curr                # (M, 3)
-            norms = jnp.linalg.norm(res, axis=1)    # (M,)
-            w = huber_weight(norms, delta)    # (M,)
-            w = w / (jnp.sum(w) + 1e-12)            # normalize to sum=1
-            t_next = jnp.sum(w[:, None] * t_samples, axis=0)  # (3,)
-            return i + 1, t_next
+    def body_fn(t_curr):
+        res = t_samples - t_curr  # (M, 3)
+        norms = xp.linalg.norm(res, axis=1)  # (M,)
+        w = huber_weight(norms, delta)  # (M,)
 
-        def cond_fn(i_t):
-            i, _ = i_t
-            return i < num_iters
+        sum_w = xp.sum(w)
+        # Normalise weights safely
+        w_norm = w / (sum_w + 1e-12)
 
-        _, t_final = jax.lax.while_loop(cond_fn, body_fn, (0, t0))
-        return t_final
+        t_next = xp.sum(w_norm[:, None] * t_samples, axis=0)
+        return t_next
 
-    return jax.lax.cond(M == 0, no_data, with_data)
+    # Using the shim for the loop
+    def loop_body(i, t_val):
+        return body_fn(t_val)
+
+    t_final = lax.fori_loop(0, num_iters, loop_body, t0)
+    return t_final
 
 
-@jax.jit
-def quaternion_average(quats: jnp.ndarray, weights: jnp.ndarray = None) -> jnp.ndarray:
+@jit
+def quaternion_average(quats: xp.ndarray, weights: xp.ndarray = None) -> xp.ndarray:
     """
-    Computes the average of a set of quaternions using Markley's method
-    Handles the q/-q ambiguity by aligning all quaternions to a reference
-    Accepts optional weights for each quaternion
+    Averages quaternions using Eigen-decomposition (Markley's method).
+    Handles q = -q ambiguity.
     """
-
-    # If no weights provided, use uniform weights
     if weights is None:
-        weights = jnp.ones(quats.shape[0], dtype=quats.dtype)
+        weights = xp.ones(quats.shape[0], dtype=quats.dtype)
 
-    # Normalize weights to sum to 1 to avoid numerical issues
-    weights = weights / (jnp.sum(weights) + 1e-8)
+    # Normalise weights
+    weights = weights / (xp.sum(weights) + 1e-8)
 
-    # Pick the quaternion with the highest weight as the reference
-    q_ref = quats[jnp.argmax(weights)]
+    # Align quaternions to handle q = -q ambiguity
+    # Pick the one with largest weight as reference
+    idx_ref = xp.argmax(weights)
+    q_ref = quats[idx_ref]
 
-    # Align all other quaternions to the reference
-    dots = jnp.einsum('i,ji->j', q_ref, quats)
-    flip = jnp.sign(dots)
+    # Dot product with reference
+    dots = xp.sum(q_ref * quats, axis=-1)
+    flip = xp.sign(dots)
+    # if dot is 0, sign is 0, which destroys data, so default to 1
+    flip = xp.where(flip == 0, 1.0, flip)
+
     quats_aligned = quats * flip[:, None]
 
-    # Build the weighted M matrix: M = ∑ w_i * q_i * q_i^T
-    # We can do this with broadcasting and einsum.
-    # q_aligned is (N, 4). We want to compute an (N, 4, 4) matrix and sum over N
-    M = jnp.einsum('i,ij,ik->jk', weights, quats_aligned, quats_aligned)
+    # Build M = sum(w_i * q_i * q_i.T)
+    # Weighted sum over N
+    q_outer = quats_aligned[..., :, None] * quats_aligned[..., None, :]  # (N, 4, 4)
+    M = xp.sum(weights[:, None, None] * q_outer, axis=0)
 
-    _, V = jnp.linalg.eigh(M)
-    avg_quat = V[:, -1]
+    # Eigen decomposition
+    vals, vecs = xp.linalg.eigh(M)  # eigh returns eigenvalues in ascending order
 
-    # Ensure w >= 0 for a canonical representation
-    return jax.lax.cond(avg_quat[0] < 0.0, lambda q: -q, lambda q: q, avg_quat)
+    # The eigenvector with largest eigenvalue is the average
+    avg_quat = vecs[:, -1]
+
+    # Ensure positive w for canonical representation
+    s = xp.sign(avg_quat[0])
+    s = xp.where(s < 0, -1.0, 1.0)
+
+    return avg_quat * s
 
 
 def filter_rt_samples(
-        rt_stack: jnp.ndarray,
-        ang_thresh: float = np.pi / 6.0,
+        rt_stack: xp.ndarray,  # (N, 7) [quat, trans]
+        ang_thresh: float = xp.pi / 6.0,
         trans_thresh: float = 1.0,
         num_iters: int = 3
-) -> Tuple[jnp.ndarray, jnp.ndarray, bool]:
+) -> Tuple[xp.ndarray, xp.ndarray, bool]:
     """
-    Robustly averages a stack of (quaternion, translation) poses using IRLS
+    Robustly averages poses (quaternion, translation) using IRLS and outlier rejection.
     """
 
-    # First, filter out any rows that contain non-finite values (NaN or Inf)
-    finite_mask = jnp.all(jnp.isfinite(rt_stack), axis=1)
-    rt_stack_clean = rt_stack[finite_mask]
-    length = rt_stack_clean.shape[0]
+    # Clean data
+    finite_mask = xp.all(xp.isfinite(rt_stack), axis=1)
+    weights_init = finite_mask.astype(xp.float32)
 
-    def fail_case():
-        return ID_QUAT, ZERO_T, False
+    quats = rt_stack[:, :4]
+    trans = rt_stack[:, 4:]
 
-    def success_case():
-        quats = rt_stack_clean[:, :4]
-        trans = rt_stack_clean[:, 4:]
+    # Check if we have any valid data
+    count = xp.sum(weights_init)
 
-        # Initial guess
-        q_curr = quaternion_average(quats)
-        t_curr = jnp.median(trans, axis=0)
+    # Initial guess
 
-        def body_fn(i, qt_curr):
-            q_c, t_c = qt_curr
-            # Compute errors from current estimate
-            ang_errs = jax.vmap(lambda q: quaternions_angular_distance(q, q_c))(quats)
-            trans_errs = jnp.linalg.norm(trans - t_c, axis=1)
+    # Rotation: Eigen-analysis (weighted average equivalent for quats)
+    q_curr = quaternion_average(quats, weights_init)
 
-            weights = (ang_errs <= ang_thresh) & (trans_errs <= trans_thresh)
-            weights = weights.astype(jnp.float32)
+    # Translation: Masked median (dimension-wise)
+    # JAX vmap to apply the 1D median function to each column (x, y, z)
+    # axis 0 is batch (N), axis 1 is coords (3), so we move coords to front
+    trans_T = trans.T  # (3, N)
 
-            has_inliers = jnp.sum(weights) > 0
+    def _med(d):
+        return weighted_median(d, weights_init)
 
-            def update_estimate():
-                q_next = quaternion_average(quats, weights=weights)
+    if USE_JAX:
+        # JAX vmap magic
+        t_curr = vmap(_med)(trans_T)
+    else:
+        # numpy fallback
+        t_curr = xp.array([_med(trans_T[0]), _med(trans_T[1]), _med(trans_T[2])])
 
-                # we use the same weights for the translation mean
-                w_norm = weights / jnp.sum(weights)
-                t_next = jnp.sum(w_norm[:, None] * trans, axis=0)
-                return q_next, t_next
+    # Fallback if median fails (e.g. all weights were 0): we use [0, 0, 0]
+    t_curr = xp.where(count > 0, t_curr, xp.zeros(3))
 
-            def keep_estimate():
-                return q_c, t_c
+    def body_fn(state):
+        q_c, t_c, _ = state
 
-            q_next, t_next = jax.lax.cond(has_inliers, update_estimate, keep_estimate)
-            return q_next, t_next
+        # Calculate errors
+        q_c_broad = xp.broadcast_to(q_c, quats.shape)
+        ang_errs = quaternions_angular_distance(quats, q_c_broad)
 
-        q_final, t_final = jax.lax.fori_loop(0, num_iters, body_fn, (q_curr, t_curr))
+        trans_errs = xp.linalg.norm(trans - t_c, axis=1)
 
-        # Final check for inliers to determine success
-        ang_errs = jax.vmap(lambda q: quaternions_angular_distance(q, q_final))(quats)
-        trans_errs = jnp.linalg.norm(trans - t_final, axis=1)
-        final_inliers = jnp.sum((ang_errs <= ang_thresh) & (trans_errs <= trans_thresh))
+        # Determine inliers
+        is_inlier = (ang_errs <= ang_thresh) & (trans_errs <= trans_thresh)
+        new_weights = is_inlier.astype(xp.float32) * weights_init
 
-        return q_final, t_final, final_inliers > 0
+        total_w = xp.sum(new_weights)
+        has_data = total_w > 1e-4
 
-    return jax.lax.cond(length == 0, fail_case, success_case)
+        # If we lost all data, keep previous estimate
+
+        # Update Q
+        q_new = quaternion_average(quats, new_weights)
+        q_next = xp.where(has_data, q_new, q_c)
+
+        # Update T
+        w_norm = new_weights / (total_w + 1e-12)
+        t_new = xp.sum(w_norm[:, None] * trans, axis=0)
+        t_next = xp.where(has_data, t_new, t_c)
+
+        return q_next, t_next, has_data
+
+    def loop_wrapper(i, state):
+        return body_fn(state)
+
+    # Initial state
+    init_state = (q_curr, t_curr, count > 0)
+
+    q_final, t_final, valid = lax.fori_loop(0, num_iters, loop_wrapper, init_state)
+
+    return q_final, t_final, valid
 
 
-@jax.jit
+@jit
 def rays_intersection_3d(
-    ray_origins:     jnp.ndarray, # (C, 3)
-    ray_directions:  jnp.ndarray  # (C, 3)
-) -> jnp.ndarray:
+        ray_origins: xp.ndarray,  # (C, 3)
+        ray_directions: xp.ndarray  # (C, 3)
+) -> xp.ndarray:
     """
-    Finds the 3D point that minimizes the sum of squared distances to a set of rays
-    Each ray is defined by an origin point and a direction vector
-
-    Args:
-        ray_origins: C origin points for C rays (C, 3)
-        ray_directions: C unit direction vectors for C rays (C, 3)
-
-    Returns:
-        intersection_point: The point of closest intersection (3,)
+    Finds the 3D point that minimizes the sum of squared distances to a set of rays.
     """
 
     # Per-ray projection matrix onto the plane orthogonal to the direction
-    I = jnp.eye(3)
-    P_i = I - jnp.einsum('ci,cj->cij', ray_directions, ray_directions)  # (C, 3, 3)
+    I = xp.eye(3)
+    # Projections: I - v v.T
+    P_i = I - xp.einsum('ci,cj->cij', ray_directions, ray_directions)
 
-    # Sum of A = sum(P_i) and b = sum(P_i @ origin_i)
-    A = jnp.sum(P_i, axis=0)  # (3, 3)
-    b = jnp.einsum('cij,cj->ci', P_i, ray_origins)  # (C, 3)
-    b = jnp.sum(b, axis=0)  # (3,)
+    # Sum of matrices: A = sum(P_i)
+    A = xp.sum(P_i, axis=0)  # (3, 3)
 
-    # Solve the small 3x3 system A @ x = b
-    intersection_point, *_ = jnp.linalg.lstsq(A, b, rcond=None)
-    return intersection_point
+    # RHS: b = sum(P_i @ origin)
+    b_vecs = xp.einsum('cij,cj->ci', P_i, ray_origins)
+    b = xp.sum(b_vecs, axis=0)  # (3,)
+
+    # Solve 3x3
+    # lstsq makes it robust against parallel rays (singular A)
+    pt, _, _, _ = xp.linalg.lstsq(A, b, rcond=None)
+    return pt
 
 
-@jax.jit
+@jit
 def ray_intersection_AABB(
-        ray_origin: jnp.ndarray,
-        ray_dir:    jnp.ndarray,
-        aabb_min:   jnp.ndarray,
-        aabb_max:   jnp.ndarray
-) -> Tuple[jnp.ndarray, jnp.ndarray, jnp.ndarray]:
+        ray_origin: xp.ndarray,
+        ray_dir: xp.ndarray,
+        aabb_min: xp.ndarray,
+        aabb_max: xp.ndarray
+) -> Tuple[xp.ndarray, xp.ndarray, xp.ndarray]:
     """
-    Computes the intersection of a ray with an Axis-Aligned Bounding Box
+    Slab method for AABB intersection. Supports batched rays.
 
     Args:
-        ray_origin: Ray origin (3,)
-        ray_dir: Ray direction (3,)
-        aabb_min: Array [x_min, y_min, z_min] of the AABB (3,)
-        aabb_max: Array [x_max, y_max, z_max] of the AABB (3,)
+        ray_origin: Ray origins (..., 3)
+        ray_dir: Ray directions (..., 3)
+        aabb_min: Box min corner (3,)
+        aabb_max: Box max corner (3,)
 
     Returns:
-        p_near: The nearest intersection (3,)
-        p_far: The far intersection (3,)
-        has_intersection: True if the ray has intersection
+        p_near: Entry points (..., 3)
+        p_far: Exit points (..., 3)
+        has_intersection: Boolean mask
     """
+    # Safe inverse direction
+    is_zero = xp.abs(ray_dir) < _tiny
+    safe_dir = xp.where(is_zero, _tiny, ray_dir)
+    dir_inv = 1.0 / safe_dir
 
-    dir_inv = 1.0 / (ray_dir + 1e-6)
+    # Broadcast AABB to rays
     t1 = (aabb_min - ray_origin) * dir_inv
     t2 = (aabb_max - ray_origin) * dir_inv
-    t_min = jnp.max(jnp.minimum(t1, t2))
-    t_max = jnp.min(jnp.maximum(t1, t2))
+
+    # Find entering and exiting planes
+    t_min = xp.max(xp.minimum(t1, t2), axis=-1)
+    t_max = xp.min(xp.maximum(t1, t2), axis=-1)
 
     has_intersection = t_min < t_max
 
     # Compute points
-    p_near = ray_origin + t_min * ray_dir
-    p_far = ray_origin + t_max * ray_dir
+    p_near = ray_origin + t_min[..., None] * ray_dir
+    p_far = ray_origin + t_max[..., None] * ray_dir
 
-    # Optionally mask outputs for non-intersecting rays
-    # This avoids invalid values leaking downstream
-    p_near = jnp.where(has_intersection, p_near, jnp.full_like(p_near, jnp.nan))
-    p_far = jnp.where(has_intersection, p_far, jnp.full_like(p_far, jnp.nan))
+    # Masking
+    nan_v = xp.full_like(p_near, xp.nan)
+    mask = has_intersection[..., None]
+
+    p_near = xp.where(mask, p_near, nan_v)
+    p_far = xp.where(mask, p_far, nan_v)
 
     return p_near, p_far, has_intersection
 
-# vmapped version on the *direction only* to compute the intersection of a bundle of rays from one camera with one AABB
-bundle_intersection_AABB = jax.vmap(ray_intersection_AABB, in_axes=(None, 0, None, None))
 
-
-@partial(jax.jit, static_argnames=['error_threshold_px', 'percentile'])
+@partial(jit, static_argnames=['error_threshold_px', 'percentile'])
 def reliability_bounds_3d(
-    world_points:               jnp.ndarray,
-    all_errors:                 jnp.ndarray,
-    error_threshold_px:         float = 1.0,
-    percentile:                 float = 1.0
+        world_points: xp.ndarray,
+        all_errors: xp.ndarray,
+        error_threshold_px: float = 1.0,
+        percentile: float = 1.0
 ) -> Dict[str, Tuple[float, float]]:
     """
-    Computes a bounding box in world coordinates from a cloud of 3D points and their corresponding errors
-
-    Reliability is determined by the mean error across all observations (cameras) for each point
+    Computes a bounding box in world coordinates from a cloud of 3D points.
+    Reliability is determined by the mean reprojection error.
 
     Args:
-        world_points: A cloud of 3D points (P, N, 3)
-        all_errors: Error values for each point from each observation (C, P, N)
-        error_threshold_px: The maximum mean error for a point to be considered reliable
-        percentile: The percentile used to clip outliers when computing the bounds
+        world_points: Cloud of 3D points (P, N, 3)
+        all_errors: Error values for each point (C, P, N)
+        error_threshold_px: Max mean error for a point to be considered reliable
+        percentile: Percentile to clip outliers when computing bounds
 
     Returns:
-        A dictionary with 'x', 'y', 'z' keys, each containing a (min, max) tuple for the bounds
-        Returns NaN bounds if fewer than 3 reliable points are found
+        Dict with 'x', 'y', 'z' keys containing (min, max) bounds
     """
 
-    # Average errors across observations (axis 0, e.g., cameras) for each point instance
-    mean_error_per_point = jnp.nanmean(all_errors, axis=0)
+    # Mean error per point instance
+    mean_error = xp.nanmean(all_errors, axis=0)  # (P, N)
 
-    reliable_mask = mean_error_per_point < error_threshold_px
-    num_reliable_points = jnp.sum(reliable_mask)
+    # Mask
+    reliable_mask = mean_error < error_threshold_px
+    count = xp.sum(reliable_mask)
 
-    # JAX-compatible masking: Replace unreliable points with NaN
-    reliable_world_pts = jnp.where(
-        reliable_mask[..., None], # Broadcast mask to match point dimensions
-        world_points,
-        jnp.nan
-    )
+    # Filter points (set unreliable to NaN)
+    pts_clean = xp.where(reliable_mask[..., None], world_points, xp.nan)
 
-    def get_bounds():
-        lower_p, upper_p = percentile, 100.0 - percentile
-        p = jnp.array([lower_p, upper_p])
-        # nanpercentile to ignore the masked-out NaN values
-        x_min, x_max = jnp.nanpercentile(reliable_world_pts[..., 0], p)
-        y_min, y_max = jnp.nanpercentile(reliable_world_pts[..., 1], p)
-        z_min, z_max = jnp.nanpercentile(reliable_world_pts[..., 2], p)
-        return {'x': (x_min, x_max), 'y': (y_min, y_max), 'z': (z_min, z_max)}
+    # Compute bounds (percentiles ignore NaNs)
+    q_low = percentile
+    q_high = 100.0 - percentile
 
-    def empty_bounds():
-        return {'x': (jnp.nan, jnp.nan), 'y': (jnp.nan, jnp.nan), 'z': (jnp.nan, jnp.nan)}
+    x_min = xp.nanpercentile(pts_clean[..., 0], q_low)
+    x_max = xp.nanpercentile(pts_clean[..., 0], q_high)
+    y_min = xp.nanpercentile(pts_clean[..., 1], q_low)
+    y_max = xp.nanpercentile(pts_clean[..., 1], q_high)
+    z_min = xp.nanpercentile(pts_clean[..., 2], q_low)
+    z_max = xp.nanpercentile(pts_clean[..., 2], q_high)
 
-    return jax.lax.cond(num_reliable_points < 3, empty_bounds, get_bounds)
+    # Check reliability (returns NaN if count too low)
+    is_valid = count >= 3
+
+    def gate(val):
+        return xp.where(is_valid, val, xp.nan)
+
+    return {
+        'x': (gate(x_min), gate(x_max)),
+        'y': (gate(y_min), gate(y_max)),
+        'z': (gate(z_min), gate(z_max))
+    }
 
 
-@partial(jax.jit, static_argnames=['error_threshold_px', 'iqr_factor'])
+@partial(jit, static_argnames=['error_threshold_px', 'iqr_factor'])
 def reliability_bounds_3d_iqr(
-    world_points:           jnp.ndarray,
-    all_errors:             jnp.ndarray,
-    error_threshold_px:     float = 1.0,
-    iqr_factor:             float = 1.5
+        world_points: xp.ndarray,
+        all_errors: xp.ndarray,
+        error_threshold_px: float = 1.0,
+        iqr_factor: float = 1.5
 ) -> Dict[str, Tuple[float, float]]:
     """
-    Computes a robust bounding box using the Interquartile Range (IQR) method
-
-    Robust to geometric outliers, and avoid the impredictibility of the percentile method
+    Computes a robust bounding box using the Interquartile Range method.
 
     Args:
-        world_points: A cloud of 3D points (P, N, 3)
-        all_errors: Error values for each point from each observation (C, P, N)
-        error_threshold_px: The maximum mean error for a point to be considered reliable
-        iqr_factor: The multiplier for the IQR to define the outlier fences (default 1.5)
-                    Higher value = larger volume
+        world_points: Cloud of 3D points (P, N, 3)
+        all_errors: Error values (C, P, N)
+        error_threshold_px: Max mean error
+        iqr_factor: Multiplier for IQR (default 1.5)
 
     Returns:
-        A dictionary with 'x', 'y', 'z' keys, each containing a (min, max) tuple for the bounds.
-        Returns NaN bounds if fewer than 4 reliable points are found (IQR is ill-defined).
+        Dict with 'x', 'y', 'z' bounds
     """
 
-    # Average errors across observations (axis 0, e.g., cameras) for each point instance
-    mean_error_per_point = jnp.nanmean(all_errors, axis=0)
+    # Average errors across observations (cameras) for each point instance
+    mean_error = xp.nanmean(all_errors, axis=0)
 
-    reliable_mask = mean_error_per_point < error_threshold_px
-    num_reliable_points = jnp.sum(reliable_mask)
+    reliable_mask = mean_error < error_threshold_px
+    count = xp.sum(reliable_mask)
 
-    # Replace unreliable points with nans
-    reliable_world_pts = jnp.where(
-        reliable_mask[..., None],
-        world_points,
-        jnp.nan
-    )
+    pts_clean = xp.where(reliable_mask[..., None], world_points, xp.nan)
 
-    def get_bounds():
-        # Q1 (25th percentile) and Q3 (75th percentile) for each axis
-        q1_x, q3_x = jnp.nanpercentile(reliable_world_pts[..., 0], jnp.array([25.0, 75.0]))
-        q1_y, q3_y = jnp.nanpercentile(reliable_world_pts[..., 1], jnp.array([25.0, 75.0]))
-        q1_z, q3_z = jnp.nanpercentile(reliable_world_pts[..., 2], jnp.array([25.0, 75.0]))
+    # Quartiles
+    qs = xp.array([25.0, 75.0])
 
-        # Interquartile Range (IQR) for each axis
-        iqr_x = q3_x - q1_x
-        iqr_y = q3_y - q1_y
-        iqr_z = q3_z - q1_z
+    qx = xp.nanpercentile(pts_clean[..., 0], qs)
+    qy = xp.nanpercentile(pts_clean[..., 1], qs)
+    qz = xp.nanpercentile(pts_clean[..., 2], qs)
 
-        # Define the bounds using the IQR
-        x_min = q1_x - iqr_factor * iqr_x
-        x_max = q3_x + iqr_factor * iqr_x
+    iqr_x = qx[1] - qx[0]
+    iqr_y = qy[1] - qy[0]
+    iqr_z = qz[1] - qz[0]
 
-        y_min = q1_y - iqr_factor * iqr_y
-        y_max = q3_y + iqr_factor * iqr_y
-
-        z_min = q1_z - iqr_factor * iqr_z
-        z_max = q3_z + iqr_factor * iqr_z
-
-        return {'x': (x_min, x_max), 'y': (y_min, y_max), 'z': (z_min, z_max)}
-
-    def empty_bounds():
-        return {'x': (jnp.nan, jnp.nan), 'y': (jnp.nan, jnp.nan), 'z': (jnp.nan, jnp.nan)}
+    x_min, x_max = qx[0] - iqr_factor * iqr_x, qx[1] + iqr_factor * iqr_x
+    y_min, y_max = qy[0] - iqr_factor * iqr_y, qy[1] + iqr_factor * iqr_y
+    z_min, z_max = qz[0] - iqr_factor * iqr_z, qz[1] + iqr_factor * iqr_z
 
     # need at least 4 points for quartiles to be meaningful
-    return jax.lax.cond(num_reliable_points < 4, empty_bounds, get_bounds)
+    is_valid = count >= 4
+
+    def gate(val):
+        return xp.where(is_valid, val, xp.nan)
+
+    return {
+        'x': (gate(x_min), gate(x_max)),
+        'y': (gate(y_min), gate(y_max)),
+        'z': (gate(z_min), gate(z_max))
+    }
 
 
-@jax.jit
+@jit
 def generate_ambiguous_pose(
-        rvec_o2c: jnp.ndarray,
-        tvec_o2c: jnp.ndarray
-) -> Tuple[jnp.ndarray, jnp.ndarray]:
+        rvec_o2c: xp.ndarray,
+        tvec_o2c: xp.ndarray
+) -> Tuple[xp.ndarray, xp.ndarray]:
     """
-    Generates the second, ambiguous solution for a planar PnP problem
-
-    This corresponds to a 180-degree rotation around the board's X-axis,
-    which results in a different camera-to-board pose
-
-    Args:
-        rvec_o2c: The rotation vector from solvePnP (object-to-camera)
-        tvec_o2c: The translation vector from solvePnP (object-to-camera)
-
-    Returns:
-        A tuple (rvec_alt, tvec_alt) representing the alternative pose
+    Generates the second, ambiguous solution for a planar PnP problem.
+    Corresponds to a 180-degree rotation around the object's X-axis.
     """
+    R_b2c = rodrigues(rvec_o2c)  # (..., 3, 3)
 
-    # Original board-to-camera rotation matrix
-    R_b2c = rodrigues(rvec_o2c)
+    #                 [1, 0, 0]
+    # Flip matrix is  [0,-1, 0]
+    #                 [0, 0,-1]
+    diag = xp.array([1.0, -1.0, -1.0], dtype=rvec_o2c.dtype)
+    R_flip = xp.diag(diag)  # (3, 3)
 
-    # 180-degree rotation matrix around the board's X-axis
-    # This is a rotation in the board's own coordinate frame
-    R_flip = jnp.array([
-        [1.0, 0.0, 0.0],
-        [0.0, -1.0, 0.0],
-        [0.0, 0.0, -1.0]
-    ], dtype=rvec_o2c.dtype)
-
-    # The new rotation is the original rotation composed with the flip
-    R_alt = R_b2c @ R_flip
+    # R_alt = R_b2c @ R_flip
+    R_alt = xp.matmul(R_b2c, R_flip)
     rvec_alt = inverse_rodrigues(R_alt)
 
-    # The translation vector (position of board origin in camera frame) does not change
-    # when we rotate the board about its own origin
     tvec_alt = tvec_o2c
 
     return rvec_alt, tvec_alt
 
-# batched version that works on (N, 3) arrays
-generate_multiple_ambiguous_poses = jax.vmap(generate_ambiguous_pose, in_axes=(0, 0), out_axes=(0, 0))
 
-
-@jax.jit
-def point_to_segment_distance(p, a, b):
+@jit
+def point_to_segment_distance(
+        p: xp.ndarray,
+        a: xp.ndarray,
+        b: xp.ndarray
+) -> xp.ndarray:
     """
-    Calculates the minimum distance from a point p to a line segment (a, b) in 2D or 3D
-
-    Args:
-        p: The point (2, or 3,)
-        a: The segment origin (2, or 3,)
-        b: The segment end (2, or 3,)
-
-    Returns:
-        A tuple (rvec_alt, tvec_alt) representing the alternative pose
+    Computes distance from point p to segment [a, b].
     """
     ab = b - a
     ap = p - a
 
-    # Project ap onto ab
-    t = jnp.dot(ap, ab) / (jnp.dot(ab, ab) + 1e-6)
-    # Clamp t to the segment [0, 1]
-    t_clamped = jnp.clip(t, 0.0, 1.0)
-    # Find the closest point on the segment
-    closest_point = a + t_clamped * ab
-    return jnp.linalg.norm(p - closest_point)
+    # dot product (..., 3) . (..., 3) -> (...)
+    num = xp.sum(ap * ab, axis=-1)
+    den = xp.sum(ab * ab, axis=-1) + 1e-9
 
-# batched version to get the distance of N points to a single segment
-points_to_segment_distance = jax.vmap(point_to_segment_distance, in_axes=(0, None, None))
+    t = num / den
+    t_clamped = xp.clip(t, 0.0, 1.0)
+
+    closest = a + t_clamped[..., None] * ab
+
+    return xp.linalg.norm(p - closest, axis=-1)

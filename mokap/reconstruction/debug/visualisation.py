@@ -1,5 +1,6 @@
 import numpy as np
-import jax.numpy as jnp
+from mokap.utils.geometry.backend import xp
+
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.widgets import Slider
@@ -9,11 +10,14 @@ from collections import defaultdict
 from typing import List, Tuple
 
 from mokap.reconstruction.datatypes import SoupData
+
 from mokap.utils.geometry.projective import (
     undistort_points, back_projection, project_points, project_to_multiple_cameras
 )
+
 from mokap.utils.geometry.transforms import extrinsics_matrix, extmat_to_rtvecs
-from mokap.utils.geometry.fitting import bundle_intersection_AABB
+from mokap.utils.geometry.fitting import ray_intersection_AABB
+
 from mokap.utils.visualisation import plot_cameras_3d, CUSTOM_COLORS
 
 
@@ -43,7 +47,7 @@ class ReconstructorVisualizer:
 
             for pt_3d in points_3d:
                 # Draw line from camera center to point
-                ax.plot(*np.stack([cam_center, pt_3d]).T, color=CUSTOM_COLORS[c % len(CUSTOM_COLORS)],
+                ax.plot(*np.stack([np.array(cam_center), np.array(pt_3d)]).T, color=CUSTOM_COLORS[c % len(CUSTOM_COLORS)],
                         linestyle='-', linewidth=0.5, alpha=0.5)
 
         ax.set_title("Ray Casting Sanity Check")
@@ -70,20 +74,20 @@ class ReconstructorVisualizer:
 
         # Backproject rays from i -> project to j
         udets_i = undistort_points(dets_i, self.r.Ks[cam_idx_i], self.r.Ds[cam_idx_i])
-        E_c2w_i = jnp.linalg.inv(self.r.Es[cam_idx_i])
+        E_c2w_i = xp.linalg.inv(self.r.Es[cam_idx_i])
         cam_center_i = E_c2w_i[:3, 3]
 
         p_3d_ray = back_projection(udets_i, 1.0, self.r.Ks[cam_idx_i], E_c2w_i, dist_coeffs=None)
         ray_dirs = p_3d_ray - cam_center_i
-        ray_dirs /= jnp.linalg.norm(ray_dirs, axis=-1, keepdims=True)
+        ray_dirs /= xp.linalg.norm(ray_dirs, axis=-1, keepdims=True)
 
         # Intersect with volume AABB
-        p_near, p_far, hit = bundle_intersection_AABB(cam_center_i, ray_dirs, self.r.aabb_min, self.r.aabb_max)
+        p_near, p_far, hit = ray_intersection_AABB(cam_center_i, ray_dirs, self.r.aabb_min, self.r.aabb_max)
 
         # Project segments to cam j
         rvec_j, tvec_j = extmat_to_rtvecs(self.r.Es[cam_idx_j])
-        segments_3d = jnp.vstack([p_near, p_far])
-        segments_2d, _ = project_points(segments_3d, rvec_j, tvec_j, new_K_j, dist_coeffs=jnp.zeros_like(D_j))
+        segments_3d = xp.vstack([p_near, p_far])
+        segments_2d, _ = project_points(segments_3d, rvec_j, tvec_j, new_K_j, dist_coeffs=xp.zeros_like(D_j))
 
         # Plot
         plt.figure(figsize=(12, 9))
@@ -170,7 +174,7 @@ class ReconstructorVisualizer:
         # Plot points
         for i, name in enumerate(soup.keypoint_names):
             if name in kp_dict:
-                pts = np.stack(kp_dict[name])
+                pts = np.array(np.stack(kp_dict[name]))
                 ax.scatter(pts[:, 0], pts[:, 1], pts[:, 2], color=colors(i), s=20, label=name)
 
         # Plot bones (greedy Nearest Neighbor)
@@ -225,7 +229,7 @@ def draw_skeletons_3d(frame_data, bones, ax):
         # Bones
         for k1, k2 in bones:
             if k1 in kps and k2 in kps:
-                p1, p2 = kps[k1], kps[k2]
+                p1, p2 = np.array(kps[k1]), np.array(kps[k2])
                 l, = ax.plot([p1[0], p2[0]], [p1[1], p2[1]], [p1[2], p2[2]], c=color, lw=2)
                 artists.append(l)
 

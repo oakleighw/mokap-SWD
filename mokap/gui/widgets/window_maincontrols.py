@@ -892,5 +892,5 @@ class MainControls(QMainWindow, SnapMixin):
 
         # Update memory pressure
         buffers_state = np.array(self.manager.buffered)
-        pressure = np.mean(buffers_state / self.manager.buffer_size) * 100
+        pressure = np.nanmean(buffers_state / self.manager.buffer_size) * 100
         self._mem_pressure_bar.setValue(int(pressure))

@@ -1,15 +1,18 @@
 import logging
 from typing import List, Dict, Tuple
 from collections import defaultdict
+
 import numpy as np
+from mokap.utils.geometry.backend import xp
+
 from itertools import combinations
-import jax.numpy as jnp
 from scipy.optimize import linear_sum_assignment
 from scipy.spatial.distance import cdist
 from alive_progress import alive_bar
 
 from mokap.reconstruction.config import MergerConfig, LinkerConfig
 from mokap.reconstruction.datatypes import TrackletData
+
 from mokap.utils.geometry.fitting import find_rigid_transform
 
 
@@ -681,8 +684,8 @@ class TrackletLinker:
             return 1e9  # not enough shared geometry for a stable cost
 
         # Shape cost
-        pts_a_common = jnp.array([kps_a[name] for name in common_kps])
-        pts_b_common = jnp.array([kps_b[name] for name in common_kps])
+        pts_a_common = xp.array([kps_a[name] for name in common_kps])
+        pts_b_common = xp.array([kps_b[name] for name in common_kps])
 
         R, t = find_rigid_transform(pts_a_common, pts_b_common)
         aligned_pts_a = (R @ pts_a_common.T).T + t

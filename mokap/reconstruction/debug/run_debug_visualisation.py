@@ -1,8 +1,10 @@
 import numpy as np
+from mokap.utils.geometry.backend import xp
+
 import pickle
 import polars as pl
 import cv2
-import jax.numpy as jnp
+
 from pathlib import Path
 from mokap.utils import fileio
 from mokap.reconstruction.config import ReconstructorConfig
@@ -14,7 +16,7 @@ from mokap.reconstruction.debug.visualisation import (
 
 # ================= CONFIGURATION =================
 # Options: "RAYS", "EPIPOLAR", "HYPOTHESIS", "SOUP", "RAW_SOUP", "TRACKLETS", "LINKED_TRACKS"
-MODE = "TRACKLETS"
+MODE = "RAW_SOUP"
 
 FOLDER = Path().home() / 'Desktop' / '3d_ant_data'
 PREFIX = '240905-1616'
@@ -87,11 +89,11 @@ if __name__ == "__main__":
         for c in range(rec.num_cams):
             c_mask = (inputs['cam_ids'][mask] == c)
             if np.any(c_mask):
-                raw_dets.append(jnp.array(inputs['coords'][mask][c_mask]))
-                raw_confs.append(jnp.array(inputs['scores'][mask][c_mask]))
+                raw_dets.append(inputs['coords'][mask][c_mask])
+                raw_confs.append(inputs['scores'][mask][c_mask])
             else:
-                raw_dets.append(rec.NULL_POINT2D_JAX)
-                raw_confs.append(rec.EMPTY_F32_JAX)
+                raw_dets.append(rec.NULL_POINT2D_XP)
+                raw_confs.append(rec.EMPTY_F32_NP)
 
         images = load_images(FOLDER, PREFIX, SESSION, cam_names, FRAME)
 
@@ -113,8 +115,8 @@ if __name__ == "__main__":
             #  This really is just to check the JAX math inside the solver
 
             # Flatten arrays for the solver
-            flat_dets = jnp.concatenate(raw_dets)
-            flat_confs = jnp.concatenate(raw_confs)
+            flat_dets = xp.concatenate(raw_dets)
+            flat_confs = xp.concatenate(raw_confs)
 
             # Calculate offsets to map Global index -> (cam index, local index)
             counts = [len(d) for d in raw_dets]

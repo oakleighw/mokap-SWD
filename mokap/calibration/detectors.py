@@ -1,8 +1,10 @@
 import logging
 from typing import Tuple, Union, Optional
 import cv2
+
 import numpy as np
-from numpy.typing import ArrayLike
+from mokap.utils.geometry.backend import ArrayLike
+
 from mokap.utils.datatypes import CharucoBoard, ChessBoard
 
 logger = logging.getLogger(__name__)
@@ -42,11 +44,10 @@ class ChessboardDetector:
             0.1  # epsilon is the minimum allowed movement (in pixels) of a point from one iteration to the next
         )
 
-    def detect(self,
-               frame: ArrayLike,
-                refine_points: bool = False,
-               **kwargs
+    def detect(self, frame: ArrayLike, refine_points: bool = False, **kwargs
                ) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[None, None]]:
+
+        frame = np.asarray(frame)
 
         if frame.ndim == 3:
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
@@ -127,6 +128,8 @@ class CharucoDetector(ChessboardDetector):
                refine_markers: bool = True,
                refine_points: bool = False
                ) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[None, None]]:
+
+        frame = np.asarray(frame)
 
         if frame.ndim == 3:
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
