@@ -2,6 +2,7 @@ from typing import Optional, Any, Dict, Iterable, Sequence, Union
 import matplotlib
 
 import numpy as np
+
 np.set_printoptions(precision=3, suppress=True, threshold=150)
 from mokap.utils.geometry.backend import xp, ArrayLike
 
@@ -11,8 +12,8 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
 from mokap.utils.geometry.fitting import intersect_rays
 from mokap.utils.geometry.projective import unproject
-from mokap.utils.geometry.transforms import compose_transform_matrix
-
+# Added rotation_matrix to imports
+from mokap.utils.geometry.transforms import compose_transform_matrix, rotation_matrix
 
 CUSTOM_COLORS = ['#9B5DE5', '#EF476F', '#FFD166', '#00BBF9', '#00F5D4', '#118ab2', '#073b4c', '#ee6c4d']
 
@@ -26,12 +27,11 @@ def truncate_colormap(cmap, minval: float = 0.0, maxval: float = 1.0, n: int = 1
 
 def plot_box_3d(
         centre: ArrayLike,
-        size:   ArrayLike,
-        color:  str = 'k',
-        alpha:  float = 0.1,
-        ax:     Optional[Axes3D] = None,
+        size: ArrayLike,
+        color: str = 'k',
+        alpha: float = 0.1,
+        ax: Optional[Axes3D] = None,
 ) -> Axes3D:
-
     if ax is None:
         fig = plt.figure(figsize=(12, 12))
         ax = fig.add_subplot(111, projection='3d')
@@ -40,12 +40,12 @@ def plot_box_3d(
     v = (coords - 0.5) * np.array(size) + np.array(centre)
 
     faces_idx = np.array([
-        [0, 1, 3, 2],   # bottom
-        [4, 5, 7, 6],   # top
-        [0, 1, 5, 4],   # back
-        [2, 3, 7, 6],   # front
-        [0, 2, 6, 4],   # left
-        [1, 3, 7, 5],   # right
+        [0, 1, 3, 2],  # bottom
+        [4, 5, 7, 6],  # top
+        [0, 1, 5, 4],  # back
+        [2, 3, 7, 6],  # front
+        [0, 2, 6, 4],  # left
+        [1, 3, 7, 5],  # right
     ])
     faces = v[faces_idx]
 
@@ -56,13 +56,12 @@ def plot_box_3d(
 
 def plot_ellipsoid_3d(
         centre: ArrayLike,
-        size:   ArrayLike,
-        color:  str = 'k',
-        alpha:  float = 0.1,
+        size: ArrayLike,
+        color: str = 'k',
+        alpha: float = 0.1,
         resolution: int = 30,
-        ax:     Optional[Axes3D] = None,
+        ax: Optional[Axes3D] = None,
 ) -> Axes3D:
-
     if ax is None:
         fig = plt.figure(figsize=(12, 12))
         ax = fig.add_subplot(111, projection='3d')
@@ -89,19 +88,18 @@ def plot_ellipsoid_3d(
 
 
 def plot_cameras_3d(
-        rvecs_c2w:          ArrayLike,
-        tvecs_c2w:          ArrayLike,
-        camera_matrices:    ArrayLike,
-        dist_coeffs:        ArrayLike,
-        imsizes:            ArrayLike = np.array([1440, 1080]),
-        cameras_names:      Optional[Sequence[Any]] = None,
-        depth:              Optional[Union[float, ArrayLike]] = None,
-        depth_ratio:        float = 0.75,
-        colors:             Optional[Sequence[str]] = None,
-        trust_volume:       Optional[Dict[str, ArrayLike]] = None,
-        ax:                 Optional[Axes3D] = None,
+        rvecs_c2w: ArrayLike,
+        tvecs_c2w: ArrayLike,
+        camera_matrices: ArrayLike,
+        dist_coeffs: ArrayLike,
+        imsizes: ArrayLike = np.array([1440, 1080]),
+        cameras_names: Optional[Sequence[Any]] = None,
+        depth: Optional[Union[float, ArrayLike]] = None,
+        depth_ratio: float = 0.75,
+        colors: Optional[Sequence[str]] = None,
+        trust_volume: Optional[Dict[str, ArrayLike]] = None,
+        ax: Optional[Axes3D] = None,
 ) -> Axes3D:
-
     """ Matplotlib 3D plot for viewing C cameras, with their frustums, and the global focal point """
 
     if rvecs_c2w.ndim != 2 or tvecs_c2w.ndim != 2 or camera_matrices.ndim != 3 or dist_coeffs.ndim != 2:
@@ -128,8 +126,8 @@ def plot_cameras_3d(
         [1, 0],
         [1, 1],
         [0, 1],
-        [0, 0],         # need to repeat the first one for Poly3DCollection
-        [0.5, 0.5],     # centre point
+        [0, 0],  # need to repeat the first one for Poly3DCollection
+        [0.5, 0.5],  # centre point
     ], dtype=np.float32)
     frustums_2d = (images_sizes[:, None, :] * unit_coords[None, :, :]).astype(np.float32)
 
@@ -160,6 +158,10 @@ def plot_cameras_3d(
         # Automatic mode: depth is 3/4 the distance from each camera to the focal point
         distances_to_focal = xp.linalg.norm(tvecs_c2w - focal_point, axis=1)
         plot_depths = distances_to_focal * depth_ratio
+
+        # NOTE: unproject expects Z-depth, but here we calculated Euclidean distance.
+        # For simple frustum visualization, this slight distortion (curved end plane) is usually acceptable,
+        # but technically we should project onto optical axis here too if we wanted a flat plane Z=d.
     else:
         # Manual override: use the fixed depth for all cameras
         plot_depths = xp.array([depth] * C)
@@ -224,12 +226,12 @@ def plot_cameras_3d(
 
 
 def plot_points_3d(
-        points3d:       ArrayLike,
-        points_names:   Optional[Sequence[Any]] = None,
-        errors:         Optional[ArrayLike] = None,
-        color:          str = 'k',
-        label:          str = '3D points',
-        ax:             Optional[Axes3D] = None,
+        points3d: ArrayLike,
+        points_names: Optional[Sequence[Any]] = None,
+        errors: Optional[ArrayLike] = None,
+        color: str = 'k',
+        label: str = '3D points',
+        ax: Optional[Axes3D] = None,
 ) -> Axes3D:
     """ Matplotlib 3D plot for points, their names and the associated errors """
 
@@ -280,12 +282,12 @@ def plot_points_3d(
 
 
 def plot_object_3d(
-        object_points:  ArrayLike,
-        rvec_w:         ArrayLike,
-        tvec_w:         ArrayLike,
-        color:          str = 'blue',
-        label:          str = 'Object Ground Truth',
-        ax:             Optional[Axes3D] = None,
+        object_points: ArrayLike,
+        rvec_w: ArrayLike,
+        tvec_w: ArrayLike,
+        color: str = 'blue',
+        label: str = 'Object Ground Truth',
+        ax: Optional[Axes3D] = None,
 ) -> Axes3D:
     """
     Plots a 3D object (like a calibration pattern) given its local points and its pose in the world
@@ -328,18 +330,17 @@ def plot_object_3d(
 
 
 def plot_points2d_3d(
-        points2d:           ArrayLike,
-        rvecs_c2w:          ArrayLike,
-        tvecs_c2w:          ArrayLike,
-        camera_matrices:    ArrayLike,
-        dist_coeffs:        ArrayLike,
-        depth:              float = 10.0,
-        points_names:       Optional[Iterable[Any]] = None,
-        errors:             Optional[ArrayLike] = None,
-        colors:             Optional[str] = None,
-        ax:                 Optional[Axes3D] = None,
+        points2d: ArrayLike,
+        rvecs_c2w: ArrayLike,
+        tvecs_c2w: ArrayLike,
+        camera_matrices: ArrayLike,
+        dist_coeffs: ArrayLike,
+        depth: float = 10.0,
+        points_names: Optional[Iterable[Any]] = None,
+        errors: Optional[ArrayLike] = None,
+        colors: Optional[str] = None,
+        ax: Optional[Axes3D] = None,
 ) -> Axes3D:
-
     if points2d.ndim != 3 or rvecs_c2w.ndim != 2 or tvecs_c2w.ndim != 2 or camera_matrices.ndim != 3 or dist_coeffs.ndim != 2:
         raise ValueError('This function should be called for CxN 2D points!')
 
@@ -353,7 +354,8 @@ def plot_points2d_3d(
         colors = CUSTOM_COLORS
 
     E_c2w = compose_transform_matrix(rvecs_c2w, tvecs_c2w)
-    points2d_3d = unproject(points2d, xp.asarray([depth] * C), camera_matrices, E_c2w, dist_coeffs, distortion_model='full')
+    points2d_3d = unproject(points2d, xp.asarray([depth] * C), camera_matrices, E_c2w, dist_coeffs,
+                            distortion_model='full')
 
     for n in range(C):
 
@@ -489,8 +491,12 @@ def plot_triangulation_scene(
     # Vector from each camera center to each 3D point -> shape (C, N, 3)
     cam_to_point_vectors = xp.asarray(points3d)[None, :, :] - xp.asarray(tvecs_c2w)[:, None, :]
 
-    # Distance from each camera to each 3D point -> shape (C, N)
-    depths_to_3d_points = xp.linalg.norm(cam_to_point_vectors, axis=2)
+    # Project these vectors onto each camera's optical axis (Z-axis) to get correct Z-depth
+    Rs_c2w = rotation_matrix(rvecs_c2w)
+    optical_axes = Rs_c2w[:, :, 2]  # (C, 3)
+
+    # Dot product: (C, N, 3) . (C, 1, 3) -> (C, N)
+    depths_to_3d_points = xp.sum(cam_to_point_vectors * optical_axes[:, None, :], axis=2)
 
     # Scale these depths to plot the back-projected points slightly closer to the camera
     plot_depths = depths_to_3d_points * detections_depth

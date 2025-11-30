@@ -208,14 +208,21 @@ def project(
     valid_mask = (z > 1e-4).astype(xp.float32)  # small positive threshold for safety
 
     # Project invalid points to (0, 0), but their mask will be False
-    z_safe = xp.where(valid_mask, z, 1.0) # we do NOT use _eps here because 1e-4 is small enough to cause overflow in x/z
-    x_norm = Xc / z_safe
+    z_safe = xp.where(valid_mask, z, 1.0)  # we don't use _eps here because 1e-4 is small enough to cause overflow in x/z
+    x_norm = Xc[..., :2] / z_safe[..., None]
 
     # dist_coeffs alignment happens inside here based on x.ndim
     radial, tangential = distort(x_norm, D, distortion_model)
     points_distorted = x_norm * radial + tangential
 
-    return points_distorted, valid_mask
+    # Apply intrinsics
+    # f = [fx, fy], c = [cx, cy]
+    f = xp.stack([K[..., 0, 0], K[..., 1, 1]], axis=-1)
+    c = K[..., :2, 2]
+
+    image_points = points_distorted * f + c
+
+    return image_points, valid_mask
 
 
 def project_multiple_poses(
@@ -505,7 +512,7 @@ def reprojection_errors(
         num_visible_points = xp.sum(visibility_mask.astype(xp.float32))
     else:
         sq_diff_masked = sq_diff
-        num_visible_points = points2d_observed.size // 2 # last dimension is 2, so number of points is total size / 2
+        num_visible_points = points2d_observed.size // 2  # last dimension is 2, so number of points is total size / 2
 
     # Metric calculations
     # True RMS Error (of all 2*N coordinates)

@@ -133,7 +133,7 @@ if __name__ == "__main__":
         imsizes=(1440, 1080),
         frustums_depth=0.5,
         detections_depth=0.8,
-        trust_volume=volume
+        # trust_volume=volume
     )
 
     plt.suptitle(f"Calibration Scene (frame {frame_idx})")
