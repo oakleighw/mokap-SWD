@@ -5,8 +5,8 @@ import numpy as np
 from mokap.utils.geometry.backend import xp
 
 from typing import Tuple, Optional, Literal, Union, Sequence
-from mokap.utils.geometry.projective import project_points, reprojection_errors
-from mokap.utils.geometry.fitting import generate_ambiguous_pose
+from mokap.utils.geometry.projective import project, reprojection_errors
+from mokap.utils.geometry.fitting import flip_pose_180
 from mokap.utils.datatypes import ChessBoard, CharucoBoard, CalibrateCameraResult, DistortionModel
 
 logger = logging.getLogger(__name__)
@@ -110,15 +110,15 @@ def solve_pnp_robust(
                 cam_mat_xp = xp.asarray(cam_mat_np)
                 dist_xp = xp.asarray(dist_np)
 
-                rvec2_xp, tvec2_xp = generate_ambiguous_pose(rvec1_xp, tvec1_xp)
+                rvec2_xp, tvec2_xp = flip_pose_180(rvec1_xp, tvec1_xp)
 
                 if tvec2_xp[2] <= 0:
                     # The ambiguous pose is invalid, so the candidate is probably correct
                     best_rvec, best_tvec = rvec1, tvec1
                 else:
                     # if both are valid, compare their errors
-                    reproj1, _ = project_points(obj_pts_xp, rvec1_xp, tvec1_xp, cam_mat_xp, dist_xp)
-                    reproj2, _ = project_points(obj_pts_xp, rvec2_xp, tvec2_xp, cam_mat_xp, dist_xp)
+                    reproj1, _ = project(obj_pts_xp, rvec1_xp, tvec1_xp, cam_mat_xp, dist_xp)
+                    reproj2, _ = project(obj_pts_xp, rvec2_xp, tvec2_xp, cam_mat_xp, dist_xp)
 
                     errors1 = reprojection_errors(img_pts_xp, reproj1)
                     errors2 = reprojection_errors(img_pts_xp, reproj2)
@@ -158,7 +158,7 @@ def solve_pnp_robust(
     best_tvec = best_tvec.squeeze()
 
     if needs_error_recalc:
-        final_reproj, _ = project_points(obj_pts_np, best_rvec, best_tvec, cam_mat_np, dist_np)
+        final_reproj, _ = project(obj_pts_np, best_rvec, best_tvec, cam_mat_np, dist_np)
         final_errors = reprojection_errors(img_pts_np, final_reproj)
     else:
         # otherwise, the one we stored is the correct one

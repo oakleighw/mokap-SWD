@@ -15,12 +15,12 @@ from mokap.utils.datatypes import DetectionPayload
 from mokap.utils.geometry.projective import (project_to_multiple_cameras, reprojection_errors,
                                              project_multiple_to_multiple)
 
-from mokap.utils.geometry.fitting import (quaternion_average, filter_rt_samples, reliability_bounds_3d_iqr,
-                                          generate_ambiguous_pose)
+from mokap.utils.geometry.fitting import (quaternion_average, average_qtposes, compute_bounds,
+                                          flip_pose_180)
 
-from mokap.utils.geometry.transforms import (extrinsics_matrix, extmat_to_rtvecs,
-                                             axisangle_to_quaternion, quaternion_to_axisangle,
-                                             invert_extrinsics_matrix, invert_rtvecs, quaternions_angular_distance)
+from mokap.utils.geometry.transforms import (compose_transform_matrix, decompose_transform_matrix,
+                                             quaternion_from_vector, vector_from_quaternion,
+                                             invert_transform, invert_vectors, quaternion_distance)
 
 logger = logging.getLogger(__name__)
 
@@ -162,8 +162,8 @@ class MultiviewCalibrationTool:
 
         # Initial board pose estimation
         E_b2c_all = xp.stack([entry[1] for entry in entries])
-        E_c2w_known = extrinsics_matrix(self._rvecs_c2w[cam_indices[known_mask]],
-                                        self._tvecs_c2w[cam_indices[known_mask]])
+        E_c2w_known = compose_transform_matrix(self._rvecs_c2w[cam_indices[known_mask]],
+                                               self._tvecs_c2w[cam_indices[known_mask]])
         E_b2c_known = E_b2c_all[known_mask]
 
         # Initial vote for the board's pose based on currently known cameras
@@ -172,8 +172,8 @@ class MultiviewCalibrationTool:
         # Temporal disambiguation using a stable ref pose
         if len(self._board_pose_history) > 0:
 
-            history_r, history_t = extmat_to_rtvecs(xp.stack(list(self._board_pose_history)))
-            history_q = axisangle_to_quaternion(history_r)
+            history_r, history_t = decompose_transform_matrix(xp.stack(list(self._board_pose_history)))
+            history_q = quaternion_from_vector(history_r)
 
             # We average the rotation (via quaternions) and translation separately
             q_ref = quaternion_average(history_q)
@@ -181,23 +181,23 @@ class MultiviewCalibrationTool:
             # r_ref = quaternion_to_axisangle(q_ref)
 
             # Get the alternative PnP solutions (180-degree flip)
-            r_b2c_known, t_b2c_known = extmat_to_rtvecs(E_b2c_known)
-            r_b2c_alt, t_b2c_alt = generate_ambiguous_pose(r_b2c_known, t_b2c_known)
-            E_b2c_alt = extrinsics_matrix(r_b2c_alt, t_b2c_alt)
+            r_b2c_known, t_b2c_known = decompose_transform_matrix(E_b2c_known)
+            r_b2c_alt, t_b2c_alt = flip_pose_180(r_b2c_known, t_b2c_known)
+            E_b2c_alt = compose_transform_matrix(r_b2c_alt, t_b2c_alt)
 
             # Calculate world poses for both the original and the alternative PnP result
             E_b2w_votes_alt = E_c2w_known @ E_b2c_alt
 
             # For each vote determine which (original or alternative) is closer to the stable ref
-            r_votes, _ = extmat_to_rtvecs(E_b2w_votes)
-            q_votes = axisangle_to_quaternion(r_votes)
+            r_votes, _ = decompose_transform_matrix(E_b2w_votes)
+            q_votes = quaternion_from_vector(r_votes)
 
-            r_votes_alt, _ = extmat_to_rtvecs(E_b2w_votes_alt)
-            q_votes_alt = axisangle_to_quaternion(r_votes_alt)
+            r_votes_alt, _ = decompose_transform_matrix(E_b2w_votes_alt)
+            q_votes_alt = quaternion_from_vector(r_votes_alt)
 
             # Calculate angular distance to the reference for both sets of poses
-            dist_original = quaternions_angular_distance(q_votes, q_ref)
-            dist_alt = quaternions_angular_distance(q_votes_alt, q_ref)
+            dist_original = quaternion_distance(q_votes, q_ref)
+            dist_alt = quaternion_distance(q_votes_alt, q_ref)
 
             # Choose the best pose for each camera view
             use_alt_mask = dist_alt < dist_original
@@ -208,14 +208,14 @@ class MultiviewCalibrationTool:
                 logger.debug(f"[FLIP_CORRECTED] Corrected {num_corrected} PnP results using stable reference.")
 
         # Averaging and quality control
-        r_stack, t_stack = extmat_to_rtvecs(E_b2w_votes)
-        q_stack = axisangle_to_quaternion(r_stack)
+        r_stack, t_stack = decompose_transform_matrix(E_b2w_votes)
+        q_stack = quaternion_from_vector(r_stack)
         rt_stack = xp.concatenate([q_stack, t_stack], axis=1)
 
-        q_avg, t_avg, success = filter_rt_samples(
-            rt_stack=rt_stack,
-            ang_thresh=self._angular_thresh_rad,
-            trans_thresh=self._translational_thresh
+        q_avg, t_avg, success = average_qtposes(
+            qt_stack=rt_stack,
+            thresh_radians=self._angular_thresh_rad,
+            thresh_distance=self._translational_thresh
         )
 
         if not success:
@@ -225,17 +225,17 @@ class MultiviewCalibrationTool:
             return
 
         # Update state with the new good pose
-        E_b2w = extrinsics_matrix(quaternion_to_axisangle(q_avg), t_avg)
+        E_b2w = compose_transform_matrix(vector_from_quaternion(q_avg), t_avg)
         self._latest_board_pose_w = E_b2w
         self._board_pose_history.append(E_b2w)
 
-        E_c2b_all = invert_extrinsics_matrix(E_b2c_all)
+        E_c2b_all = invert_transform(E_b2c_all)
         E_c2w_new = E_b2w @ E_c2b_all
-        r_c2w_new, t_c2w_new = extmat_to_rtvecs(E_c2w_new)
+        r_c2w_new, t_c2w_new = decompose_transform_matrix(E_c2w_new)
 
         world_pts = (E_b2w @ self._board_pts_hom.T).T[:, :3]
 
-        r_w2c_new, t_w2c_new = invert_rtvecs(r_c2w_new, t_c2w_new)
+        r_w2c_new, t_w2c_new = invert_vectors(r_c2w_new, t_c2w_new)
         K_batch = self._cam_matrices[cam_indices]
         D_batch = self._dist_coeffs[cam_indices]
 
@@ -298,7 +298,7 @@ class MultiviewCalibrationTool:
         f = detection.frame
         self._last_frame[cam_idx] = f
 
-        E_b2c = extrinsics_matrix(xp.asarray(rvec), xp.asarray(tvec))
+        E_b2c = compose_transform_matrix(xp.asarray(rvec), xp.asarray(tvec))
         self._detection_buffer[cam_idx][f] = (E_b2c, detection.points2D, detection.pointsIDs)
 
         # The origin camera's extrinsics are fixed at identity, so its flag is always true
@@ -429,7 +429,7 @@ class MultiviewCalibrationTool:
 
                 # Initial guess for board poses (from online estimation)
                 r_board_w_list, t_board_w_list = [], []
-                E_c2w_all = extrinsics_matrix(self._rvecs_c2w, self._tvecs_c2w)
+                E_c2w_all = compose_transform_matrix(self._rvecs_c2w, self._tvecs_c2w)
 
                 for p_idx, entries in enumerate(current_samples):
 
@@ -440,14 +440,14 @@ class MultiviewCalibrationTool:
 
                     E_b2w_votes = E_c2w_in_frame @ E_b2c_in_frame
 
-                    r_stack, t_stack = extmat_to_rtvecs(E_b2w_votes)
-                    q_stack = axisangle_to_quaternion(r_stack)
+                    r_stack, t_stack = decompose_transform_matrix(E_b2w_votes)
+                    q_stack = quaternion_from_vector(r_stack)
 
                     # here we use the simple, lenient average for BA initialization
                     # (Because the spread of this cluster is a direct result of the accumulated errors
                     # during online camera pose estimates - which are unavoidable!!
                     # The hardcore filter used online would likely jusyt eliminate everyone here)
-                    r_board_w_list.append(quaternion_to_axisangle(quaternion_average(q_stack)))
+                    r_board_w_list.append(vector_from_quaternion(quaternion_average(q_stack)))
                     t_board_w_list.append(xp.median(t_stack, axis=0))
 
                 # Start with the online estimates
@@ -686,7 +686,7 @@ class MultiviewCalibrationTool:
         if self._refined:
 
             # calculate the 3D world coordinates of all point instances using the refined poses
-            E_b2w_all_opt = extrinsics_matrix(*self.refined_board_poses)
+            E_b2w_all_opt = compose_transform_matrix(*self.refined_board_poses)
             world_pts_all_instances = xp.einsum('pij,nj->pni', E_b2w_all_opt, self._board_pts_hom)[:, :, :3]
 
             # Reprojection and error calculation
@@ -695,7 +695,7 @@ class MultiviewCalibrationTool:
             observed_pts2d, visibility_mask = self.image_points
 
             # Invert camera-to-world poses to get world-to-camera poses for projection
-            r_w2c, t_w2c = invert_rtvecs(*self._refined_extrinsics)
+            r_w2c, t_w2c = invert_vectors(*self._refined_extrinsics)
 
             # Project all 3D points into all cameras
             reprojected_pts, valid_depth_mask = project_multiple_to_multiple(
@@ -712,7 +712,7 @@ class MultiviewCalibrationTool:
             all_errors = xp.where(effective_visibility, raw_errors, xp.nan)    # And mark non-observed points as nan
 
             # And compute the reliable bounding box using the world points and their errors
-            volume_of_trust = reliability_bounds_3d_iqr(
+            volume_of_trust = compute_bounds(
                 world_pts_all_instances,
                 all_errors,
                 error_threshold_px=threshold,

@@ -3,8 +3,8 @@ from jax import numpy as jnp
 import numpy as np
 import matplotlib.pyplot as plt
 
-from mokap.utils.geometry.transforms import invert_rtvecs, rodrigues, inverse_rodrigues
-from mokap.utils.geometry.projective import project_points, triangulate
+from mokap.utils.geometry.transforms import invert_vectors, rotation_matrix, rotation_vector
+from mokap.utils.geometry.projective import project, triangulate
 from mokap.utils.visualisation import plot_cameras_3d, plot_points_3d
 
 # Use CPU for this test to avoid any GPU memory issues with Matplotlib
@@ -55,7 +55,7 @@ def create_test_scene():
     tvecs_c2w = jnp.stack([tvec_c2w_1, tvec_c2w_2, tvec_c2w_3, tvec_c2w_4])
 
     # Most functions (project, triangulate) need world-to-camera (w2c) poses
-    rvecs_w2c, tvecs_w2c = invert_rtvecs(rvecs_c2w, tvecs_c2w)
+    rvecs_w2c, tvecs_w2c = invert_vectors(rvecs_c2w, tvecs_c2w)
 
     return {
         "points_3d_gt": points_3d_ground_truth, "Ks": camera_matrices, "Ds": dist_coeffs,
@@ -108,10 +108,10 @@ def perturb_cameras(
 
     # Compose the original rotation with the perturbation
     # R_new = R_perturb @ R_orig
-    R_orig = rodrigues(rvecs_c2w)
-    R_perturb = rodrigues(rvecs_perturb)
+    R_orig = rotation_matrix(rvecs_c2w)
+    R_perturb = rotation_matrix(rvecs_perturb)
     R_new = R_perturb @ R_orig
-    perturbed_rvecs = inverse_rodrigues(R_new)
+    perturbed_rvecs = rotation_vector(R_new)
 
     # Translation Perturbation
     # Add a random vector where each component is in [-max_translation, max_translation]
@@ -161,11 +161,11 @@ def main():
 
         # We also must re-calculate the world-to-camera (w2c) poses
         # as they are derived from the c2w poses
-        scene['rvecs_w2c'], scene['tvecs_w2c'] = invert_rtvecs(perturbed_r, perturbed_t)
+        scene['rvecs_w2c'], scene['tvecs_w2c'] = invert_vectors(perturbed_r, perturbed_t)
         print("------------------------\n")
 
     # Project the 3D points into each camera to get the 2D observations
-    project_vmapped = jax.vmap(project_points, in_axes=(None, 0, 0, 0, 0))
+    project_vmapped = jax.vmap(project, in_axes=(None, 0, 0, 0, 0))
     points_2d_observed, validity_mask = project_vmapped(
         scene['points_3d_gt'],
         scene['rvecs_w2c'],
@@ -190,8 +190,8 @@ def main():
     print("\nAttempting to triangulate 3D points from 2D observations...")
     points_3d_triangulated = triangulate(
         points2d=points_2d_observed,
-        camera_matrices=scene['Ks'],
-        dist_coeffs=scene['Ds'],
+        K=scene['Ks'],
+        D=scene['Ds'],
         rvecs_w2c=scene['rvecs_w2c'],
         tvecs_w2c=scene['tvecs_w2c'],
         weights=None,  # Let the function infer from non-NaN values

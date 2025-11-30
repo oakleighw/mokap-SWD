@@ -15,7 +15,7 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 
 from mokap.utils import fileio
-from mokap.utils.geometry.fitting import find_rigid_transform
+from mokap.utils.geometry.fitting import align_rigid
 
 from mokap.reconstruction.config import AssemblerConfig, TrackerConfig, AnatomyConfig
 from mokap.reconstruction.datatypes import Bone, AssembledSkeleton, CandidateSkeleton, SoupData
@@ -152,7 +152,7 @@ class Tracklet:
         points_A = np.array([prev_kps[name] for name in common_names])
         points_B = np.array([curr_kps[name] for name in common_names])
 
-        R_mat, t_vec = find_rigid_transform(points_A, points_B)
+        R_mat, t_vec = align_rigid(points_A, points_B)
         inferred_pos = np.array(R_mat) @ prev_kps[self.central_kp] + np.array(t_vec)
 
         completed_skeleton = AssembledSkeleton(

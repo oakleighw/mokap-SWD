@@ -17,7 +17,7 @@ from mokap.utils.datatypes import DistortionModel
 # from alive_progress import alive_bar
 
 from mokap.utils.geometry.projective import project_object_views_batched, project_multiple_to_multiple
-from mokap.utils.geometry.transforms import invert_rtvecs
+from mokap.utils.geometry.transforms import invert_vectors
 
 DIST_MODEL_MAP = {'none': 0, 'simple': 4, 'standard': 5, 'full': 8, 'rational': 8}
 
@@ -603,7 +603,7 @@ def cost_function(
 
     Ks, Ds, cam_r, cam_t, object_points, poses_r, poses_t = _unpack_params(params, fixed_params, spec)
     all_residuals = []
-    r_w2c, t_w2c = invert_rtvecs(cam_r, cam_t)
+    r_w2c, t_w2c = invert_vectors(cam_r, cam_t)
 
     cfg = spec['config']
     C, P, N = cfg['nb_cams'], cfg['nb_frames'], cfg['nb_points']

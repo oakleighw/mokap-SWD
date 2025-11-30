@@ -1,11 +1,14 @@
 from functools import partial
-from typing import Tuple, Dict
-from .backend import USE_JAX, xp, jit, lax, vmap, _tiny
-from .transforms import quaternions_angular_distance, rodrigues, inverse_rodrigues
+from typing import Tuple, Dict, Optional
+from .backend import USE_JAX, xp, jit, lax, vmap, _tiny, align_batch_dims
+from .transforms import quaternion_distance, rotation_matrix, rotation_vector, homogenize
 
 
 @jit
-def weighted_median(data: xp.ndarray, weights: xp.ndarray) -> xp.ndarray:
+def weighted_median(
+        data: xp.ndarray,
+        weights: xp.ndarray
+) -> xp.ndarray:
     """
     Computes the weighted median of data.
     Works for both continuous weights and binary masks (0/1)
@@ -18,26 +21,36 @@ def weighted_median(data: xp.ndarray, weights: xp.ndarray) -> xp.ndarray:
         The weighted median value
     """
 
-    sort_idx = xp.argsort(data)
-    sorted_data = data[sort_idx]
-    sorted_weights = weights[sort_idx]
+    # Sort data and weights based on data
+    sort_idx = xp.argsort(data, axis=-1)
+    sorted_data = xp.take_along_axis(data, sort_idx, axis=-1)
+    sorted_weights = xp.take_along_axis(weights, sort_idx, axis=-1)
 
-    cumsum = xp.cumsum(sorted_weights)
-    total_weight = cumsum[-1]
+    # Compute cumulative weights
+    cumsum = xp.cumsum(sorted_weights, axis=-1)
 
-    # We want the first index where cumulative weight >= 0.5 * total
-    median_idx = xp.searchsorted(cumsum, 0.5 * total_weight)
+    # Handle total weight safely (keepdims to broadcast later)
+    total_weight = xp.take(cumsum, xp.array([-1]), axis=-1) # take last element of cumsum
+    target = 0.5 * total_weight
 
-    # Clip to ensure valid index (handles empty/zero-weight cases)
-    median_idx = xp.clip(median_idx, 0, data.shape[0] - 1)
+    # Find insertion point
+    # Already sorted, so we can use a comparison mask
 
-    return sorted_data[median_idx]
+    # Find first index where cumsum >= target
+    condition = cumsum >= target
+    median_idx = xp.argmax(condition, axis=-1)  # index of first True
+
+    # Expand dims and take_along_axis
+    median_idx_expanded = median_idx[..., None]
+    result = xp.take_along_axis(sorted_data, median_idx_expanded, axis=-1)
+
+    return result.squeeze(-1)
 
 
 @jit
-def find_rigid_transform(
-        points_A: xp.ndarray,
-        points_B: xp.ndarray
+def align_rigid(
+        points3d_A: xp.ndarray,
+        points3d_B: xp.ndarray
 ) -> Tuple[xp.ndarray, xp.ndarray]:
     """
     Estimates the rigid transformation (rotation R, translation t) between two
@@ -45,8 +58,8 @@ def find_rigid_transform(
     Finds T such that: B ~ T(A) = R @ A + t
 
     Args:
-        points_A: Source points (..., N, 3)
-        points_B: Destination points (..., N, 3)
+        points3d_A: Source points (..., N, 3)
+        points3d_B: Destination points (..., N, 3)
 
     Returns:
         R: Rotation matrix (..., 3, 3)
@@ -54,12 +67,12 @@ def find_rigid_transform(
     """
 
     # Compute centroids (N dim)
-    centroid_A = xp.mean(points_A, axis=-2, keepdims=True)
-    centroid_B = xp.mean(points_B, axis=-2, keepdims=True)
+    centroid_A = xp.mean(points3d_A, axis=-2, keepdims=True)
+    centroid_B = xp.mean(points3d_B, axis=-2, keepdims=True)
 
     # Center the points
-    A_centered = points_A - centroid_A
-    B_centered = points_B - centroid_B
+    A_centered = points3d_A - centroid_A
+    B_centered = points3d_B - centroid_B
 
     # Compute Covariance Matrix H
     # swap axes to perform the transpose of A_centered: (..., 3, N) @ (..., N, 3) -> (..., 3, 3)
@@ -98,17 +111,17 @@ def find_rigid_transform(
 
 
 @jit
-def find_affine_transform(
-        points_A: xp.ndarray,
-        points_B: xp.ndarray
+def align_affine(
+        points3d_A: xp.ndarray,
+        points3d_B: xp.ndarray
 ) -> Tuple[xp.ndarray, xp.ndarray]:
     """
     Estimates the affine transformation (A, t) between two sets of corresponding 3D points.
     Finds T such that: B ~ T(A) = A @ A.T + t. Uses linear least squares.
 
     Args:
-        points_A: Source points (..., M, 3)
-        points_B: Destination points (..., M, 3)
+        points3d_A: Source points (..., M, 3)
+        points3d_B: Destination points (..., M, 3)
 
     Returns:
         A_mat: The affine transformation matrix (..., 3, 3)
@@ -116,14 +129,13 @@ def find_affine_transform(
     """
 
     # Construct Design Matrix X: [x, y, z, 1]
-    ones = xp.ones(points_A.shape[:-1] + (1,), dtype=points_A.dtype)
-    X = xp.concatenate([points_A, ones], axis=-1)  # (..., M, 4)
+    X = homogenize(points3d_A)  # (..., M, 4)
 
     # Solve T = (X^T X)^-1 X^T B
     XT = xp.swapaxes(X, -1, -2)  # (..., 4, M)
 
     XTX = xp.matmul(XT, X)
-    XTB = xp.matmul(XT, points_B)
+    XTB = xp.matmul(XT, points3d_B)
 
     # Solve (..., 4, 4) * T = (..., 4, 3)
     eye_reg = xp.eye(4) * 1e-6  # small regularization to diagonal for stability
@@ -141,7 +153,7 @@ def find_affine_transform(
 
 
 @jit
-def interpolate3d(
+def fill_missing_points(
         points3d: xp.ndarray,
         visibility_mask: xp.ndarray,
         points3d_theoretical: xp.ndarray
@@ -163,8 +175,7 @@ def interpolate3d(
     mask = visibility_mask.astype(xp.float32)
 
     # Design matrix [X_th | 1]
-    ones = xp.ones((N, 1), dtype=points3d.dtype)
-    A = xp.concatenate([points3d_theoretical, ones], axis=1)  # (N, 4)
+    A = homogenize(points3d_theoretical)  # (N, 4)
 
     # We want to solve A * T = Y, but weighted by mask
     # W is diagonal of mask
@@ -192,63 +203,75 @@ def interpolate3d(
     return xp.where(mask_col.astype(bool), points3d, filled_all)
 
 
-@jit
-def huber_weight(residual_norm: xp.ndarray, delta: float = 1.0) -> xp.ndarray:
-    """
-    Compute Huber weight for each ||error||
-
-        w = 1                   if ||error|| <= delta
-        w = delta / ||error||   if ||error|| > delta
-    """
-    return xp.where(residual_norm <= delta, 1.0, delta / (residual_norm + 1e-12))
-
-
-@jit
+@partial(jit, static_argnames=['iters', 'delta'])
 def translation_average(
-        t_samples: xp.ndarray,  # (M, 3)
-        num_iters: int = 3,
+        tvec_stack: xp.ndarray,
+        iters: int = 3,
         delta: float = 1.0
 ) -> xp.ndarray:
     """
-    Computes Huber-weighted mean of translations using IRLS.
+    Computes the robust average of translation vectors using Iteratively Reweighted Least Squares (IRLS).
+    Uses Huber weights to suppress outliers.
+
+    Args:
+        tvec_stack: Input translation vectors (M, 3)
+        iters: Number of IRLS iterations
+        delta: Huber loss threshold
+
+    Returns:
+        The robustly averaged translation vector (3,)
     """
-    M = t_samples.shape[0]
+
+    M = tvec_stack.shape[0]
 
     # Handle empty input safely
     if M == 0:
-        return xp.zeros((3,), dtype=t_samples.dtype)
+        return xp.zeros((3,), dtype=tvec_stack.dtype)
 
     # Initial guess: Median
-    t0 = xp.median(t_samples, axis=0)
+    t0 = xp.median(tvec_stack, axis=0)
 
     def body_fn(t_curr):
-        res = t_samples - t_curr  # (M, 3)
+        res = tvec_stack - t_curr  # (M, 3)
         norms = xp.linalg.norm(res, axis=1)  # (M,)
-        w = huber_weight(norms, delta)  # (M,)
+
+        # Huber weight
+        w = xp.where(norms <= delta, 1.0, delta / (norms + 1e-12))  # (M,)
 
         sum_w = xp.sum(w)
         # Normalise weights safely
         w_norm = w / (sum_w + 1e-12)
 
-        t_next = xp.sum(w_norm[:, None] * t_samples, axis=0)
+        t_next = xp.sum(w_norm[:, None] * tvec_stack, axis=0)
         return t_next
 
     # Using the shim for the loop
     def loop_body(i, t_val):
         return body_fn(t_val)
 
-    t_final = lax.fori_loop(0, num_iters, loop_body, t0)
+    t_final = lax.fori_loop(0, iters, loop_body, t0)
     return t_final
 
 
 @jit
-def quaternion_average(quats: xp.ndarray, weights: xp.ndarray = None) -> xp.ndarray:
+def quaternion_average(
+        q_stack: xp.ndarray,
+        weights: Optional[xp.ndarray] = None
+) -> xp.ndarray:
     """
-    Averages quaternions using Eigen-decomposition (Markley's method).
-    Handles q = -q ambiguity.
+    Computes the weighted average of quaternions using Markley's Eigen-decomposition method.
+    Robustly handles the antipodal ambiguity (q == -q).
+
+    Args:
+        q_stack: Input quaternions (N, 4)
+        weights: Optional weights for each quaternion (N,). Defaults to uniform.
+
+    Returns:
+        The averaged unit quaternion (4,)
     """
+
     if weights is None:
-        weights = xp.ones(quats.shape[0], dtype=quats.dtype)
+        weights = xp.ones(q_stack.shape[0], dtype=q_stack.dtype)
 
     # Normalise weights
     weights = weights / (xp.sum(weights) + 1e-8)
@@ -256,15 +279,15 @@ def quaternion_average(quats: xp.ndarray, weights: xp.ndarray = None) -> xp.ndar
     # Align quaternions to handle q = -q ambiguity
     # Pick the one with largest weight as reference
     idx_ref = xp.argmax(weights)
-    q_ref = quats[idx_ref]
+    q_ref = q_stack[idx_ref]
 
     # Dot product with reference
-    dots = xp.sum(q_ref * quats, axis=-1)
+    dots = xp.sum(q_ref * q_stack, axis=-1)
     flip = xp.sign(dots)
     # if dot is 0, sign is 0, which destroys data, so default to 1
     flip = xp.where(flip == 0, 1.0, flip)
 
-    quats_aligned = quats * flip[:, None]
+    quats_aligned = q_stack * flip[:, None]
 
     # Build M = sum(w_i * q_i * q_i.T)
     # Weighted sum over N
@@ -284,22 +307,35 @@ def quaternion_average(quats: xp.ndarray, weights: xp.ndarray = None) -> xp.ndar
     return avg_quat * s
 
 
-def filter_rt_samples(
-        rt_stack: xp.ndarray,  # (N, 7) [quat, trans]
-        ang_thresh: float = xp.pi / 6.0,
-        trans_thresh: float = 1.0,
-        num_iters: int = 3
+@partial(jit, static_argnames=['thresh_radians', 'thresh_distance', 'iters'])
+def average_qtposes(
+        qt_stack: xp.ndarray,
+        thresh_radians: float = xp.pi / 6.0,
+        thresh_distance: float = 1.0,
+        iters: int = 3
 ) -> Tuple[xp.ndarray, xp.ndarray, bool]:
     """
-    Robustly averages poses (quaternion, translation) using IRLS and outlier rejection.
+    Robustly averages a stack of pose hypotheses (quaternions and translations).
+    Filters outliers based on angular and Euclidean distance from the current estimate.
+
+    Args:
+        qt_stack: Stack of poses (N, 7), where each row is [qx, qy, qz, qw, tx, ty, tz]
+        thresh_radians: Max angular distance (radians) for a sample to be considered an inlier
+        thresh_distance: Max Euclidean distance for a sample to be considered an inlier
+        iters: Number of IRLS iterations
+
+    Returns:
+        q_final: Robust average quaternion (4,)
+        t_final: Robust average translation (3,)
+        valid: Boolean indicating if enough inliers were found to form a valid estimate
     """
 
     # Clean data
-    finite_mask = xp.all(xp.isfinite(rt_stack), axis=1)
+    finite_mask = xp.all(xp.isfinite(qt_stack), axis=1)
     weights_init = finite_mask.astype(xp.float32)
 
-    quats = rt_stack[:, :4]
-    trans = rt_stack[:, 4:]
+    quats = qt_stack[:, :4]
+    trans = qt_stack[:, 4:]
 
     # Check if we have any valid data
     count = xp.sum(weights_init)
@@ -332,12 +368,12 @@ def filter_rt_samples(
 
         # Calculate errors
         q_c_broad = xp.broadcast_to(q_c, quats.shape)
-        ang_errs = quaternions_angular_distance(quats, q_c_broad)
+        ang_errs = quaternion_distance(quats, q_c_broad)
 
         trans_errs = xp.linalg.norm(trans - t_c, axis=1)
 
         # Determine inliers
-        is_inlier = (ang_errs <= ang_thresh) & (trans_errs <= trans_thresh)
+        is_inlier = (ang_errs <= thresh_radians) & (trans_errs <= thresh_distance)
         new_weights = is_inlier.astype(xp.float32) * weights_init
 
         total_w = xp.sum(new_weights)
@@ -362,22 +398,31 @@ def filter_rt_samples(
     # Initial state
     init_state = (q_curr, t_curr, count > 0)
 
-    q_final, t_final, valid = lax.fori_loop(0, num_iters, loop_wrapper, init_state)
+    q_final, t_final, valid = lax.fori_loop(0, iters, loop_wrapper, init_state)
 
     return q_final, t_final, valid
 
 
 @jit
-def rays_intersection_3d(
-        ray_origins: xp.ndarray,  # (C, 3)
-        ray_directions: xp.ndarray  # (C, 3)
+def intersect_rays(
+        ray_origins: xp.ndarray,
+        ray_directions: xp.ndarray
 ) -> xp.ndarray:
     """
-    Finds the 3D point that minimizes the sum of squared distances to a set of rays.
+    Finds the single 3D point that minimizes the sum of squared distances to a set of rays.
+    Mathematically equivalent to the least-squares intersection.
+
+    Args:
+        ray_origins: Origins of the rays (C, 3)
+        ray_directions: Normalized directions of the rays (C, 3)
+
+    Returns:
+        The optimal intersection point (3,)
     """
 
     # Per-ray projection matrix onto the plane orthogonal to the direction
     I = xp.eye(3)
+
     # Projections: I - v v.T
     P_i = I - xp.einsum('ci,cj->cij', ray_directions, ray_directions)
 
@@ -395,9 +440,9 @@ def rays_intersection_3d(
 
 
 @jit
-def ray_intersection_AABB(
-        ray_origin: xp.ndarray,
-        ray_dir: xp.ndarray,
+def intersect_aabb(
+        ray_origins: xp.ndarray,
+        ray_directions: xp.ndarray,
         aabb_min: xp.ndarray,
         aabb_max: xp.ndarray
 ) -> Tuple[xp.ndarray, xp.ndarray, xp.ndarray]:
@@ -405,8 +450,8 @@ def ray_intersection_AABB(
     Slab method for AABB intersection. Supports batched rays.
 
     Args:
-        ray_origin: Ray origins (..., 3)
-        ray_dir: Ray directions (..., 3)
+        ray_origins: Ray origins (..., 3)
+        ray_directions: Ray directions (..., 3)
         aabb_min: Box min corner (3,)
         aabb_max: Box max corner (3,)
 
@@ -416,13 +461,13 @@ def ray_intersection_AABB(
         has_intersection: Boolean mask
     """
     # Safe inverse direction
-    is_zero = xp.abs(ray_dir) < _tiny
-    safe_dir = xp.where(is_zero, _tiny, ray_dir)
+    is_zero = xp.abs(ray_directions) < _tiny
+    safe_dir = xp.where(is_zero, _tiny, ray_directions)
     dir_inv = 1.0 / safe_dir
 
     # Broadcast AABB to rays
-    t1 = (aabb_min - ray_origin) * dir_inv
-    t2 = (aabb_max - ray_origin) * dir_inv
+    t1 = (aabb_min - ray_origins) * dir_inv
+    t2 = (aabb_max - ray_origins) * dir_inv
 
     # Find entering and exiting planes
     t_min = xp.max(xp.minimum(t1, t2), axis=-1)
@@ -431,8 +476,8 @@ def ray_intersection_AABB(
     has_intersection = t_min < t_max
 
     # Compute points
-    p_near = ray_origin + t_min[..., None] * ray_dir
-    p_far = ray_origin + t_max[..., None] * ray_dir
+    p_near = ray_origins + t_min[..., None] * ray_directions
+    p_far = ray_origins + t_max[..., None] * ray_directions
 
     # Masking
     nan_v = xp.full_like(p_near, xp.nan)
@@ -444,127 +489,95 @@ def ray_intersection_AABB(
     return p_near, p_far, has_intersection
 
 
-@partial(jit, static_argnames=['error_threshold_px', 'percentile'])
-def reliability_bounds_3d(
-        world_points: xp.ndarray,
+@partial(jit, static_argnames=['method'])
+def compute_bounds(
+        points3d: xp.ndarray,
         all_errors: xp.ndarray,
         error_threshold_px: float = 1.0,
-        percentile: float = 1.0
-) -> Dict[str, Tuple[float, float]]:
-    """
-    Computes a bounding box in world coordinates from a cloud of 3D points.
-    Reliability is determined by the mean reprojection error.
-
-    Args:
-        world_points: Cloud of 3D points (P, N, 3)
-        all_errors: Error values for each point (C, P, N)
-        error_threshold_px: Max mean error for a point to be considered reliable
-        percentile: Percentile to clip outliers when computing bounds
-
-    Returns:
-        Dict with 'x', 'y', 'z' keys containing (min, max) bounds
-    """
-
-    # Mean error per point instance
-    mean_error = xp.nanmean(all_errors, axis=0)  # (P, N)
-
-    # Mask
-    reliable_mask = mean_error < error_threshold_px
-    count = xp.sum(reliable_mask)
-
-    # Filter points (set unreliable to NaN)
-    pts_clean = xp.where(reliable_mask[..., None], world_points, xp.nan)
-
-    # Compute bounds (percentiles ignore NaNs)
-    q_low = percentile
-    q_high = 100.0 - percentile
-
-    x_min = xp.nanpercentile(pts_clean[..., 0], q_low)
-    x_max = xp.nanpercentile(pts_clean[..., 0], q_high)
-    y_min = xp.nanpercentile(pts_clean[..., 1], q_low)
-    y_max = xp.nanpercentile(pts_clean[..., 1], q_high)
-    z_min = xp.nanpercentile(pts_clean[..., 2], q_low)
-    z_max = xp.nanpercentile(pts_clean[..., 2], q_high)
-
-    # Check reliability (returns NaN if count too low)
-    is_valid = count >= 3
-
-    def gate(val):
-        return xp.where(is_valid, val, xp.nan)
-
-    return {
-        'x': (gate(x_min), gate(x_max)),
-        'y': (gate(y_min), gate(y_max)),
-        'z': (gate(z_min), gate(z_max))
-    }
-
-
-@partial(jit, static_argnames=['error_threshold_px', 'iqr_factor'])
-def reliability_bounds_3d_iqr(
-        world_points: xp.ndarray,
-        all_errors: xp.ndarray,
-        error_threshold_px: float = 1.0,
+        method: str = 'iqr',  # 'iqr' or 'percentile'
+        percentile: float = 1.0,
         iqr_factor: float = 1.5
 ) -> Dict[str, Tuple[float, float]]:
     """
-    Computes a robust bounding box using the Interquartile Range method.
+    Computes a bounding box in world coordinates from a cloud of 3D points.
+    Uses Interquartile Range method. Reliability is determined by the mean reprojection error.
 
     Args:
-        world_points: Cloud of 3D points (P, N, 3)
+        points3d: Cloud of 3D points (P, N, 3)
         all_errors: Error values (C, P, N)
         error_threshold_px: Max mean error
+        method: Which method to use, IQR or percentile
+        percentile: Percentile to clip outliers when computing bounds
         iqr_factor: Multiplier for IQR (default 1.5)
 
     Returns:
         Dict with 'x', 'y', 'z' bounds
     """
 
-    # Average errors across observations (cameras) for each point instance
-    mean_error = xp.nanmean(all_errors, axis=0)
-
+    # Reliability masking
+    mean_error = xp.nanmean(all_errors, axis=0)  # (P, N) or (N,)
     reliable_mask = mean_error < error_threshold_px
-    count = xp.sum(reliable_mask)
 
-    pts_clean = xp.where(reliable_mask[..., None], world_points, xp.nan)
-
-    # Quartiles
-    qs = xp.array([25.0, 75.0])
-
-    qx = xp.nanpercentile(pts_clean[..., 0], qs)
-    qy = xp.nanpercentile(pts_clean[..., 1], qs)
-    qz = xp.nanpercentile(pts_clean[..., 2], qs)
-
-    iqr_x = qx[1] - qx[0]
-    iqr_y = qy[1] - qy[0]
-    iqr_z = qz[1] - qz[0]
-
-    x_min, x_max = qx[0] - iqr_factor * iqr_x, qx[1] + iqr_factor * iqr_x
-    y_min, y_max = qy[0] - iqr_factor * iqr_y, qy[1] + iqr_factor * iqr_y
-    z_min, z_max = qz[0] - iqr_factor * iqr_z, qz[1] + iqr_factor * iqr_z
-
-    # need at least 4 points for quartiles to be meaningful
+    # Check if enough points (threshold of 4 for IQR)
+    count = xp.sum(reliable_mask.astype(xp.float32))
     is_valid = count >= 4
 
-    def gate(val):
-        return xp.where(is_valid, val, xp.nan)
+    # Filter points
+    # Ensure proper broadcasting if points3d has temporal dim but mask does not
+    pts_clean = xp.where(reliable_mask[..., None], points3d, xp.nan)
+
+    # Compute bounds
+    if method.lower() == 'percentile':
+        q_low, q_high = percentile, 100.0 - percentile
+        bounds = xp.nanpercentile(pts_clean, xp.array([q_low, q_high]), axis=(0, 1))
+        # Result is (2, 3) -> [min_x, min_y, min_z], [max_x, max_y, max_z]
+        mins, maxs = bounds[0], bounds[1]
+
+    elif method.lower() == 'iqr':
+        # Compute 25/75 quartiles
+        qs = xp.nanpercentile(pts_clean, xp.array([25.0, 75.0]), axis=(0, 1))  # (2, 3)
+        q25, q75 = qs[0], qs[1]
+        iqr = q75 - q25
+
+        mins = q25 - iqr_factor * iqr
+        maxs = q75 + iqr_factor * iqr
+
+    else:
+        # Fallback to simple min/max
+        mins = xp.nanmin(pts_clean, axis=(0, 1))
+        maxs = xp.nanmax(pts_clean, axis=(0, 1))
+
+    # Gate output
+    def get_dim(idx):
+        return (xp.where(is_valid, mins[idx], xp.nan),
+                xp.where(is_valid, maxs[idx], xp.nan))
 
     return {
-        'x': (gate(x_min), gate(x_max)),
-        'y': (gate(y_min), gate(y_max)),
-        'z': (gate(z_min), gate(z_max))
+        'x': get_dim(0),
+        'y': get_dim(1),
+        'z': get_dim(2)
     }
 
 
 @jit
-def generate_ambiguous_pose(
+def flip_pose_180(
         rvec_o2c: xp.ndarray,
         tvec_o2c: xp.ndarray
 ) -> Tuple[xp.ndarray, xp.ndarray]:
     """
-    Generates the second, ambiguous solution for a planar PnP problem.
-    Corresponds to a 180-degree rotation around the object's X-axis.
+    Generates the ambiguous "flipped" pose solution often found in planar PnP problems.
+    This corresponds to a 180-degree rotation of the object around its own X-axis.
+
+    Args:
+        rvec_o2c: Original rotation vector (..., 3)
+        tvec_o2c: Original translation vector (..., 3)
+
+    Returns:
+        rvec_alt: Flipped rotation vector (..., 3)
+        tvec_alt: Flipped translation vector (..., 3) (usually identical to input)
     """
-    R_b2c = rodrigues(rvec_o2c)  # (..., 3, 3)
+
+    R_b2c = rotation_matrix(rvec_o2c)  # (..., 3, 3)
 
     #                 [1, 0, 0]
     # Flip matrix is  [0,-1, 0]
@@ -574,7 +587,7 @@ def generate_ambiguous_pose(
 
     # R_alt = R_b2c @ R_flip
     R_alt = xp.matmul(R_b2c, R_flip)
-    rvec_alt = inverse_rodrigues(R_alt)
+    rvec_alt = rotation_vector(R_alt)
 
     tvec_alt = tvec_o2c
 
@@ -582,24 +595,70 @@ def generate_ambiguous_pose(
 
 
 @jit
-def point_to_segment_distance(
-        p: xp.ndarray,
-        a: xp.ndarray,
-        b: xp.ndarray
+def segment_distance(
+        points3d: xp.ndarray,
+        segments: xp.ndarray,
 ) -> xp.ndarray:
     """
-    Computes distance from point p to segment [a, b].
+    Computes the shortest Euclidean distance from point(s) P to line segment(s) AB.
+
+    Args:
+        points3d: Point(s) to query (..., 3)
+        segments: Start and end point(s) of the segment(s) (..., 2, 3)
+
+    Returns:
+        Distance(s) (..., )
     """
+
+    # Determine target batch rank
+    pts_batch_rank = points3d.ndim - 1  # points data_dims=1
+    seg_batch_rank = segments.ndim - 2  # segments data_dims=2 (start/end + coords)
+
+    target_rank = max(pts_batch_rank, seg_batch_rank)
+
+    # Align ranks (inserts singleton dims at the start of batch dims)
+    points3d = align_batch_dims(target_rank, points3d, data_dims=1)
+    segments = align_batch_dims(target_rank, segments, data_dims=2)
+
+    a = segments[..., 0, :]
+    b = segments[..., 1, :]
+
     ab = b - a
-    ap = p - a
+    ap = points3d - a
 
-    # dot product (..., 3) . (..., 3) -> (...)
-    num = xp.sum(ap * ab, axis=-1)
-    den = xp.sum(ab * ab, axis=-1) + 1e-9
+    dot_ap_ab = xp.sum(ap * ab, axis=-1)
+    dot_ab_ab = xp.sum(ab * ab, axis=-1)
 
-    t = num / den
-    t_clamped = xp.clip(t, 0.0, 1.0)
+    t = dot_ap_ab / (dot_ab_ab + _tiny)
+    t = xp.clip(t, 0.0, 1.0)
 
-    closest = a + t_clamped[..., None] * ab
+    closest = a + t[..., None] * ab
 
-    return xp.linalg.norm(p - closest, axis=-1)
+    return xp.linalg.norm(points3d - closest, axis=-1)
+
+
+@jit
+def fit_plane(
+        points3d: xp.ndarray
+) -> Tuple[xp.ndarray, xp.ndarray]:
+    """
+    Fits a plane to a set of 3D points using SVD.
+    Equation: normal . (x - centroid) = 0
+
+    Args:
+        points3d: Input 3D points (..., N, 3)
+
+    Returns:
+        centroid: (..., 3)
+        normal: Unit normal vector (..., 3)
+    """
+
+    centroid = xp.mean(points3d, axis=-2)
+    centered = points3d - centroid[..., None, :]
+
+    # last row of Vh is the smallest singular value
+    _, _, Vh = xp.linalg.svd(centered)
+
+    normal = Vh[..., -1, :]
+
+    return centroid, normal

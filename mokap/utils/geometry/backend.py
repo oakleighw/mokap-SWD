@@ -126,3 +126,31 @@ else:
         return wrapper
 
     print(f'Mokap math backend: NumPy')
+
+
+def align_batch_dims(target_ndim: int, arr: xp.ndarray, data_dims: int = 1) -> xp.ndarray:
+    """
+    Helper to ensure 'arr' broadcasts correctly against a data array with 'target_ndim' batch dimensions.
+    It inserts singleton dimensions between the array's batch dims and its data dims.
+
+    Args:
+        target_ndim: The number of batch dimensions in the reference data (e.g. points)
+        arr: The parameter array (e.g. K, D, rvec)
+        data_dims: How many dimensions at the end of 'arr' are data (1 for vec, 2 for matrix)
+    """
+    arr = xp.asarray(arr)
+    arr_batch_ndim = arr.ndim - data_dims
+    pad_needed = target_ndim - arr_batch_ndim
+    if pad_needed > 0:
+        # Handle data_dims=0 case where slicing with [:-0] returns empty tuple
+        if data_dims == 0:
+            # For scalars/1D arrays, we append 1s at the end
+            # e.g. (5,) -> (5, 1) to match (5, 6)
+            new_shape = arr.shape + (1,) * pad_needed
+        else:
+            # Insert 1s before the data dimensions
+            # e.g. (5, 3, 3) -> (5, 1, 3, 3) to match (5, 6, ...)
+            new_shape = arr.shape[:-data_dims] + (1,) * pad_needed + arr.shape[-data_dims:]
+
+        return arr.reshape(new_shape)
+    return arr

@@ -13,7 +13,7 @@ from alive_progress import alive_bar
 from mokap.reconstruction.config import MergerConfig, LinkerConfig
 from mokap.reconstruction.datatypes import TrackletData
 
-from mokap.utils.geometry.fitting import find_rigid_transform
+from mokap.utils.geometry.fitting import align_rigid
 
 
 logger = logging.getLogger(__name__)
@@ -687,7 +687,7 @@ class TrackletLinker:
         pts_a_common = xp.array([kps_a[name] for name in common_kps])
         pts_b_common = xp.array([kps_b[name] for name in common_kps])
 
-        R, t = find_rigid_transform(pts_a_common, pts_b_common)
+        R, t = align_rigid(pts_a_common, pts_b_common)
         aligned_pts_a = (R @ pts_a_common.T).T + t
         shape_dist_sq = np.mean(np.sum((aligned_pts_a - pts_b_common) ** 2, axis=1))
         shape_cost = np.sqrt(shape_dist_sq)

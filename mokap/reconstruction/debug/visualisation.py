@@ -12,11 +12,11 @@ from typing import List, Tuple
 from mokap.reconstruction.datatypes import SoupData
 
 from mokap.utils.geometry.projective import (
-    undistort_points, back_projection, project_points, project_to_multiple_cameras
+    undistort, unproject, project, project_to_multiple_cameras
 )
 
-from mokap.utils.geometry.transforms import extrinsics_matrix, extmat_to_rtvecs
-from mokap.utils.geometry.fitting import ray_intersection_AABB
+from mokap.utils.geometry.transforms import compose_transform_matrix, decompose_transform_matrix
+from mokap.utils.geometry.fitting import intersect_aabb
 
 from mokap.utils.visualisation import plot_cameras_3d, CUSTOM_COLORS
 
@@ -35,7 +35,7 @@ class ReconstructorVisualizer:
         plot_cameras_3d(self.r.rvecs_c2w, self.r.tvecs_c2w, self.r.Ks, self.r.Ds,
                         cameras_names=self.r.camera_names, trust_volume=self.r.volume_bounds, ax=ax)
 
-        E_c2w = extrinsics_matrix(self.r.rvecs_c2w, self.r.tvecs_c2w)
+        E_c2w = compose_transform_matrix(self.r.rvecs_c2w, self.r.tvecs_c2w)
 
         for c, cam_name in enumerate(self.r.camera_names):
             if dets_per_cam[c].shape[0] == 0: continue
@@ -43,7 +43,7 @@ class ReconstructorVisualizer:
             cam_center = self.r.tvecs_c2w[c]
 
             # Back project to get points on the rays far away (z=1000)
-            points_3d = back_projection(dets_per_cam[c], 1000.0, self.r.Ks[c], E_c2w[c], self.r.Ds[c])
+            points_3d = unproject(dets_per_cam[c], 1000.0, self.r.Ks[c], E_c2w[c], self.r.Ds[c])
 
             for pt_3d in points_3d:
                 # Draw line from camera center to point
@@ -70,24 +70,24 @@ class ReconstructorVisualizer:
         # Undistort target detections to match the remapped image
         udets_j = None
         if len(dets_j) > 0:
-            udets_j = undistort_points(dets_j, K_j, D_j, P=new_K_j)
+            udets_j = undistort(dets_j, K_j, D_j, P=new_K_j)
 
         # Backproject rays from i -> project to j
-        udets_i = undistort_points(dets_i, self.r.Ks[cam_idx_i], self.r.Ds[cam_idx_i])
+        udets_i = undistort(dets_i, self.r.Ks[cam_idx_i], self.r.Ds[cam_idx_i])
         E_c2w_i = xp.linalg.inv(self.r.Es[cam_idx_i])
         cam_center_i = E_c2w_i[:3, 3]
 
-        p_3d_ray = back_projection(udets_i, 1.0, self.r.Ks[cam_idx_i], E_c2w_i, dist_coeffs=None)
+        p_3d_ray = unproject(udets_i, 1.0, self.r.Ks[cam_idx_i], E_c2w_i, D=None)
         ray_dirs = p_3d_ray - cam_center_i
         ray_dirs /= xp.linalg.norm(ray_dirs, axis=-1, keepdims=True)
 
         # Intersect with volume AABB
-        p_near, p_far, hit = ray_intersection_AABB(cam_center_i, ray_dirs, self.r.aabb_min, self.r.aabb_max)
+        p_near, p_far, hit = intersect_aabb(cam_center_i, ray_dirs, self.r.aabb_min, self.r.aabb_max)
 
         # Project segments to cam j
-        rvec_j, tvec_j = extmat_to_rtvecs(self.r.Es[cam_idx_j])
+        rvec_j, tvec_j = decompose_transform_matrix(self.r.Es[cam_idx_j])
         segments_3d = xp.vstack([p_near, p_far])
-        segments_2d, _ = project_points(segments_3d, rvec_j, tvec_j, new_K_j, dist_coeffs=xp.zeros_like(D_j))
+        segments_2d, _ = project(segments_3d, rvec_j, tvec_j, new_K_j, D=xp.zeros_like(D_j))
 
         # Plot
         plt.figure(figsize=(12, 9))

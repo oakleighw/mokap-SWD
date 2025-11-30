@@ -6,7 +6,7 @@ import matplotlib.pyplot as plt
 
 from mokap.utils.visualisation import plot_cameras_3d, plot_triangulation_scene
 from mokap.utils.geometry.projective import triangulate
-from mokap.utils.geometry.transforms import invert_rtvecs
+from mokap.utils.geometry.transforms import invert_vectors
 
 
 def load_calibration_data(folder: Path):
@@ -57,14 +57,14 @@ def load_calibration_data(folder: Path):
 
 if __name__ == "__main__":
 
-    folder = Path("C:/Users/flolm/Desktop/3d_ant_data/240905-1616/calibration")
+    folder = Path.home() / "Desktop/3d_ant_data/240905-1616/calibration"
     frame_idx = None
 
     if not folder.exists():
         print(f"Folder not found: {folder}")
         sys.exit(1)
 
-    # Load Data
+    # Load data
     cam_names, Ks, Ds, rvecs_c2w, tvecs_c2w, volume = load_calibration_data(folder)
 
     # Check for debug point data
@@ -111,7 +111,7 @@ if __name__ == "__main__":
     points2d_frame[~vis_mask_frame] = np.nan
 
     # Triangulate
-    rvecs_w2c, tvecs_w2c = invert_rtvecs(rvecs_c2w, tvecs_c2w)
+    rvecs_w2c, tvecs_w2c = invert_vectors(rvecs_c2w, tvecs_c2w)
 
     points3d = triangulate(
         points2d_frame,

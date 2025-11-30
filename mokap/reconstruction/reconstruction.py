@@ -18,16 +18,16 @@ from mokap.reconstruction.datatypes import SoupData
 from mokap.reconstruction.utils import solve_mwis_networkx, prepare_reconstruction_input
 
 from mokap.utils.geometry.projective import (
-    back_projection, triangulate_points_from_projections,
-    project_to_multiple_cameras, undistort_points, project_points
+    unproject, triangulate_from_projections,
+    project_to_multiple_cameras, undistort, project
 )
 
 from mokap.utils.geometry.transforms import (
-    extrinsics_matrix, projection_matrix, invert_rtvecs,
-    extmat_to_rtvecs, invert_extrinsics_matrix
+    compose_transform_matrix, projection_matrix, invert_vectors,
+    decompose_transform_matrix, invert_transform
 )
 
-from mokap.utils.geometry.fitting import ray_intersection_AABB
+from mokap.utils.geometry.fitting import intersect_aabb
 
 logger = logging.getLogger(__name__)
 
@@ -106,12 +106,12 @@ class Reconstructor:
         self.rvecs_c2w = xp.stack([camera_parameters[name]['rvec'] for name in self.camera_names])
         self.tvecs_c2w = xp.stack([camera_parameters[name]['tvec'] for name in self.camera_names])
 
-        self.rvecs_w2c, self.tvecs_w2c = invert_rtvecs(self.rvecs_c2w, self.tvecs_c2w)
-        self.Es = extrinsics_matrix(self.rvecs_w2c, self.tvecs_w2c)
+        self.rvecs_w2c, self.tvecs_w2c = invert_vectors(self.rvecs_c2w, self.tvecs_c2w)
+        self.Es = compose_transform_matrix(self.rvecs_w2c, self.tvecs_w2c)
         self.Ps = projection_matrix(self.Ks, self.Es)
 
         # Extrinsics: Camera-to-world (ror ray casting / back proj)
-        self.Es_c2w = extrinsics_matrix(self.rvecs_c2w, self.tvecs_c2w)
+        self.Es_c2w = compose_transform_matrix(self.rvecs_c2w, self.tvecs_c2w)
 
     @property
     def max_point_score(self) -> float:
@@ -257,7 +257,7 @@ class Reconstructor:
 
         pts_uv = xp.array(coords)  # (N, 2)
 
-        world_pts = back_projection(
+        world_pts = unproject(
             pts_uv,
             xp.ones(len(cam_ids)),
             Ks_batch,
@@ -365,8 +365,8 @@ class Reconstructor:
     @partial(jit, static_argnums=(0,))
     def _triangulate_and_check(self, matched_uvs, tri_weights):
 
-        undistorted_uvs = undistort_points(matched_uvs, self.Ks, self.Ds)
-        points3d = triangulate_points_from_projections(undistorted_uvs, self.Ps, weights=tri_weights)
+        undistorted_uvs = undistort(matched_uvs, self.Ks, self.Ds)
+        points3d = triangulate_from_projections(undistorted_uvs, self.Ps, weights=tri_weights)
 
         # Validation
         valid_triangulation = ~xp.any(xp.isnan(points3d), axis=1)
@@ -494,15 +494,15 @@ class Reconstructor:
         Ni, Nj = dets_i.shape[0], dets_j.shape[0]
         K_i, D_i, E_i = self.Ks[i], self.Ds[i], self.Es[i]
         K_j, D_j, E_j = self.Ks[j], self.Ds[j], self.Es[j]
-        rvec_w2c_j, tvec_w2c_j = extmat_to_rtvecs(E_j)
+        rvec_w2c_j, tvec_w2c_j = decompose_transform_matrix(E_j)
 
-        udets_j = undistort_points(dets_j, K_j, D_j)
+        udets_j = undistort(dets_j, K_j, D_j)
 
-        E_c2w_i = invert_extrinsics_matrix(E_i)
+        E_c2w_i = invert_transform(E_i)
         cam_center_i = E_c2w_i[:3, 3]
 
         # Back project
-        p_3d_on_ray = back_projection(
+        p_3d_on_ray = unproject(
             dets_i,
             xp.ones(Ni),
             K_i,
@@ -515,7 +515,7 @@ class Reconstructor:
         # Safe normalise
         ray_dirs /= (xp.linalg.norm(ray_dirs, axis=-1, keepdims=True) + 1e-8)
 
-        p_near_3d, p_far_3d, has_intersection = ray_intersection_AABB(
+        p_near_3d, p_far_3d, has_intersection = intersect_aabb(
             cam_center_i, ray_dirs, self.aabb_min, self.aabb_max
         )
         segments_3d = xp.vstack([p_near_3d, p_far_3d])
@@ -523,7 +523,7 @@ class Reconstructor:
         segments_3d = xp.nan_to_num(segments_3d)
 
         # Project segments to camera j
-        segments_2d, _ = project_points(
+        segments_2d, _ = project(
             segments_3d, rvec_w2c_j, tvec_w2c_j, K_j, xp.zeros_like(D_j), 'none'
         )
 
@@ -667,27 +667,27 @@ class Reconstructor:
         Ni, Nj = dets_i_padded.shape[0], dets_j_padded.shape[0]
         K_i, D_i, E_i = self.Ks[i], self.Ds[i], self.Es[i]
         K_j, D_j, E_j = self.Ks[j], self.Ds[j], self.Es[j]
-        rvec_w2c_j, tvec_w2c_j = extmat_to_rtvecs(E_j)
+        rvec_w2c_j, tvec_w2c_j = decompose_transform_matrix(E_j)
 
-        udets_j = undistort_points(dets_j_padded, K_j, D_j)
+        udets_j = undistort(dets_j_padded, K_j, D_j)
 
-        E_c2w_i = invert_extrinsics_matrix(E_i)
+        E_c2w_i = invert_transform(E_i)
         cam_center_i = E_c2w_i[:3, 3]
 
         # Back project
-        p_3d_on_ray = back_projection(dets_i_padded, xp.ones(Ni), xp.stack([K_i] * Ni),
-                                              xp.stack([E_c2w_i] * Ni), xp.stack([D_i] * Ni))
+        p_3d_on_ray = unproject(dets_i_padded, xp.ones(Ni), xp.stack([K_i] * Ni),
+                                xp.stack([E_c2w_i] * Ni), xp.stack([D_i] * Ni))
 
         ray_dirs = p_3d_on_ray - cam_center_i
         ray_dirs /= (xp.linalg.norm(ray_dirs, axis=-1, keepdims=True) + 1e-8)
 
-        p_near_3d, p_far_3d, has_intersection = ray_intersection_AABB(cam_center_i, ray_dirs, self.aabb_min,
-                                                                         self.aabb_max)
+        p_near_3d, p_far_3d, has_intersection = intersect_aabb(cam_center_i, ray_dirs, self.aabb_min,
+                                                               self.aabb_max)
         segments_3d = xp.vstack([p_near_3d, p_far_3d])
         segments_3d = xp.nan_to_num(segments_3d)       # Prevent projection issues
 
         # Project segments to camera J
-        segments_2d, _ = project_points(segments_3d, rvec_w2c_j, tvec_w2c_j, K_j, xp.zeros_like(D_j), 'none')
+        segments_2d, _ = project(segments_3d, rvec_w2c_j, tvec_w2c_j, K_j, xp.zeros_like(D_j), 'none')
 
         a_pts = segments_2d[:Ni]
         b_pts = segments_2d[Ni:]

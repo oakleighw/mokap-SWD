@@ -1,36 +1,63 @@
 from .transforms import (
-    rodrigues,
-    inverse_rodrigues,
-    extrinsics_matrix,
-    extmat_to_rtvecs,
-    projection_matrix,
+    homogenize,
+    dehomogenize,
+    normalize_vector,
+    skew_symmetric,
+
+    # Matrix representations
+    rotation_matrix,
+    rotation_vector,
+    matrix_from_axis_angle,
+
+    # Quaternions
+    quaternion_from_vector,
+    vector_from_quaternion,
+    matrix_from_quaternion,
+    quaternion_from_matrix,
+    invert_quaternion,
+    multiply_quaternions,
+    apply_quaternion,
+    quaternion_distance,
+
+    # Homogeneous Transforms
+    compose_transform_matrix,
+    decompose_transform_matrix,
+    invert_transform,
+    invert_vectors,
+    compose_transforms,
+    translate_pose,
+    rotate_pose,
+
+    # Operations
+    transform_points,
+    transform_vectors,
+    rotate_points,
+    angular_distance,
+    pairwise_angular_distance,
+
+    # Epipolar geometry
     fundamental_matrix,
-    invert_intrinsics_matrix,
-    invert_extrinsics_matrix,
-    invert_rtvecs,
-    Rmat_from_angle,
-    rotate_points3d,
-    rotate_rtvecs,
-    rotate_extrinsics_matrix,
-    axisangle_to_quaternion,
-    quaternion_to_axisangle,
-    quaternion_inverse,
-    quaternion_multiply,
-    rotate_vector_by_quat,
-    quaternions_angular_distance,
+    essential_from_fundamental,
+    projection_matrix,
+    invert_intrinsics,
 )
 
-
 from .projective import (
-    distortion,
-    project_points,
-    undistort_points,
-    back_projection,
-    reprojection_errors,
-    triangulate_points_from_projections,
-    triangulate,
+    # Core projection
+    distort,
+    undistort,
+    project,
+    unproject,
+    pixels_to_rays,
 
-    # Wrappers
+    # Metrics
+    reprojection_errors,
+
+    # Triangulation
+    triangulate,
+    triangulate_from_projections,
+
+    # Batched / Helper Wrappers
     project_multiple_poses,
     project_to_multiple_cameras,
     project_multiple_to_multiple,
@@ -39,19 +66,26 @@ from .projective import (
 )
 
 from .fitting import (
-    find_rigid_transform,
-    find_affine_transform,
-    interpolate3d,
-    huber_weight,
+    # Rigid / Affine alignment
+    align_rigid,
+    align_affine,
+
+    # Point cloud ops
+    fit_plane,
+    fill_missing_points,
+    compute_bounds,
+    segment_distance,
+    intersect_rays,
+    intersect_aabb,
+
+    # Averaging / Robust fitting
+    weighted_median,
     translation_average,
     quaternion_average,
-    filter_rt_samples,
-    rays_intersection_3d,
-    ray_intersection_AABB,
-    reliability_bounds_3d,
-    reliability_bounds_3d_iqr,
-    generate_ambiguous_pose,
-    point_to_segment_distance,
+    average_qtposes,
+
+    # Others
+    flip_pose_180,
 )
 
 from .backend import USE_JAX, xp

@@ -11,7 +11,7 @@ from mokap.calibration.common import solve_pnp_robust, calibrate_camera_robust
 from mokap.calibration.detectors import ChessboardDetector, CharucoDetector
 from mokap.utils.datatypes import ChessBoard, CharucoBoard, DistortionModel
 from mokap.utils import SENSOR_SIZES, estimate_camera_matrix
-from mokap.utils.geometry.projective import project_points
+from mokap.utils.geometry.projective import project
 
 logger = logging.getLogger(__name__)
 
@@ -440,7 +440,7 @@ class MonocularCalibrationTool:
             return None
 
         # TODO: store the validity mask maybe?
-        self._reprojected_points, _ = project_points(
+        self._reprojected_points, _ = project(
             self._object_points_3d, self._curr_rvec_b2c, self._curr_tvec_b2c, self._camera_matrix, self._dist_coeffs)
 
     def clear_grid(self):

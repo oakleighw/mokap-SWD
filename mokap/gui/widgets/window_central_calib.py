@@ -18,7 +18,7 @@ from mokap.gui.widgets.widgets_base import Base
 from mokap.utils import hex_to_rgb
 from mokap.utils.datatypes import CharucoBoard, ChessBoard
 
-from mokap.utils.geometry.transforms import rotate_points3d, rotate_extrinsics_matrix
+from mokap.utils.geometry.transforms import rotate_points, rotate_pose
 
 
 logger = logging.getLogger(__name__)

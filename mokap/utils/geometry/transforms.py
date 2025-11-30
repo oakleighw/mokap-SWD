@@ -2,8 +2,88 @@ from typing import Tuple
 from .backend import xp, jit, _eps, _tiny
 
 
+def homogenize(
+        points: xp.ndarray
+) -> xp.ndarray:
+    """
+    Converts Euclidean points to homogeneous coordinates by appending 1.
+
+    Args:
+        points: Input points (..., D)
+
+    Returns:
+        Homogeneous points (..., D+1)
+    """
+    return xp.concatenate([points, xp.ones_like(points[..., :1])], axis=-1)
+
+
+def dehomogenize(
+        points: xp.ndarray
+) -> xp.ndarray:
+    """
+    Converts homogeneous coordinates to Euclidean by dividing by the last component.
+
+    Args:
+        points: Homogeneous points (..., D+1)
+
+    Returns:
+        Euclidean points (..., D)
+    """
+    w_coord = points[:, -1:]
+    safe_w = xp.where(xp.abs(w_coord) < _tiny, _tiny, w_coord)
+
+    # Divide the coordinate components (all but the last) by w
+    return points[..., :-1] / safe_w
+
+
 @jit
-def rodrigues(rvec: xp.ndarray) -> xp.ndarray:
+def normalize_vector(
+        v: xp.ndarray,
+        axis: int = -1
+) -> xp.ndarray:
+    """
+    Normalizes vectors to unit length. Handles zero-vectors safely.
+
+    Args:
+        v: Input vectors (..., D)
+        axis: Axis to normalize along
+
+    Returns:
+        Unit vectors (..., D)
+    """
+    norm = xp.linalg.norm(v, axis=axis, keepdims=True)
+    safe_norm = xp.where(norm < _tiny, 1.0, norm)
+    return v / safe_norm
+
+
+@jit
+def skew_symmetric(v: xp.ndarray) -> xp.ndarray:
+    """
+    Returns the skew-symmetric cross-product matrix of vector v.
+    [0 -z  y]
+    [z  0 -x]
+    [-y x  0]
+
+    Args:
+        v: Input vector (..., 3)
+
+    Returns:
+        Skew-symmetric cross-product matrix (..., 3, 3)
+    """
+    x, y, z = v[..., 0], v[..., 1], v[..., 2]
+    zeros = xp.zeros_like(x)
+
+    return xp.stack([
+        xp.stack([zeros, -z, y], axis=-1),
+        xp.stack([z, zeros, -x], axis=-1),
+        xp.stack([-y, x, zeros], axis=-1),
+    ], axis=-2)
+
+
+@jit
+def rotation_matrix(
+        rvec: xp.ndarray
+) -> xp.ndarray:
     """
     Converts rotation vector(s) to rotation matrix(ces).
     Uses Taylor expansion for small angles to ensure numerical stability.
@@ -16,7 +96,7 @@ def rodrigues(rvec: xp.ndarray) -> xp.ndarray:
     """
 
     # Magnitude of each vector
-    theta_sq = xp.sum(rvec**2, axis=-1, keepdims=True)  # (..., 1)
+    theta_sq = xp.sum(rvec ** 2, axis=-1, keepdims=True)  # (..., 1)
 
     # When theta is small, we use the Taylor expansion of R = I + [r_x] to avoid division by theta
     is_zero = theta_sq < _tiny
@@ -46,69 +126,92 @@ def rodrigues(rvec: xp.ndarray) -> xp.ndarray:
     R_normal = I + sin_t * K + (1 - cos_t) * (K @ K)
 
     # Path B: Small angle (Taylor expansion)
-    rx, ry, rz = rvec[..., 0], rvec[..., 1], rvec[..., 2]
-    zeros_r = xp.zeros_like(rx)
-
-    # Skew-symmetric matrix of the rvec
-    R_skew = xp.stack([
-        xp.stack([zeros_r, -rz, ry], axis=-1),
-        xp.stack([rz, zeros_r, -rx], axis=-1),
-        xp.stack([-ry, rx, zeros_r], axis=-1),
-    ], axis=-2)
-
+    R_skew = skew_symmetric(rvec)
     R_small = I + R_skew
 
     return xp.where(is_small_angle[..., None], R_small, R_normal)
 
 
 @jit
-def inverse_rodrigues(Rmat: xp.ndarray) -> xp.ndarray:
+def rotation_vector(
+        R: xp.ndarray
+) -> xp.ndarray:
     """
     Converts rotation matrix(ces) to rotation vector(s).
-    Handles small angles by using the skew-symmetric approximation to avoid instability.
+    Handles small angles (Taylor) and 180-degree singularities (Eigen-analysis).
 
     Args:
-        Rmat: Rotation matrices (..., 3, 3)
+        R: Rotation matrices (..., 3, 3)
 
     Returns:
         Rotation vectors (..., 3)
     """
 
-    trace = xp.trace(Rmat, axis1=-2, axis2=-1)
-    costheta = (trace - 1) / 2
-
-    # Clip to (-1+tiny, 1-tiny) to ensure finite gradients for arccos
+    # Calculate angle
+    trace = xp.trace(R, axis1=-2, axis2=-1)
+    costheta = (trace - 1.0) / 2.0
     safe_costheta = xp.clip(costheta, -1.0 + _eps, 1.0 - _eps)
-    theta_safe = xp.arccos(safe_costheta)
+    theta = xp.arccos(safe_costheta)
 
-    # Skew part of the matrix
+    # Extract skew components (matrix -> vector)
     rv_unscaled = xp.stack([
-        Rmat[..., 2, 1] - Rmat[..., 1, 2],
-        Rmat[..., 0, 2] - Rmat[..., 2, 0],
-        Rmat[..., 1, 0] - Rmat[..., 0, 1]
+        R[..., 2, 1] - R[..., 1, 2],
+        R[..., 0, 2] - R[..., 2, 0],
+        R[..., 1, 0] - R[..., 0, 1]
     ], axis=-1)
 
-    # Condition: theta near 0
-    theta_check = xp.arccos(xp.clip(costheta, -1.0, 1.0))
-    is_near_zero = theta_check < _eps
+    # Define conditions
+    is_small = theta < 1e-2
+    # trace near -1 implies theta near pi (180 deg)
+    is_pi = (trace + 1.0) < 1e-2
 
-    # Path A: Normal angle (scale is theta / (2 * sin(theta)) )
-    # sin(theta_safe) is safe because theta_safe is clipped away from 0 and pi
-    scale_normal = theta_safe / (2 * xp.sin(theta_safe))
+    # Path A: Normal angle
+    # rvec = rv_unscaled * (theta / 2sin(theta))
+    sin_t = xp.sin(theta)
+    # Add tiny to denominator to prevent div/0 in the is_small/is_pi branches
+    scale_normal = theta / (2.0 * sin_t + _tiny)
+    rvec_normal = rv_unscaled * scale_normal[..., None]
 
-    # Path B: Small angle
-    # Taylor expansion of theta / (2 sin theta) ~ 0.5 * (1 + theta^2 / 6)
-    # rvec = rv_unscaled * 0.5 * (1 + theta^2/6)
-    # First order: 0.5
-    rvec_small_angle = 0.5 * rv_unscaled
+    # Path B: Small angle (Taylor expansion)
+    # theta / 2sin(theta) approx 0.5 * (1 + theta^2/6)
+    rvec_small = rv_unscaled * (0.5 * (1.0 + theta[..., None] ** 2 / 6.0))
 
-    rvec_normal_angle = rv_unscaled * scale_normal[..., None]
+    # Path C: 180 deg singularity
+    # R + I = 2 * v * v.T
+    # The columns of (R+I) are parallel to the axis.
+    # -> pick the column corresponding to the largest diagonal element to avoid numerical issues
 
-    return xp.where(is_near_zero[..., None], rvec_small_angle, rvec_normal_angle)
+    # Identify which column to take (max diagonal index)
+    diag = xp.stack([R[..., 0, 0], R[..., 1, 1], R[..., 2, 2]], axis=-1)
+    k = xp.argmax(diag, axis=-1)
+
+    # Mask to extract column k
+    mask = xp.eye(3, dtype=R.dtype)[k]
+
+    # Extract the column: (R+I) @ mask
+    I = xp.eye(3, dtype=R.dtype)
+    R_plus_I = R + I
+
+    # Matmul: (..., 3, 3) @ (..., 3, 1) -> (..., 3, 1) -> squeeze to (..., 3)
+    col_k = xp.matmul(R_plus_I, mask[..., None]).squeeze(-1)
+
+    # Normalise to get unit vector then scale by pi
+    axis_pi = normalize_vector(col_k)
+    rvec_pi = axis_pi * xp.pi
+
+    # Select result
+    # Priority small angle, then pi singularity, then normal
+    rvec = xp.where(is_small[..., None], rvec_small, rvec_normal)
+    rvec = xp.where(is_pi[..., None], rvec_pi, rvec)
+
+    return rvec
 
 
 @jit
-def extrinsics_matrix(rvec: xp.ndarray, tvec: xp.ndarray) -> xp.ndarray:
+def compose_transform_matrix(
+        rvec: xp.ndarray,
+        tvec: xp.ndarray
+) -> xp.ndarray:
     """
     Combines rotation and translation vectors into 4x4 Homogeneous Transform matrices (T).
 
@@ -127,7 +230,7 @@ def extrinsics_matrix(rvec: xp.ndarray, tvec: xp.ndarray) -> xp.ndarray:
         T: Homogeneous Transform matrices (..., 4, 4)
     """
 
-    R = rodrigues(rvec)  # (..., 3, 3)
+    R = rotation_matrix(rvec)  # (..., 3, 3)
     t = tvec[..., None]  # (..., 3, 1)
 
     # Concatenate R and t into the extrinsics matrix (..., 3, 4)
@@ -142,7 +245,9 @@ def extrinsics_matrix(rvec: xp.ndarray, tvec: xp.ndarray) -> xp.ndarray:
 
 
 @jit
-def extmat_to_rtvecs(T: xp.ndarray) -> Tuple[xp.ndarray, xp.ndarray]:
+def decompose_transform_matrix(
+        T: xp.ndarray
+) -> Tuple[xp.ndarray, xp.ndarray]:
     """
     Decomposes a Transform matrix (T) into rotation and translation vectors.
 
@@ -155,12 +260,56 @@ def extmat_to_rtvecs(T: xp.ndarray) -> Tuple[xp.ndarray, xp.ndarray]:
     """
     R = T[..., :3, :3]  # (..., 3, 3)
     tvec = T[..., :3, 3]  # (..., 3)
-    rvec = inverse_rodrigues(R)  # (..., 3)
+    rvec = rotation_vector(R)  # (..., 3)
     return rvec, tvec
 
 
 @jit
-def projection_matrix(K: xp.ndarray, T: xp.ndarray) -> xp.ndarray:
+def transform_points(
+        points3d: xp.ndarray,
+        transform: xp.ndarray
+) -> xp.ndarray:
+    """
+    Applies a 4x4 rigid transform to 3D points.
+    Handles the homogeneous coordinate conversion internally.
+
+    Args:
+        points3d: (..., N, 3)
+        transform: (..., 4, 4)
+    """
+    points_h = homogenize(points3d)
+    transformed_h = xp.einsum('...ij,...nj->...ni', transform, points_h)
+    return transformed_h[..., :3]
+
+
+@jit
+def transform_vectors(
+        vectors: xp.ndarray,
+        transform: xp.ndarray
+) -> xp.ndarray:
+    """
+    Applies a 4x4 Homogeneous Transform to 3D vectors.
+    This ignores the translation component of the transform because, well, vectors.
+
+    Args:
+        vectors: Input vectors (..., N, 3)
+        transform: Homogeneous transform matrices (..., 4, 4)
+
+    Returns:
+        Rotated vectors (..., N, 3)
+    """
+    # We slice only the Rotation block (top-left 3x3)
+    R = transform[..., :3, :3]
+
+    # We do NOT add the translation vector (transform[..., :3, 3])
+    return xp.einsum('...ij,...nj->...ni', R, vectors)
+
+
+@jit
+def projection_matrix(
+        K: xp.ndarray,
+        T: xp.ndarray
+) -> xp.ndarray:
     """
     Computes projection matrices P = K @ [R|t].
     The projection matrix maps 3D points in homogeneous world coordinates (X, Y, Z, 1)
@@ -186,7 +335,9 @@ def projection_matrix(K: xp.ndarray, T: xp.ndarray) -> xp.ndarray:
 
 
 @jit
-def invert_intrinsics_matrix(K: xp.ndarray) -> xp.ndarray:
+def invert_intrinsics(
+        K: xp.ndarray
+) -> xp.ndarray:
     """
     Computes the analytical inverse of camera matrix K.
 
@@ -240,8 +391,8 @@ def fundamental_matrix(
     r1, r2 = rvecs_w2c_pair
     t1, t2 = tvecs_w2c_pair
 
-    R1 = rodrigues(r1)  # world to camera 1 rotation
-    R2 = rodrigues(r2)  # world to camera 2 rotation
+    R1 = rotation_matrix(r1)  # world to camera 1 rotation
+    R2 = rotation_matrix(r2)  # world to camera 2 rotation
 
     # The relative transformation from camera 1's coordinate system to camera 2's is
     # T_c1_c2 = T_w_c2 * inv(T_w_c1)
@@ -252,20 +403,13 @@ def fundamental_matrix(
     t_c1_c2 = t2 - Rt1
 
     # Construct skew matrix
-    z = xp.zeros_like(t_c1_c2[..., 0])
-    tx, ty, tz = t_c1_c2[..., 0], t_c1_c2[..., 1], t_c1_c2[..., 2]
+    t_skew = skew_symmetric(t_c1_c2)
 
     # The essential matrix E relates a point x1 in cam 1 to a point x2 in cam 2 via: x2^T * E * x1 = 0
-    t_skew = xp.stack([
-        xp.stack([z, -tz, ty], axis=-1),
-        xp.stack([tz, z, -tx], axis=-1),
-        xp.stack([-ty, tx, z], axis=-1)
-    ], axis=-2)
-
     E_mat = t_skew @ R_c1_c2
 
-    invK2_T = xp.swapaxes(invert_intrinsics_matrix(K2), -1, -2)
-    invK1 = invert_intrinsics_matrix(K1)
+    invK2_T = xp.swapaxes(invert_intrinsics(K2), -1, -2)
+    invK1 = invert_intrinsics(K1)
     F = invK2_T @ E_mat @ invK1
 
     # Enforce rank-2
@@ -275,13 +419,54 @@ def fundamental_matrix(
 
     # Recompose U @ diag(S) @ Vt
     F_corrected = (U * S_new[..., None, :]) @ Vt
-    F_normalized = F_corrected / (F_corrected[..., 2:3, 2:3] + _tiny)
+
+    norm = xp.linalg.norm(F_corrected, axis=(-1, -2), keepdims=True)
+    F_normalized = F_corrected / (norm + _tiny)
 
     return F_normalized
 
 
 @jit
-def invert_extrinsics_matrix(T: xp.ndarray) -> xp.ndarray:
+def essential_from_fundamental(
+        F: xp.ndarray,
+        K1: xp.ndarray,
+        K2: xp.ndarray
+) -> xp.ndarray:
+    """
+    Computes the Essential Matrix E from the Fundamental Matrix F.
+    E = K2.T @ F @ K1
+
+    Also enforces rank-2 constraint (singular values 1, 1, 0).
+
+    Args:
+        F: Fundamental matrices (..., 3, 3)
+        K1: Intrinsics of camera 1 (..., 3, 3)
+        K2: Intrinsics of camera 2 (..., 3, 3)
+
+    Returns:
+        Essential matrices (..., 3, 3)
+    """
+
+    K2_T = xp.swapaxes(K2, -1, -2)
+    E_temp = xp.matmul(K2_T, xp.matmul(F, K1))
+
+    # Essential Matrix constraints: singular values must be [s, s, 0]
+    # (we enforce [1, 1, 0] by reconstructing using only the first 2 components)
+    U, _, Vt = xp.linalg.svd(E_temp)
+
+    # E = U @ diag(1,1,0) @ Vt
+    # Reconstructed by summing the outer products of the first two singular vectors
+    # U[..., :, 0:1] is (..., 3, 1)
+    # Vt[..., 0:1, :] is (..., 1, 3)
+    E = xp.matmul(U[..., :, 0:1], Vt[..., 0:1, :]) + xp.matmul(U[..., :, 1:2], Vt[..., 1:2, :])
+
+    return E
+
+
+@jit
+def invert_transform(
+        T: xp.ndarray
+) -> xp.ndarray:
     """
     Inverts a 4x4 Homogeneous Transform Matrix (T).
     Exploits the structure of [R|t] to invert efficiently without general matrix inversion.
@@ -309,17 +494,29 @@ def invert_extrinsics_matrix(T: xp.ndarray) -> xp.ndarray:
 
 
 @jit
-def invert_rtvecs(rvec: xp.ndarray, tvec: xp.ndarray) -> Tuple[xp.ndarray, xp.ndarray]:
+def invert_vectors(
+        rvec: xp.ndarray,
+        tvec: xp.ndarray
+) -> Tuple[xp.ndarray, xp.ndarray]:
     """
-    Inverts extrinsics vectors: (r, t) -> (r_inv, t_inv).
+    Inverts a pose defined by a rotation vector and translation vector.
+    Computes (R^T, -R^T @ t).
+
+    Args:
+        rvec: Rotation vectors (..., 3)
+        tvec: Translation vectors (..., 3)
+
+    Returns:
+        rvec_inv: Inverse rotation vectors (..., 3)
+        tvec_inv: Inverse translation vectors (..., 3)
     """
-    T = extrinsics_matrix(rvec, tvec)
-    T_inv = invert_extrinsics_matrix(T)
-    return extmat_to_rtvecs(T_inv)
+    T = compose_transform_matrix(rvec, tvec)
+    T_inv = invert_transform(T)
+    return decompose_transform_matrix(T_inv)
 
 
 @jit
-def Rmat_from_angle(
+def matrix_from_axis_angle(
         angle_degrees: xp.ndarray,
         axis: xp.ndarray
 ) -> xp.ndarray:
@@ -347,11 +544,11 @@ def Rmat_from_angle(
     axis_u = axis / (axis_norm + _tiny)
 
     rvec = axis_u * theta
-    return rodrigues(rvec)
+    return rotation_matrix(rvec)
 
 
 @jit
-def rotate_points3d(
+def rotate_points(
         points3d: xp.ndarray,
         angle_degrees: xp.ndarray,
         axis: xp.ndarray,
@@ -368,58 +565,28 @@ def rotate_points3d(
         The rotated points (..., 3)
     """
 
-    R = Rmat_from_angle(angle_degrees, axis)
+    R = matrix_from_axis_angle(angle_degrees, axis)
     return xp.einsum('...ij,...j->...i', R, points3d)
 
 
 @jit
-def rotate_rtvecs(
-        rvecs: xp.ndarray,
-        tvecs: xp.ndarray,
-        angle_degrees: xp.ndarray,
-        axis: xp.ndarray,
-) -> tuple[xp.ndarray, xp.ndarray]:
-    """
-    Rotates a pose (rvec, tvec) by a global rotation defined by angle/axis.
-
-    Args:
-        rvecs: Input rotation vectors (..., 3)
-        tvecs: Input translation vectors (..., 3)
-        angle_degrees: Rotation angle (scalar or N)
-        axis: Rotation axis (3,)
-
-    Returns:
-        Tuple of rotated rvecs and tvecs.
-    """
-
-    Rg = Rmat_from_angle(angle_degrees, axis)
-    tvecs_rot = xp.einsum('...ij,...j->...i', Rg, tvecs)
-
-    Rl = rodrigues(rvecs)
-    R_comb = xp.matmul(Rg, Rl)  # Rg is (3, 3), it broadcasts to (..., 3, 3)
-    rvecs_rot = inverse_rodrigues(R_comb)
-
-    return rvecs_rot, tvecs_rot
-
-
-@jit
-def rotate_extrinsics_matrix(
+def rotate_pose(
         T: xp.ndarray,
         angle_degrees: xp.ndarray,
         axis: xp.ndarray,
 ) -> xp.ndarray:
     """
-    Rotates a Transform matrix T by a global rotation defined by angle/axis.
+    Rotates a pose matrix T by a global rotation defined by an axis and angle.
 
     Args:
-        T: Transform matrix (..., 4, 4)
-        angle_degrees: Rotation angle
-        axis: Rotation axis
+        T: Homogeneous transform matrices (..., 4, 4)
+        angle_degrees: Rotation angle in degrees (scalar or N)
+        axis: Rotation axis (3,) or (N, 3)
 
     Returns:
-        Rotated Transform matrix (..., 4, 4)
+        Rotated transform matrices (..., 4, 4)
     """
-    Rg = Rmat_from_angle(angle_degrees, axis)
+    Rg = matrix_from_axis_angle(angle_degrees, axis)
 
     R = T[..., :3, :3]
     t = T[..., :3, 3]
@@ -438,7 +605,60 @@ def rotate_extrinsics_matrix(
 
 
 @jit
-def axisangle_to_quaternion(rvec: xp.ndarray) -> xp.ndarray:
+def translate_pose(
+        T: xp.ndarray,
+        translation: xp.ndarray
+) -> xp.ndarray:
+    """
+    Applies a translation to an existing pose matrix T in its local frame.
+    Equivalent to T_new = T + translation (applied to position column).
+
+    Args:
+        T: Homogeneous transform matrices (..., 4, 4)
+        translation: Translation vectors (..., 3)
+
+    Returns:
+        Translated transform matrices (..., 4, 4)
+    """
+
+    R = T[..., :3, :3]
+    t = T[..., :3, 3]
+
+    t_new = t + translation
+
+    extmat_new = xp.concatenate([R, t_new[..., None]], axis=-1)
+
+    batch_shape = T.shape[:-2]
+    bottom_row = xp.broadcast_to(
+        xp.array([0., 0., 0., 1.], dtype=T.dtype),
+        batch_shape + (1, 4)
+    )
+    return xp.concatenate([extmat_new, bottom_row], axis=-2)
+
+
+@jit
+def compose_transforms(
+        pose: xp.ndarray,
+        modifier: xp.ndarray
+) -> xp.ndarray:
+    """
+    Just a mini wrapper for clarity.
+    Applies a rigid transformation (modifier) to an existing pose.
+
+    Args:
+        pose: The target pose (..., 4, 4)
+        modifier: The transformation to apply (..., 4, 4)
+
+    Returns:
+        pose_new = modifier @ pose
+    """
+    return modifier @ pose
+
+
+@jit
+def quaternion_from_vector(
+        rvec: xp.ndarray
+) -> xp.ndarray:
     """
     Convert axis-angle (Rodrigues) vectors rvec to unit quaternions [w, x, y, z].
 
@@ -474,7 +694,9 @@ def axisangle_to_quaternion(rvec: xp.ndarray) -> xp.ndarray:
 
 
 @jit
-def quaternion_to_axisangle(q: xp.ndarray) -> xp.ndarray:
+def vector_from_quaternion(
+        q: xp.ndarray
+) -> xp.ndarray:
     """
     Convert unit quaternions [w, x, y, z] to axis-angle rvec.
 
@@ -486,7 +708,7 @@ def quaternion_to_axisangle(q: xp.ndarray) -> xp.ndarray:
     """
     w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
 
-    w_clamped = xp.clip(w, -1.0 + _eps, 1.0 - _eps) # clip w to avoid NaN gradients in arccos
+    w_clamped = xp.clip(w, -1.0 + _eps, 1.0 - _eps)  # clip w to avoid NaN gradients in arccos
     theta = 2.0 * xp.arccos(w_clamped)
 
     s2 = 1.0 - w_clamped * w_clamped
@@ -508,7 +730,113 @@ def quaternion_to_axisangle(q: xp.ndarray) -> xp.ndarray:
 
 
 @jit
-def quaternion_inverse(q: xp.ndarray) -> xp.ndarray:
+def matrix_from_quaternion(
+        q: xp.ndarray
+) -> xp.ndarray:
+    """
+    Converts unit quaternions [w, x, y, z] to 3x3 rotation matrices.
+
+    Args:
+        q: Unit quaternions (..., 4)
+
+    Returns:
+        Rotation matrices (..., 3, 3)
+    """
+
+    w, x, y, z = q[..., 0], q[..., 1], q[..., 2], q[..., 3]
+
+    x2, y2, z2 = x * 2, y * 2, z * 2
+    wx, wy, wz = w * x2, w * y2, w * z2
+    xx, xy, xz = x * x2, x * y2, x * z2
+    yy, yz, zz = y * y2, y * z2, z * z2
+
+    row0 = xp.stack([1 - (yy + zz), xy - wz, xz + wy], axis=-1)
+    row1 = xp.stack([xy + wz, 1 - (xx + zz), yz - wx], axis=-1)
+    row2 = xp.stack([xz - wy, yz + wx, 1 - (xx + yy)], axis=-1)
+
+    return xp.stack([row0, row1, row2], axis=-2)
+
+
+@jit
+def quaternion_from_matrix(
+        R: xp.ndarray
+) -> xp.ndarray:
+    """
+    Converts 3x3 rotation matrices to unit quaternions [w, x, y, z].
+    Shepperd's algorithm, to handle numerical instability near trace=0 or singularities.
+
+    Args:
+        R: Rotation matrices (..., 3, 3)
+
+    Returns:
+        Quaternions (..., 4)
+    """
+
+    # 4 candidate squared terms for the denominator
+    # t = 1 + trace
+    t = 1.0 + R[..., 0, 0] + R[..., 1, 1] + R[..., 2, 2]
+
+    # Candidates for 4 * q_w^2, 4 * q_x^2, etc
+    c0 = t
+    c1 = 1.0 + R[..., 0, 0] - R[..., 1, 1] - R[..., 2, 2]
+    c2 = 1.0 - R[..., 0, 0] + R[..., 1, 1] - R[..., 2, 2]
+    c3 = 1.0 - R[..., 0, 0] - R[..., 1, 1] + R[..., 2, 2]
+
+    # Stack to find the largest candidate index (..., 4)
+    candidates = xp.stack([c0, c1, c2, c3], axis=-1)
+    best_idx = xp.argmax(candidates, axis=-1)
+
+    # Get largest denominator
+    largest = xp.max(candidates, axis=-1)
+    scale = 0.5 * xp.sqrt(xp.maximum(largest, _tiny))
+    inv_scale = 0.25 / scale
+
+    # Compute all 4 potential quaternion sets
+    # Case 0: w is dominant
+    q0 = xp.stack([
+        scale,
+        (R[..., 2, 1] - R[..., 1, 2]) * inv_scale,
+        (R[..., 0, 2] - R[..., 2, 0]) * inv_scale,
+        (R[..., 1, 0] - R[..., 0, 1]) * inv_scale
+    ], axis=-1)
+
+    # Case 1: x is dominant
+    q1 = xp.stack([
+        (R[..., 2, 1] - R[..., 1, 2]) * inv_scale,
+        scale,
+        (R[..., 0, 1] + R[..., 1, 0]) * inv_scale,
+        (R[..., 0, 2] + R[..., 2, 0]) * inv_scale
+    ], axis=-1)
+
+    # Case 2: y is dominant
+    q2 = xp.stack([
+        (R[..., 0, 2] - R[..., 2, 0]) * inv_scale,
+        (R[..., 0, 1] + R[..., 1, 0]) * inv_scale,
+        scale,
+        (R[..., 1, 2] + R[..., 2, 1]) * inv_scale
+    ], axis=-1)
+
+    # Case 3: z is dominant
+    q3 = xp.stack([
+        (R[..., 1, 0] - R[..., 0, 1]) * inv_scale,
+        (R[..., 0, 2] + R[..., 2, 0]) * inv_scale,
+        (R[..., 1, 2] + R[..., 2, 1]) * inv_scale,
+        scale
+    ], axis=-1)
+
+    # Select result based on best_idx
+    m0 = (best_idx == 0)[..., None]
+    m1 = (best_idx == 1)[..., None]
+    m2 = (best_idx == 2)[..., None]
+    m3 = (best_idx == 3)[..., None]
+
+    return q0 * m0 + q1 * m1 + q2 * m2 + q3 * m3
+
+
+@jit
+def invert_quaternion(
+        q: xp.ndarray
+) -> xp.ndarray:
     """
     Inverts unit quaternions. q_inv = [w, -x, -y, -z].
     """
@@ -517,9 +845,16 @@ def quaternion_inverse(q: xp.ndarray) -> xp.ndarray:
 
 
 @jit
-def quaternion_multiply(q1: xp.ndarray, q2: xp.ndarray) -> xp.ndarray:
+def multiply_quaternions(q1: xp.ndarray, q2: xp.ndarray) -> xp.ndarray:
     """
-    Multiplies two sets of quaternions.
+    Computes the Hamilton product of two sets of quaternions.
+
+    Args:
+        q1: Left quaternions (..., 4)
+        q2: Right quaternions (..., 4)
+
+    Returns:
+        Product quaternions (..., 4)
     """
 
     w1, x1, y1, z1 = q1[..., 0], q1[..., 1], q1[..., 2], q1[..., 3]
@@ -534,29 +869,103 @@ def quaternion_multiply(q1: xp.ndarray, q2: xp.ndarray) -> xp.ndarray:
 
 
 @jit
-def rotate_vector_by_quat(q: xp.ndarray, v: xp.ndarray) -> xp.ndarray:
+def apply_quaternion(
+        q: xp.ndarray,
+        v: xp.ndarray
+) -> xp.ndarray:
     """
-    Rotates 3D vector v by unit-quaternion q using q * v * q_inv.
+    Rotates 3D vectors v by unit quaternions q.
+    Implements the operation v' = q * v * q_inverse.
+
+    Args:
+        q: Unit quaternions (..., 4)
+        v: 3D vectors (..., 3)
+
+    Returns:
+        Rotated vectors (..., 3)
     """
 
     # Pad v (..., 3) to quaternion [0, v] (..., 4)
     zeros = xp.zeros_like(v[..., :1])
     v_quat = xp.concatenate([zeros, v], axis=-1)
 
-    q_inv = quaternion_inverse(q)
+    q_inv = invert_quaternion(q)
 
     # q * v * q_inv
-    temp = quaternion_multiply(v_quat, q_inv)
-    v_rot_quat = quaternion_multiply(q, temp)
+    temp = multiply_quaternions(v_quat, q_inv)
+    v_rot_quat = multiply_quaternions(q, temp)
 
     return v_rot_quat[..., 1:]
 
 
 @jit
-def quaternions_angular_distance(q1: xp.ndarray, q2: xp.ndarray) -> xp.ndarray:
+def quaternion_distance(
+        q1: xp.ndarray,
+        q2: xp.ndarray
+) -> xp.ndarray:
     """
-    Computes the geodesic angular distance between two unit quaternions.
+    Computes the geodesic angular distance (in radians) between two unit quaternions.
+    Defined as 2 * acos(|<q1, q2>|).
+
+    Args:
+        q1: First set of quaternions (..., 4)
+        q2: Second set of quaternions (..., 4)
+
+    Returns:
+        Angular distance in radians (..., )
     """
     d = xp.abs(xp.sum(q1 * q2, axis=-1))
-    d = xp.clip(d, -1.0 + _eps, 1.0 - _eps) # clip for gradient safety
+    d = xp.clip(d, -1.0 + _eps, 1.0 - _eps)  # clip for gradient safety
     return 2.0 * xp.arccos(d)
+
+
+@jit
+def angular_distance(
+        R1: xp.ndarray,
+        R2: xp.ndarray
+) -> xp.ndarray:
+    """
+    Computes the element-wise geodesic angular distance between corresponding
+    rotation matrices in two arrays.
+
+    Args:
+        R1: First set of rotation matrices (..., 3, 3)
+        R2: Second set of rotation matrices (..., 3, 3)
+
+    Returns:
+        Angles in radians (..., )
+    """
+
+    # trace(R1 @ R2.T) is the sum of element-wise multiplication
+    trace = xp.sum(R1 * R2, axis=(-1, -2))
+
+    cos_theta = (trace - 1.0) / 2.0
+    cos_theta = xp.clip(cos_theta, -1.0 + _eps, 1.0 - _eps)
+
+    return xp.arccos(cos_theta)
+
+
+@jit
+def pairwise_angular_distance(
+        R_A: xp.ndarray,
+        R_B: xp.ndarray
+) -> xp.ndarray:
+    """
+    Computes the angular distance between EVERY matrix in R_A and EVERY matrix in R_B.
+    Useful for comparing a trajectory against ground truth or finding nearest neighbors.
+
+    Args:
+        R_A: Set A of rotation matrices (N, 3, 3)
+        R_B: Set B of rotation matrices (M, 3, 3)
+
+    Returns:
+        Matrix of angles in radians (N, M)
+    """
+
+    # Einstein summation to compute trace(Ra @ Rb.T) for all pairs
+    trace = xp.einsum('nij,mij->nm', R_A, R_B)
+
+    cos_theta = (trace - 1.0) / 2.0
+    cos_theta = xp.clip(cos_theta, -1.0 + _eps, 1.0 - _eps)
+
+    return xp.arccos(cos_theta)

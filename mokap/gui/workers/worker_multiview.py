@@ -11,11 +11,11 @@ from mokap.gui.workers.workers_base import CalibrationProcessingWorker
 from mokap.utils.datatypes import (CalibrationData, DetectionPayload, ExtrinsicsPayload, IntrinsicsPayload,
                                    ChessBoard, CharucoBoard)
 
-from mokap.utils.geometry.projective import back_projection
+from mokap.utils.geometry.projective import unproject
 
 from mokap.utils.geometry.transforms import (
-    extrinsics_matrix, invert_rtvecs, rotate_extrinsics_matrix, rotate_points3d,
-    Rmat_from_angle, invert_extrinsics_matrix, rodrigues
+    compose_transform_matrix, invert_vectors, rotate_pose, rotate_points,
+    matrix_from_axis_angle, invert_transform, rotation_matrix
 )
 
 
@@ -141,7 +141,7 @@ class MultiviewWorker(CalibrationProcessingWorker):
         elif self._current_stage == 0 and isinstance(payload, ExtrinsicsPayload):
 
             if payload.rvec is not None and payload.tvec is not None:
-                r_c2w, t_c2w = invert_rtvecs(payload.rvec, payload.tvec)
+                r_c2w, t_c2w = invert_vectors(payload.rvec, payload.tvec)
                 self._rvecs_c2w[cam_idx] = r_c2w
                 self._tvecs_c2w[cam_idx] = t_c2w
 
@@ -181,14 +181,14 @@ class MultiviewWorker(CalibrationProcessingWorker):
             # nothing to draw, early exit
             return
 
-        Es_c2w = extrinsics_matrix(rs_c2w, ts_c2w)
+        Es_c2w = compose_transform_matrix(rs_c2w, ts_c2w)
         cam_centres = Es_c2w[:, :3, 3]
 
         # Back-project the 5 points (principal + 4 corners) into 3D space
-        frustums_points_all = back_projection(self._img_points_2d,
-                                                      xp.asarray([40] * Ks.shape[0]),
-                                                      Ks, Es_c2w, xp.zeros_like(Ds),   # TODO: No need to create this at each call
-                                                      distortion_model='full')
+        frustums_points_all = unproject(self._img_points_2d,
+                                        xp.asarray([40] * Ks.shape[0]),
+                                        Ks, Es_c2w, xp.zeros_like(Ds),  # TODO: No need to create this at each call
+                                        distortion_model='full')
 
         # Safety Check
         # Mask out frustums for cameras whose intrinsics haven't arrived yet
@@ -250,12 +250,12 @@ class MultiviewWorker(CalibrationProcessingWorker):
         def to_gl(points):
             if points is None or points.shape[0] == 0:
                 return points
-            return rotate_points3d(points, angle_degrees=180, axis=[1.0, 0.0, 0.0])
+            return rotate_points(points, angle_degrees=180, axis=[1.0, 0.0, 0.0])
 
         def to_gl_batch(points_batch):
             if points_batch is None or points_batch.shape[0] == 0:
                 return points_batch
-            return rotate_points3d(points_batch, angle_degrees=180, axis=[1.0, 0.0,  0.0])
+            return rotate_points(points_batch, angle_degrees=180, axis=[1.0, 0.0, 0.0])
 
         scene_data = {
             'ready_mask': ready_mask,

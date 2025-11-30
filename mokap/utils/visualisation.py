@@ -9,9 +9,9 @@ import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-from mokap.utils.geometry.fitting import rays_intersection_3d
-from mokap.utils.geometry.projective import back_projection
-from mokap.utils.geometry.transforms import extrinsics_matrix
+from mokap.utils.geometry.fitting import intersect_rays
+from mokap.utils.geometry.projective import unproject
+from mokap.utils.geometry.transforms import compose_transform_matrix
 
 
 CUSTOM_COLORS = ['#9B5DE5', '#EF476F', '#FFD166', '#00BBF9', '#00F5D4', '#118ab2', '#073b4c', '#ee6c4d']
@@ -142,18 +142,18 @@ def plot_cameras_3d(
     ax.set_ylabel('Y')
     ax.set_zlabel('Z')
 
-    E_c2w = extrinsics_matrix(rvecs_c2w, tvecs_c2w)
+    E_c2w = compose_transform_matrix(rvecs_c2w, tvecs_c2w)
 
     # First, find the shared focal point. The calculation is independent of the initial depth
     # used for back-projection, we only need the normalized direction vectors
     # so we use a dummy depth of 1.0 to get the directions
-    frustums_for_direction = back_projection(
+    frustums_for_direction = unproject(
         frustums_2d, xp.ones(C), camera_matrices, E_c2w, dist_coeffs, distortion_model='full'
     )
 
     directions = frustums_for_direction[:, -1] - tvecs_c2w
     directions_normalised = directions / np.linalg.norm(directions, axis=1)[:, None]
-    focal_point = rays_intersection_3d(tvecs_c2w, directions_normalised)
+    focal_point = intersect_rays(tvecs_c2w, directions_normalised)
 
     # Determine the plotting depths
     if depth is None:
@@ -165,7 +165,7 @@ def plot_cameras_3d(
         plot_depths = xp.array([depth] * C)
 
     # Calculate the final frustums for plotting using the determined depths
-    frustums_3d = back_projection(
+    frustums_3d = unproject(
         frustums_2d,
         plot_depths,
         camera_matrices,
@@ -304,7 +304,7 @@ def plot_object_3d(
         ax = fig.add_subplot(111, projection='3d')
 
     # Create the 4x4 transformation matrix from the board's local frame to the world frame
-    board_pose_matrix = extrinsics_matrix(rvec_w, tvec_w)
+    board_pose_matrix = compose_transform_matrix(rvec_w, tvec_w)
 
     # Convert local points to homogeneous coordinates
     local_points_hom = np.hstack([
@@ -352,8 +352,8 @@ def plot_points2d_3d(
     if colors is None:
         colors = CUSTOM_COLORS
 
-    E_c2w = extrinsics_matrix(rvecs_c2w, tvecs_c2w)
-    points2d_3d = back_projection(points2d, xp.asarray([depth] * C), camera_matrices, E_c2w, dist_coeffs, distortion_model='full')
+    E_c2w = compose_transform_matrix(rvecs_c2w, tvecs_c2w)
+    points2d_3d = unproject(points2d, xp.asarray([depth] * C), camera_matrices, E_c2w, dist_coeffs, distortion_model='full')
 
     for n in range(C):
 
@@ -496,8 +496,8 @@ def plot_triangulation_scene(
     plot_depths = depths_to_3d_points * detections_depth
 
     # Back-project the 2D points using the calculated dynamic depths
-    E_c2w = extrinsics_matrix(rvecs_c2w, tvecs_c2w)
-    points2d_in_3d = back_projection(
+    E_c2w = compose_transform_matrix(rvecs_c2w, tvecs_c2w)
+    points2d_in_3d = unproject(
         xp.asarray(points2d_plot), plot_depths, camera_matrices, E_c2w, dist_coeffs, distortion_model='full'
     )
     points2d_in_3d = np.asarray(points2d_in_3d)  # convert to numpy for plotting
