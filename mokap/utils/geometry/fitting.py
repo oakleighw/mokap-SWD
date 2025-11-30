@@ -564,38 +564,39 @@ def compute_bounds(
 
 
 @jit
-def flip_pose_180(
-        rvec_o2c: xp.ndarray,
-        tvec_o2c: xp.ndarray
-) -> Tuple[xp.ndarray, xp.ndarray]:
+def flip_transform_180(
+        T_o2c: xp.ndarray
+) -> xp.ndarray:
     """
-    Generates the ambiguous "flipped" pose solution often found in planar PnP problems.
+    Generates the ambiguous "flipped" transform solution often found in planar PnP problems.
     This corresponds to a 180-degree rotation of the object around its own X-axis.
 
     Args:
-        rvec_o2c: Original rotation vector (..., 3)
-        tvec_o2c: Original translation vector (..., 3)
+        T_o2c: Original transform matrix (..., 4, 4)
 
     Returns:
-        rvec_alt: Flipped rotation vector (..., 3)
-        tvec_alt: Flipped translation vector (..., 3) (usually identical to input)
+        T_alt: Flipped transform matrix (..., 4, 4)
     """
-
-    R_b2c = rotation_matrix(rvec_o2c)  # (..., 3, 3)
+    R = T_o2c[..., :3, :3]
+    t = T_o2c[..., :3, 3]
 
     #                 [1, 0, 0]
     # Flip matrix is  [0,-1, 0]
     #                 [0, 0,-1]
-    diag = xp.array([1.0, -1.0, -1.0], dtype=rvec_o2c.dtype)
+    diag = xp.array([1.0, -1.0, -1.0], dtype=T_o2c.dtype)
     R_flip = xp.diag(diag)  # (3, 3)
 
-    # R_alt = R_b2c @ R_flip
-    R_alt = xp.matmul(R_b2c, R_flip)
-    rvec_alt = rotation_vector(R_alt)
+    # R_alt = R @ R_flip
+    R_alt = xp.matmul(R, R_flip)
 
-    tvec_alt = tvec_o2c
-
-    return rvec_alt, tvec_alt
+    # Build output matrix
+    batch_shape = T_o2c.shape[:-2]
+    extmat = xp.concatenate([R_alt, t[..., None]], axis=-1)
+    bottom_row = xp.broadcast_to(
+        xp.array([0., 0., 0., 1.], dtype=T_o2c.dtype),
+        batch_shape + (1, 4)
+    )
+    return xp.concatenate([extmat, bottom_row], axis=-2)
 
 
 @jit

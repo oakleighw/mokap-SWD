@@ -85,7 +85,7 @@ from .fitting import (
     average_qtposes,
 
     # Others
-    flip_pose_180,
+    flip_transform_180,
 )
 
 from .backend import USE_JAX, xp

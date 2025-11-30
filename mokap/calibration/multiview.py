@@ -12,15 +12,14 @@ from mokap.calibration.common import solve_pnp_robust
 
 from mokap.utils.datatypes import DetectionPayload
 
-from mokap.utils.geometry.projective import (project_to_multiple_cameras, reprojection_errors,
-                                             project_multiple_to_multiple)
+from mokap.utils.geometry.projective import project_to_cameras, reprojection_errors, project_to_cameras_multi
 
 from mokap.utils.geometry.fitting import (quaternion_average, average_qtposes, compute_bounds,
-                                          flip_pose_180)
+                                          flip_transform_180)
 
 from mokap.utils.geometry.transforms import (compose_transform_matrix, decompose_transform_matrix,
-                                             quaternion_from_vector, vector_from_quaternion,
-                                             invert_transform, invert_vectors, quaternion_distance)
+                                             quaternion_from_vector, quaternion_from_matrix, vector_from_quaternion,
+                                             invert_transform, quaternion_distance)
 
 logger = logging.getLogger(__name__)
 
@@ -172,28 +171,22 @@ class MultiviewCalibrationTool:
         # Temporal disambiguation using a stable ref pose
         if len(self._board_pose_history) > 0:
 
-            history_r, history_t = decompose_transform_matrix(xp.stack(list(self._board_pose_history)))
-            history_q = quaternion_from_vector(history_r)
+            history_q = quaternion_from_matrix(xp.stack(list(self._board_pose_history)))
 
             # We average the rotation (via quaternions) and translation separately
             q_ref = quaternion_average(history_q)
             # t_ref = xp.mean(history_t, axis=0)   # these are not super useful, the quaternion is the most important
             # r_ref = quaternion_to_axisangle(q_ref)
 
-            # Get the alternative PnP solutions (180-degree flip)
-            r_b2c_known, t_b2c_known = decompose_transform_matrix(E_b2c_known)
-            r_b2c_alt, t_b2c_alt = flip_pose_180(r_b2c_known, t_b2c_known)
-            E_b2c_alt = compose_transform_matrix(r_b2c_alt, t_b2c_alt)
+            # Get the alternative PnP solutions (180-degree flip) using transform directly
+            E_b2c_alt = flip_transform_180(E_b2c_known)
 
             # Calculate world poses for both the original and the alternative PnP result
             E_b2w_votes_alt = E_c2w_known @ E_b2c_alt
 
             # For each vote determine which (original or alternative) is closer to the stable ref
-            r_votes, _ = decompose_transform_matrix(E_b2w_votes)
-            q_votes = quaternion_from_vector(r_votes)
-
-            r_votes_alt, _ = decompose_transform_matrix(E_b2w_votes_alt)
-            q_votes_alt = quaternion_from_vector(r_votes_alt)
+            q_votes = quaternion_from_matrix(E_b2w_votes)
+            q_votes_alt = quaternion_from_matrix(E_b2w_votes_alt)
 
             # Calculate angular distance to the reference for both sets of poses
             dist_original = quaternion_distance(q_votes, q_ref)
@@ -235,14 +228,14 @@ class MultiviewCalibrationTool:
 
         world_pts = (E_b2w @ self._board_pts_hom.T).T[:, :3]
 
-        r_w2c_new, t_w2c_new = invert_vectors(r_c2w_new, t_c2w_new)
+        # Get world-to-camera transforms for projection
+        T_w2c_new = invert_transform(E_c2w_new)
         K_batch = self._cam_matrices[cam_indices]
         D_batch = self._dist_coeffs[cam_indices]
 
-        reproj_pts, reproj_mask = project_to_multiple_cameras(
+        reproj_pts, reproj_mask = project_to_cameras(
             world_pts,
-            r_w2c_new,
-            t_w2c_new,
+            T_w2c_new,
             K_batch,
             D_batch,
             distortion_model='full'
@@ -283,10 +276,10 @@ class MultiviewCalibrationTool:
 
         # Reestimate the board-to-camera pose and validate it
         success, rvec, tvec, pose_errors = solve_pnp_robust(
-            points3d=np.asarray(self._object_points[detection.pointsIDs]),
+            points3d=self._object_points[detection.pointsIDs],
             points2d=detection.points2D,
-            K=np.asarray(self._cam_matrices[cam_idx]),
-            D=np.asarray(self._dist_coeffs[cam_idx])
+            K=self._cam_matrices[cam_idx],
+            D=self._dist_coeffs[cam_idx]
         )
 
         # if PnP fails, return
@@ -470,8 +463,8 @@ class MultiviewCalibrationTool:
                 #
                 logger.debug(f"[BA] >>> STAGE 1: Consolidating cameras position with {current_P} frames...")
                 success_s1, results_s1 = bundle_adjustment.run_bundle_adjustment(
-                    K_initial=K_online,
-                    D_initial=D_online,
+                    camera_matrices_initial=K_online,
+                    distortion_coeffs_initial=D_online,
                     cam_rvecs_initial=cam_r_online,
                     cam_tvecs_initial=cam_t_online,
 
@@ -517,8 +510,8 @@ class MultiviewCalibrationTool:
                 poses_r_s2_init, poses_t_s2_init = results_s1['poses_r_opt'], results_s1['poses_t_opt']
 
                 success_s2, results_s2 = bundle_adjustment.run_bundle_adjustment(
-                    K_initial=K_s2_init,
-                    D_initial=D_s2_init,
+                    camera_matrices_initial=K_s2_init,
+                    distortion_coeffs_initial=D_s2_init,
                     cam_rvecs_initial=cam_r_s2_init,
                     cam_tvecs_initial=cam_t_s2_init,
 
@@ -563,8 +556,8 @@ class MultiviewCalibrationTool:
                 poses_r_s3_init, poses_t_s3_init = results_s2['poses_r_opt'], results_s2['poses_t_opt']
 
                 success_s3, final_results_attempt = bundle_adjustment.run_bundle_adjustment(
-                    K_initial=K_s3_init,
-                    D_initial=D_s3_init,
+                    camera_matrices_initial=K_s3_init,
+                    distortion_coeffs_initial=D_s3_init,
                     cam_rvecs_initial=cam_r_s3_init,
                     cam_tvecs_initial=cam_t_s3_init,
 
@@ -684,23 +677,21 @@ class MultiviewCalibrationTool:
     ) -> Optional[Dict[str, Tuple[float, float]]]:
 
         if self._refined:
-
             # calculate the 3D world coordinates of all point instances using the refined poses
             E_b2w_all_opt = compose_transform_matrix(*self.refined_board_poses)
             world_pts_all_instances = xp.einsum('pij,nj->pni', E_b2w_all_opt, self._board_pts_hom)[:, :, :3]
 
             # Reprojection and error calculation
-
-            # Get all necessary parameters for projection
             observed_pts2d, visibility_mask = self.image_points
 
-            # Invert camera-to-world poses to get world-to-camera poses for projection
-            r_w2c, t_w2c = invert_vectors(*self._refined_extrinsics)
+            # Get world-to-camera transforms
+            T_c2w = compose_transform_matrix(*self._refined_extrinsics)
+            T_w2c = invert_transform(T_c2w)
 
             # Project all 3D points into all cameras
-            reprojected_pts, valid_depth_mask = project_multiple_to_multiple(
+            reprojected_pts, valid_depth_mask = project_to_cameras_multi(
                 world_pts_all_instances,
-                r_w2c, t_w2c,
+                T_w2c,
                 *self._refined_intrinsics,
                 distortion_model='full'
             )

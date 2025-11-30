@@ -2,11 +2,13 @@ import logging
 import cv2
 
 import numpy as np
+
+from mokap.utils.geometry import compose_transform_matrix
 from mokap.utils.geometry.backend import xp, ArrayLike
 
 from typing import Tuple, Optional, Literal, Union, Sequence
 from mokap.utils.geometry.projective import project, reprojection_errors
-from mokap.utils.geometry.fitting import flip_pose_180
+from mokap.utils.geometry.fitting import flip_transform_180
 from mokap.utils.datatypes import ChessBoard, CharucoBoard, CalibrateCameraResult, DistortionModel
 
 logger = logging.getLogger(__name__)
@@ -122,8 +124,11 @@ def solve_pnp_robust(
                 K_xp = xp.asarray(K)
                 D_xp = xp.asarray(D)
 
-                reproj, _ = project(points3d_xp, rvec_xp, tvec_xp, K_xp, D_xp)
-                reproj_flip, _ = project(points3d_xp, rvec_flip_xp, tvec_flip_xp, K_xp, D_xp)
+                T_xp = compose_transform_matrix(rvec_xp, tvec_xp)
+                T_flip_xp = compose_transform_matrix(rvec_flip_xp, tvec_flip_xp)
+
+                reproj, _ = project(points3d_xp, T_xp, K_xp, D_xp)
+                reproj_flip, _ = project(points3d_xp, T_flip_xp, K_xp, D_xp)
 
                 reproj_errors = reprojection_errors(points2d_xp, reproj)
                 reproj_errors_flip = reprojection_errors(points2d_xp, reproj_flip)
@@ -160,13 +165,15 @@ def solve_pnp_robust(
     best_tvec_xp = xp.asarray(best_tvec).squeeze()
 
     if best_error is None:
-        if points2d_xp is None or points3d_xp is None or K is None or D is None:
+        if points2d_xp is None or points3d_xp is None or K_xp is None or D_xp is None:
             # TODO: is this possible here?
             points2d_xp = xp.asarray(points2d)
             points3d_xp = xp.asarray(points3d)
             K_xp = xp.asarray(K)
             D_xp = xp.asarray(D)
-        final_reproj, _ = project(points3d_xp, best_rvec_xp, best_tvec_xp, K_xp, D_xp)
+
+        T_xp = compose_transform_matrix(best_rvec_xp, best_tvec_xp)
+        final_reproj, _ = project(points3d_xp, T_xp, K_xp, D_xp)
         final_errors = reprojection_errors(points2d_xp, final_reproj)
     else:
         # otherwise, the one we stored is the correct one

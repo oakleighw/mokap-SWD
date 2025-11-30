@@ -2,11 +2,11 @@ from functools import partial
 from typing import Tuple, Union, Optional, Dict
 try:
     from .backend import xp, jit, lax, _eps, _tiny, align_batch_dims
-    from .transforms import rotation_matrix, compose_transform_matrix, projection_matrix, decompose_transform_matrix, \
+    from .transforms import compose_transform_matrix, projection_matrix, decompose_transform_matrix, \
         invert_intrinsics, homogenize, dehomogenize
 except ImportError:
     from mokap.utils.geometry.backend import xp, jit, lax, _eps, _tiny, align_batch_dims
-    from mokap.utils.geometry.transforms import (rotation_matrix, compose_transform_matrix, projection_matrix,
+    from mokap.utils.geometry.transforms import (compose_transform_matrix, projection_matrix,
                                                  decompose_transform_matrix, invert_intrinsics, homogenize,
                                                  dehomogenize)
 
@@ -175,21 +175,18 @@ def undistort(
 @partial(jit, static_argnames=['distortion_model'])
 def project(
         points3d: xp.ndarray,
-        rvec: xp.ndarray,
-        tvec: xp.ndarray,
+        T: xp.ndarray,
         K: xp.ndarray,
         D: xp.ndarray,
         distortion_model: str = 'standard'
 ) -> Tuple[xp.ndarray, xp.ndarray]:
     """
-    Fundamental projection function (equivalent to cv2.projectPoints).
     Projects points from a source coordinate system into the image plane of a camera.
 
     Args:
         points3d: Points in the source coordinate system (..., 3)
-        rvec: Rotation vector for transform from source to camera (..., 3)
-        tvec: Translation vector for transform from source to camera (..., 3)
-        K: Camera intrinsics matrix K (..., 3, 3)
+        T: Transform matrix (source-to-camera) (..., 4, 4) or (..., 3, 4)
+        K: Camera intrinsics matrix (..., 3, 3)
         D: Camera distortion coefficients (..., D)
         distortion_model: Distortion model string
 
@@ -197,21 +194,19 @@ def project(
         image_points: Projected 2D points in the image plane (..., 2)
         valid_mask: Boolean mask indicating points strictly in front of the camera (Z > 0)
     """
-
-    # object_points is (..., 3), so batch dims are ndim - 1
+    # points3d is (..., 3), so batch dims are ndim - 1
     target_batch_dim = points3d.ndim - 1
 
-    rvec = align_batch_dims(target_batch_dim, rvec, data_dims=1)
-    tvec = align_batch_dims(target_batch_dim, tvec, data_dims=1)
-    # Note: dist_coeffs alignment happens in the distortion() call
-
-    # camera_matrix is matrix, so data_dims=2
+    # Transform matrix is (..., 4, 4) or (..., 3, 4), data_dims=2
+    T = align_batch_dims(target_batch_dim, T, data_dims=2)
     K = align_batch_dims(target_batch_dim, K, data_dims=2)
 
-    R = rotation_matrix(rvec)  # (..., 3, 3)
+    # Extract R and t from T (works for both 4x4 and 3x4)
+    R = T[..., :3, :3]
+    t = T[..., :3, 3]
 
     # R @ P + t
-    Xc = xp.einsum('...ij,...j->...i', R, points3d) + tvec
+    Xc = xp.einsum('...ij,...j->...i', R, points3d) + t
     z = Xc[..., 2]
 
     valid_mask_bool = z > 1e-4  # small positive threshold for safety
@@ -236,6 +231,64 @@ def project(
     return image_points, valid_mask
 
 
+def project_to_cameras(
+        points3d: xp.ndarray,
+        T_w2c: xp.ndarray,
+        K: xp.ndarray,
+        D: xp.ndarray,
+        distortion_model: str = 'standard'
+):
+    """
+    Project points (N, 3) to C different cameras.
+
+    Args:
+        points3d: Points in world coordinates (N, 3)
+        T_w2c: World-to-camera transforms (C, 4, 4)
+        K: Camera matrices (C, 3, 3)
+        D: Distortion coefficients (C, D)
+
+    Returns:
+        points2d: (C, N, 2)
+        valid_mask: (C, N)
+    """
+    obj_exp = points3d[None, ...]        # (1, N, 3)
+    T_exp = T_w2c[:, None, :, :]         # (C, 1, 4, 4)
+    return project(obj_exp, T_exp, K, D, distortion_model)
+
+
+def project_to_cameras_multi(
+        points3d: xp.ndarray,
+        T_w2c: xp.ndarray,
+        K: xp.ndarray,
+        D: xp.ndarray,
+        distortion_model: str = 'standard'
+) -> Tuple[xp.ndarray, xp.ndarray]:
+    """
+    Projects P temporal snapshots of a point cloud into C camera views.
+
+    Args:
+        points3d: Points in world coordinates (P, N, 3) or (N, 3)
+        T_w2c: World-to-camera transforms (C, 4, 4)
+        K: Camera matrices (C, 3, 3)
+        D: Distortion coefficients (C, D)
+
+    Returns:
+        points2d: (C, P, N, 2)
+        valid_mask: (C, P, N)
+    """
+    if points3d.ndim == 2:
+        obj_exp = points3d[None, None, ...]  # (1, 1, N, 3)
+    else:
+        obj_exp = points3d[None, ...]        # (1, P, N, 3)
+
+    T_exp = T_w2c[:, None, None, :, :]       # (C, 1, 1, 4, 4)
+    K_exp = K[:, None, None, :, :]           # (C, 1, 1, 3, 3)
+    D_exp = D[:, None, None, :]              # (C, 1, 1, D)
+
+    return project(obj_exp, T_exp, K_exp, D_exp, distortion_model)
+
+
+# Legacy wrappers for backward compatibility (deprecated)
 def project_multiple_poses(
         points3d: xp.ndarray,
         rvec: xp.ndarray,
@@ -244,14 +297,11 @@ def project_multiple_poses(
         D: xp.ndarray,
         distortion_model: str = 'standard'
 ):
-    """
-    Wrapper for project_points that projects 1 set of points (N, 3) using P poses (P, 3).
-    Returns (P, N, 2).
-    """
-    obj_exp = points3d[None, ...]  # (1, N, 3)
-    rvec_exp = rvec[:, None, :]  # (P, 1, 3)
-    tvec_exp = tvec[:, None, :]  # (P, 1, 3)
-    return project(obj_exp, rvec_exp, tvec_exp, K, D, distortion_model)
+    """DEPRECATED: Use project() with transform matrices directly."""
+    T = compose_transform_matrix(rvec, tvec)
+    obj_exp = points3d[None, ...]
+    T_exp = T[:, None, :, :]
+    return project(obj_exp, T_exp, K, D, distortion_model)
 
 
 def project_to_multiple_cameras(
@@ -262,18 +312,9 @@ def project_to_multiple_cameras(
         D: xp.ndarray,
         distortion_model: str = 'standard'
 ):
-    """
-    Wrapper for project_points to project points (N, 3) to C different cameras.
-    Where each camera has its own Intrinsics (K, D) and its own pose (rvec, tvec).
-    Returns (C, N, 2).
-    """
-    # Points: (N, 3) -> (1, N, 3)
-    obj_exp = points3d[None, ...]
-    # Poses: (C, 3) -> (C, 1, 3)
-    rvec_exp = rvec[:, None, :]
-    tvec_exp = tvec[:, None, :]
-    # project_points will align intrinsics to (C, 1, 3, 3) because 'obj_exp' has 2 batch dimensions
-    return project(obj_exp, rvec_exp, tvec_exp, K, D, distortion_model)
+    """DEPRECATED: Use project_to_cameras() with transform matrices directly."""
+    T = compose_transform_matrix(rvec, tvec)
+    return project_to_cameras(points3d, T, K, D, distortion_model)
 
 
 def project_multiple_to_multiple(
@@ -284,37 +325,90 @@ def project_multiple_to_multiple(
         D: xp.ndarray,
         distortion_model: str = 'standard'
 ) -> Tuple[xp.ndarray, xp.ndarray]:
+    """DEPRECATED: Use project_to_cameras_multi() with transform matrices directly."""
+    T = compose_transform_matrix(rvecs, tvecs)
+    return project_to_cameras_multi(points3d, T, K, D, distortion_model)
+
+
+@partial(jit, static_argnames=['distortion_model'])
+def project_with_object_pose(
+        object_points3d: xp.ndarray,
+        T_w2c: xp.ndarray,
+        T_o2w: xp.ndarray,
+        K: xp.ndarray,
+        D: xp.ndarray,
+        distortion_model: str = 'standard'
+) -> Tuple[xp.ndarray, xp.ndarray]:
     """
-    Projects P temporal snapshots of a point cloud into C camera views.
-    Computes the Cartesian product of (C cameras) x (P frames).
+    Projects 3D points from an object's local frame into a camera view by
+    composing object-to-world and world-to-camera transforms.
+
+    T_o2c = T_w2c @ T_o2w
 
     Args:
-        points3d: Points in world coordinates for each frame (P, N, 3)
-        rvecs: World-to-camera rotation vectors (C, 3)
-        tvecs: World-to-camera translation vectors (C, 3)
-        K: Camera matrices (C, 3, 3) or (3, 3)
-        D: Distortion coefficients (C, D) or (D,)
+        object_points3d: Points in object coordinates (..., 3)
+        T_w2c: World-to-camera transform (..., 4, 4)
+        T_o2w: Object-to-world transform (..., 4, 4)
+        K: Camera intrinsics (..., 3, 3)
+        D: Distortion coefficients (..., D)
+
+    Returns:
+        image_points: (..., 2)
+        valid_mask: (...)
+    """
+    target_dim = object_points3d.ndim - 1
+    T_w2c = align_batch_dims(target_dim, T_w2c, 2)
+    T_o2w = align_batch_dims(target_dim, T_o2w, 2)
+
+    T_o2c = T_w2c @ T_o2w
+    return project(object_points3d, T_o2c, K, D, distortion_model)
+
+
+def project_object_to_cameras(
+        object_points3d: xp.ndarray,
+        T_w2c: xp.ndarray,
+        T_o2w: xp.ndarray,
+        K: xp.ndarray,
+        D: xp.ndarray,
+        distortion_model: str = 'standard'
+):
+    """
+    Projects N object points through P object poses into C cameras.
+
+    Args:
+        object_points3d: 3D points in object coordinates (N, 3)
+        T_w2c: Camera poses (world -> cam), (C, 4, 4)
+        T_o2w: Object poses (object -> world), (P, 4, 4)
+        K: Camera intrinsics (C, 3, 3)
+        D: Distortion coefficients (C, D)
 
     Returns:
         points2d: (C, P, N, 2)
         valid_mask: (C, P, N)
     """
+    # Expand for broadcasting: (C, 1, 4, 4) @ (1, P, 4, 4) -> (C, P, 4, 4)
+    T_w2c_exp = T_w2c[:, None, :, :]
+    T_o2w_exp = T_o2w[None, :, :, :]
+    T_net = T_w2c_exp @ T_o2w_exp
 
-    # If points are (N, 3), make them (1, 1, N, 3) to broadcast over C and P
-    if points3d.ndim == 2:
-        obj_exp = points3d[None, None, ...] # (1, P, N, 3)
+    # Expand for points dimension
+    obj_exp = object_points3d[None, None, :, :]  # (1, 1, N, 3)
+    T_net_exp = T_net[:, :, None, :, :]          # (C, P, 1, 4, 4)
+
+    if K.ndim == 3:
+        K_exp = K[:, None, None, :, :]
     else:
-        obj_exp = points3d[None, ...]       # (1, P, N, 3)
+        K_exp = K
 
-    rvec_exp = rvecs[:, None, None, :]      # (C, 1, 1, 3)
-    tvec_exp = tvecs[:, None, None, :]      # (C, 1, 1, 3)
-    K_exp = K[:, None, None, :, :]          # (C, 1, 1, 3, 3)
-    D_exp = D[:, None, None, :]             # (C, 1, 1, D)
+    if D.ndim == 2:
+        D_exp = D[:, None, None, :]
+    else:
+        D_exp = D
 
-    return project(obj_exp, rvec_exp, tvec_exp, K_exp, D_exp, distortion_model)
+    return project(obj_exp, T_net_exp, K_exp, D_exp, distortion_model)
 
 
-@partial(jit, static_argnames=['distortion_model'])
+# Legacy wrappers (deprecated)
 def project_object_to_camera(
         object_points3d: xp.ndarray,
         r_w2c: xp.ndarray,
@@ -325,28 +419,10 @@ def project_object_to_camera(
         D: xp.ndarray,
         distortion_model: str = 'standard'
 ) -> Tuple[xp.ndarray, xp.ndarray]:
-    """
-    Projects 3D points from an object's local frame into a camera view by
-    composing object-to-world and world-to-camera poses.
-
-    T_o2c = T_w2c @ T_o2w
-    """
-
-    # Target batch dim based on points
-    target_dim = object_points3d.ndim - 1
-
-    r_w2c = align_batch_dims(target_dim, r_w2c, 1)
-    t_w2c = align_batch_dims(target_dim, t_w2c, 1)
-    r_o2w = align_batch_dims(target_dim, r_o2w, 1)
-    t_o2w = align_batch_dims(target_dim, t_o2w, 1)
-
-    # Compose poses: world -> camera and object -> world  ==>  object -> camera
+    """DEPRECATED: Use project_with_object_pose() with transform matrices."""
     T_w2c = compose_transform_matrix(r_w2c, t_w2c)
     T_o2w = compose_transform_matrix(r_o2w, t_o2w)
-    T_o2c = T_w2c @ T_o2w
-
-    r_o2c, t_o2c = decompose_transform_matrix(T_o2c)
-    return project(object_points3d, r_o2c, t_o2c, K, D, distortion_model)
+    return project_with_object_pose(object_points3d, T_w2c, T_o2w, K, D, distortion_model)
 
 
 def project_object_views_batched(
@@ -359,57 +435,10 @@ def project_object_views_batched(
         D: xp.ndarray,
         distortion_model: str = 'standard'
 ):
-    """
-    Projects N object points through P object poses into C cameras.
-
-    Args:
-        object_points3d: 3D points in object coordinates (N, 3)
-        r_w2c, t_w2c: Camera poses (world -> cam), (C, 3)
-        r_o2w, t_o2w: Object poses (object -> world), (P, 3)
-
-    Returns:
-        Projected points (C, P, N, 2)
-    """
-
-    # Cameras (C, ...) -> (C, 1, ...)
-    r_w2c_exp = r_w2c[:, None, :]
-    t_w2c_exp = t_w2c[:, None, :]
-
-    # Object Poses (P, ...) -> (1, P, ...)
-    r_o2w_exp = r_o2w[None, :, :]
-    t_o2w_exp = t_o2w[None, :, :]
-
-    # Compute net Extrinsics (C, P, 4, 4)
-    T_w2c = compose_transform_matrix(r_w2c_exp, t_w2c_exp)  # (C, 1, 4, 4)
-    T_o2w = compose_transform_matrix(r_o2w_exp, t_o2w_exp)  # (1, P, 4, 4)
-
-    # Matmul broadcasts (C, 1, 4, 4) @ (1, P, 4, 4) -> (C, P, 4, 4)
-    T_net = T_w2c @ T_o2w
-
-    # Convert back to rvec/tvec (C, P, 3)
-    r_net, t_net = decompose_transform_matrix(T_net)
-
-    # Project
-    # Poses (C, P, 3), ok
-    # Points (N, 3) -> Need (1, 1, N, 3)
-    # Intrinsics (C, 3, 3) -> Need (C, 1, 1, 3, 3)
-
-    obj_exp = object_points3d[None, None, :, :]
-
-    r_net = r_net[:, :, None, :]  # (C, P, 1, 3)
-    t_net = t_net[:, :, None, :]
-
-    if K.ndim == 3:
-        K_exp = K[:, None, None, :, :]
-    else:
-        K_exp = K
-
-    if D.ndim == 2:
-        D_exp = D[:, None, None, :]
-    else:
-        D_exp = D
-
-    return project(obj_exp, r_net, t_net, K_exp, D_exp, distortion_model)
+    """DEPRECATED: Use project_object_to_cameras() with transform matrices."""
+    T_w2c = compose_transform_matrix(r_w2c, t_w2c)
+    T_o2w = compose_transform_matrix(r_o2w, t_o2w)
+    return project_object_to_cameras(object_points3d, T_w2c, T_o2w, K, D, distortion_model)
 
 
 @partial(jit, static_argnames=['distortion_model'])

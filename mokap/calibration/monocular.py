@@ -12,6 +12,7 @@ from mokap.calibration.detectors import ChessboardDetector, CharucoDetector
 from mokap.utils.datatypes import ChessBoard, CharucoBoard, DistortionModel
 from mokap.utils import SENSOR_SIZES, estimate_camera_matrix
 from mokap.utils.geometry.projective import project
+from mokap.utils.geometry.transforms import compose_transform_matrix, decompose_transform_matrix
 
 logger = logging.getLogger(__name__)
 
@@ -78,10 +79,8 @@ class MonocularCalibrationTool:
         self._K: Optional[np.ndarray] = None
         self._D: Optional[np.ndarray] = None
 
-        # Current estimated rvec and tvec (for a given frame)
-        # These are returned as xp by the robust PnP solver, they can stay as xp in here
-        self._curr_rvec_b2c_xp: Optional[xp.ndarray] = None
-        self._curr_tvec_b2c_xp: Optional[xp.ndarray] = None
+        # Current estimated board-to-camera transform (for a given frame)
+        self._curr_T_b2c: Union[xp.ndarray, None] = None
 
         if imsize_hw is not None:
             self._update_grid(imsize_hw)
@@ -151,11 +150,15 @@ class MonocularCalibrationTool:
 
     @property
     def extrinsics(self) -> Tuple[Optional[xp.ndarray], Optional[xp.ndarray]]:
-        if self._curr_rvec_b2c_xp is None or self._curr_tvec_b2c_xp is None:
+        if self._curr_T_b2c is None:
             return None, None
+
+        rvec, tvec = decompose_transform_matrix(self._curr_T_b2c)
         # have to copy (the jax versions are read only)
         # TODO: Can't we return xp directly here?
-        return xp.asarray(self._curr_rvec_b2c_xp).copy(), xp.asarray(self._curr_tvec_b2c_xp).copy()
+        return np.asarray(rvec).copy(), np.asarray(tvec).copy()
+
+        # TODO: There is no reason anymore to return separate rvec and tvec
 
     @property
     def has_detection(self) -> bool:
@@ -167,7 +170,7 @@ class MonocularCalibrationTool:
 
     @property
     def has_extrinsics(self) -> bool:
-        return all(x is not None for x in self.extrinsics)
+        return self._curr_T_b2c is not None
 
     @property
     def curr_nb_points(self) -> int:
@@ -391,7 +394,7 @@ class MonocularCalibrationTool:
 
         # we need a detection and to have intrinsics to be able to compute extrinsics
         if not self.has_detection or not self.has_intrinsics:
-            self._curr_rvec_b2c_xp, self._curr_tvec_b2c_xp = None, None
+            self._curr_T_b2c = None
             self._pose_error = np.nan
             return False
 
@@ -400,7 +403,7 @@ class MonocularCalibrationTool:
 
             # if the points are collinear, extrinsics estimation is garbage, so abort
             if cv2.aruco.testCharucoCornersCollinear(self.calibration_board.to_opencv(), self._pointsIDs):
-                self._curr_rvec_b2c_xp, self._curr_tvec_b2c_xp = None, None
+                self._curr_T_b2c = None
                 self._pose_error = np.nan
                 return False
 
@@ -415,12 +418,11 @@ class MonocularCalibrationTool:
         )
 
         if not success:
-            self._curr_rvec_b2c_xp, self._curr_tvec_b2c_xp = None, None
+            self._curr_T_b2c = None
             self._pose_error = np.nan
             return False
 
-        self._curr_rvec_b2c_xp = rvec_b2c
-        self._curr_tvec_b2c_xp = tvec_b2c
+        self._curr_T_b2c = compose_transform_matrix(rvec_b2c, tvec_b2c)
         self._pose_error = pose_errors['rms']
 
         return True

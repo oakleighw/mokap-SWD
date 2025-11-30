@@ -16,8 +16,8 @@ from mokap.utils import CallbackOutputStream
 from mokap.utils.datatypes import DistortionModel
 # from alive_progress import alive_bar
 
-from mokap.utils.geometry.projective import project_object_views_batched, project_multiple_to_multiple
-from mokap.utils.geometry.transforms import invert_vectors
+from mokap.utils.geometry.projective import project, project_to_cameras_multi, project_object_to_cameras
+from mokap.utils.geometry.transforms import compose_transform_matrix, invert_transform
 
 DIST_MODEL_MAP = {'none': 0, 'simple': 4, 'standard': 5, 'full': 8, 'rational': 8}
 
@@ -190,13 +190,10 @@ def _get_bounds(
     # Set bounds for camera intrinsics
     if not cfg['fix_cameras_intrinsics']:
         for i in range(nb_intr_sets):
-            if is_shared:
-                w = np.max(images_sizes_wh[:, 0])
-                h = np.max(images_sizes_wh[:, 1])
-            else:
-                w, h = images_sizes_wh[i]
+            cam_idx = 0 if is_shared else i
+            w, h = images_sizes_wh[cam_idx]
 
-            # Focal length and principal point
+            # Focal Length and Principal Point
             if 'cam_mat' in spec['blocks']:
                 info = spec['blocks']['cam_mat']
                 size_per_set = info['size'] // nb_intr_sets
@@ -606,7 +603,10 @@ def cost_function(
 
     Ks, Ds, cam_r, cam_t, object_points, poses_r, poses_t = _unpack_params(params, fixed_params, spec)
     all_residuals = []
-    r_w2c, t_w2c = invert_vectors(cam_r, cam_t)
+
+    # Build camera transforms: cam_r/t are camera-to-world, we need world-to-camera
+    T_c2w = compose_transform_matrix(cam_r, cam_t)
+    T_w2c = invert_transform(T_c2w)
 
     cfg = spec['config']
     C, P, N = cfg['nb_cams'], cfg['nb_frames'], cfg['nb_points']
@@ -617,16 +617,15 @@ def cost_function(
     if is_rigid_object:
         # Workflow: Rigid object (calibration board)
         # Projects a single set of N points for each of the P poses
-        # object_points shape: (N, 3), poses_r/t shape: (P, 3)
-        reproj, valid_depth = project_object_views_batched(
-            object_points, r_w2c, t_w2c, poses_r, poses_t, Ks, Ds, distortion_model
+        T_o2w = compose_transform_matrix(poses_r, poses_t)
+        reproj, valid_depth = project_object_to_cameras(
+            object_points, T_w2c, T_o2w, Ks, Ds, distortion_model
         )
     else:
         # Workflows: Scaffolding or Temporally-consistent non-rigid (animal)
-        # Both use the same multiple-to-multiple projection logic (their 3D point structure is the same)
         object_points_per_frame = object_points.reshape(P, N, 3)
-        reproj, valid_depth = project_multiple_to_multiple(
-            object_points_per_frame, r_w2c, t_w2c, Ks, Ds, distortion_model
+        reproj, valid_depth = project_to_cameras_multi(
+            object_points_per_frame, T_w2c, Ks, Ds, distortion_model
         )
 
     # Residuals calculation
@@ -781,8 +780,8 @@ def _validate_inputs(**kwargs):
 
 
 def run_bundle_adjustment(
-        K_initial:                  jnp.ndarray,
-        D_initial:                  jnp.ndarray,
+        camera_matrices_initial:    jnp.ndarray,
+        distortion_coeffs_initial:  jnp.ndarray,
         cam_rvecs_initial:          jnp.ndarray,
         cam_tvecs_initial:          jnp.ndarray,
         images_sizes_wh:            ArrayLike,
@@ -850,13 +849,13 @@ def run_bundle_adjustment(
     # Prepare and pad distortion coefficients if necessary
     if not fix_cameras_intrinsics:
         n_d = spec['config']['n_d']
-        current_d = D_initial.shape[1]
+        current_d = distortion_coeffs_initial.shape[1]
         if current_d < n_d:
             padding = ((0, 0), (0, n_d - current_d))
-            D_initial = jnp.pad(D_initial, padding, mode='constant')
+            distortion_coeffs_initial = jnp.pad(distortion_coeffs_initial, padding, mode='constant')
 
     x0, fixed_params = _pack_params(
-        K_initial, D_initial,
+        camera_matrices_initial, distortion_coeffs_initial,
         cam_rvecs_initial, cam_tvecs_initial,
         object_points_initial, poses_rvecs_initial, poses_tvecs_initial,
         spec
@@ -878,7 +877,7 @@ def run_bundle_adjustment(
     weights = residual_weights(
         points2d=image_points,
         visibility_mask=visibility_mask,
-        camera_matrices=K_initial,
+        camera_matrices=camera_matrices_initial,
         distance_falloff_gamma=radial_penalty
     )
 
