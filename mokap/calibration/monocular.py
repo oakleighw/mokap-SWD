@@ -51,33 +51,37 @@ class MonocularCalibrationTool:
         # TODO: Error normalisation factor: we want to use image diagonal to normalise the errors
         self._err_norm = 1
 
-        self._points2d_np = None
-        self._points_ids_np = None
+        self._points2d = None
+        self._pointsIDs = None
 
         # Object points in 3D and their reprojection
-        self._object_points_3d = xp.concatenate([xp.asarray(self.calibration_board.object_points),
-                                                  xp.asarray(self.calibration_board.corner_points)])
-        self._reprojected_points = np.full((self._object_points_3d.shape[0], 2), np.nan, dtype=np.float32)
+        self._points3d = np.concatenate([np.asarray(self.calibration_board.object_points),
+                                         np.asarray(self.calibration_board.corner_points)])
+
+        # This won't change so we can push to GPU now if needed
+        self._points3d_xp = xp.asarray(self._points3d)
+
+        self._reprojected_points_xp = xp.full((self._points3d.shape[0], 2), xp.nan, dtype=xp.float32)
 
         # Samples stack
         self.stack_points2d: deque = deque(maxlen=self._max_stack)
-        self.stack_points_ids: deque = deque(maxlen=self._max_stack)
+        self.stack_pointsIDs: deque = deque(maxlen=self._max_stack)
 
         # Error metrics
         # The raw OpenCV errors for comparing future calibrations
-        self._intrinsics_errors_opencv: ArrayLike = np.array([np.inf])
+        self._intrinsics_errors_opencv: np.ndarray = np.array([np.inf])
         # Also store the true RMS for comparison with other parts of the app
-        self._intrinsics_errors_rms: ArrayLike = np.array([np.inf])
+        self._intrinsics_errors_rms: np.ndarray = np.array([np.inf])
 
         self._pose_error: float = np.nan
 
-        # Where to store the intrinsics
-        self._camera_matrix: Union[xp.ndarray, None] = None
-        self._dist_coeffs: Union[xp.ndarray, None] = None
+        self._K: Optional[np.ndarray] = None
+        self._D: Optional[np.ndarray] = None
 
         # Current estimated rvec and tvec (for a given frame)
-        self._curr_rvec_b2c: Union[xp.ndarray, None] = None
-        self._curr_tvec_b2c: Union[xp.ndarray, None] = None
+        # These are returned as xp by the robust PnP solver, they can stay as xp in here
+        self._curr_rvec_b2c_xp: Optional[xp.ndarray] = None
+        self._curr_tvec_b2c_xp: Optional[xp.ndarray] = None
 
         if imsize_hw is not None:
             self._update_grid(imsize_hw)
@@ -92,22 +96,21 @@ class MonocularCalibrationTool:
         elif isinstance(sensor_size, (tuple, list, set, ArrayLike)) and len(sensor_size) == 2:
             self._cam_sensor_size = np.array(sensor_size)
 
-        # compute theoretical camera matrix if possible
-        # (this helps the first estimation)
-        self._zero_coeffs = xp.zeros(8, dtype=xp.float32)
-        self._theoretical_cam_mat: Union[xp.ndarray, None] = None
+        # Estimate K if possible (this helps the first intrinsics estimation)
+        self._D_zero = np.zeros(8, dtype=np.float32)
+        self._K_est: Optional[np.ndarray] = None
 
         if None not in (focal_mm, self._img_w, self._img_h) and self._cam_sensor_size is not None:
-            theoretical_cam_mat = estimate_camera_matrix(
+            K_est = estimate_camera_matrix(
                 f_mm=focal_mm,
                 image_wh_px=(self._img_w, self._img_h),
                 sensor_wh_mm=self._cam_sensor_size,
                 pixel_pitch_um=None             # TODO: probably better to use this instead of sensor size
             )
 
-            self._theoretical_cam_mat = xp.asarray(theoretical_cam_mat)
-            self._camera_matrix = xp.asarray(self._theoretical_cam_mat.copy())
-            self._dist_coeffs = xp.asarray(self._zero_coeffs)
+            self._K_est = np.asarray(K_est)
+            self._K = self._K_est.copy()
+            self._D = self._D_zero.copy()
 
     def _update_grid(self, imsize_hw):
         """ Internal method to set or update arrays related to image size """
@@ -139,23 +142,24 @@ class MonocularCalibrationTool:
         self._grid_weights = self._min_cells_weight + (1 - self._min_cells_weight) * (norm_dist ** self._cells_gamma)
 
     @property
-    def detection(self) -> Tuple[ArrayLike, ArrayLike]:
-        return self._points2d_np, self._points_ids_np
+    def detection(self) -> Tuple[np.ndarray, np.ndarray]:
+        return self._points2d, self._pointsIDs
 
     @property
-    def intrinsics(self) -> Tuple[ArrayLike, ArrayLike]:
-        return self._camera_matrix, self._dist_coeffs
+    def intrinsics(self) -> Tuple[np.ndarray, np.ndarray]:
+        return self._K, self._D
 
     @property
-    def extrinsics(self) -> Tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        if self._curr_rvec_b2c is None or self._curr_tvec_b2c is None:
+    def extrinsics(self) -> Tuple[Optional[xp.ndarray], Optional[xp.ndarray]]:
+        if self._curr_rvec_b2c_xp is None or self._curr_tvec_b2c_xp is None:
             return None, None
         # have to copy (the jax versions are read only)
-        return np.asarray(self._curr_rvec_b2c).copy(), np.asarray(self._curr_tvec_b2c).copy()
+        # TODO: Can't we return xp directly here?
+        return xp.asarray(self._curr_rvec_b2c_xp).copy(), xp.asarray(self._curr_tvec_b2c_xp).copy()
 
     @property
     def has_detection(self) -> bool:
-        return all(x is not None for x in self.detection) and len(self._points2d_np) >= self._min_pts
+        return all(x is not None for x in self.detection) and len(self._points2d) >= self._min_pts
 
     @property
     def has_intrinsics(self) -> bool:
@@ -167,14 +171,14 @@ class MonocularCalibrationTool:
 
     @property
     def curr_nb_points(self) -> int:
-        return self._points2d_np.shape[0] if self._points2d_np is not None else 0
+        return self._points2d.shape[0] if self._points2d is not None else 0
 
     @property
     def curr_nb_samples(self) -> int:
         return len(self.stack_points2d)
 
     @property
-    def grid(self) -> np.array:
+    def grid(self) -> np.ndarray:
         return self._cumul_grid
 
     @property
@@ -183,14 +187,14 @@ class MonocularCalibrationTool:
 
     @property
     def reprojected_points2d(self) -> ArrayLike:
-        return self._reprojected_points
+        return self._reprojected_points_xp
 
     @property
     def pose_error(self):
         return self._pose_error
 
     @property
-    def intrinsics_errors(self) -> ArrayLike:
+    def intrinsics_errors(self) -> np.ndarray:
         return self._intrinsics_errors_rms
 
     @property
@@ -199,13 +203,13 @@ class MonocularCalibrationTool:
         if not self.has_intrinsics:
             return 0.0
 
-        f_px = xp.sum(self._camera_matrix[xp.diag_indices(2)]) / 2.0
+        f_px = np.sum(self._K[np.diag_indices(2)]) / 2.0
         return float(f_px)
 
-    def set_intrinsics(self, camera_matrix: ArrayLike, dist_coeffs: ArrayLike, errors: Optional[ArrayLike] = None):
+    def set_intrinsics(self, K: ArrayLike, D: ArrayLike, errors: Optional[ArrayLike] = None):
 
-        self._camera_matrix = xp.asarray(camera_matrix)
-        self._dist_coeffs = xp.asarray(xp.pad(dist_coeffs, (0, max(0, 8 - len(dist_coeffs))), 'constant', constant_values=0.0))
+        self._K = np.asarray(K)
+        self._D = np.asarray(np.pad(D, (0, max(0, 8 - len(D))), 'constant', constant_values=0.0))
 
         if errors is not None:
             # Store the raw OpenCV errors for internal comparison
@@ -218,13 +222,13 @@ class MonocularCalibrationTool:
 
     def clear_intrinsics(self):
 
-        if self._theoretical_cam_mat is not None:
-            self._camera_matrix = xp.asarray(self._theoretical_cam_mat)
-            self._dist_coeffs = xp.asarray(self._zero_coeffs)
+        if self._K_est is not None:
+            self._K = self._K_est.copy()
+            self._D = self._D_zero.copy()
 
         else:
-            self._camera_matrix = None
-            self._dist_coeffs = None
+            self._K = None
+            self._D = None
 
         self._intrinsics_errors_opencv = np.array([np.inf])
         self._intrinsics_errors_rms = np.array([np.inf])
@@ -281,7 +285,7 @@ class MonocularCalibrationTool:
             return 0.0
 
         cells_indices = np.fliplr(
-            np.clip((self._points2d_np // ((self._img_h, self._img_w) / self._grid_shape)).astype(np.int32), [0, 0],
+            np.clip((self._points2d // ((self._img_h, self._img_w) / self._grid_shape)).astype(np.int32), [0, 0],
                     np.flip(self._grid_shape - 1)))
 
         rows, cols = cells_indices.T
@@ -298,9 +302,11 @@ class MonocularCalibrationTool:
 
         return float(novel_weight / total_weight) * 100
 
-    def detect(self, frame: np.ndarray):
+    def detect(self, frame: ArrayLike):
 
         # TODO: Detector could be taken out completely from the monocular tool
+
+        frame = np.asarray(frame)
 
         # initialise or update the internal arrays to match frame size if needed
         if self._img_h == 0 or self._img_w == 0 or self._img_h != frame.shape[0] or self._img_w != frame.shape[1]:
@@ -308,20 +314,16 @@ class MonocularCalibrationTool:
 
         # Detect
         if type(self.detector) is ChessboardDetector:
-            self._points2d_np, self._points_ids_np = self.detector.detect(
+            self._points2d, self._pointsIDs = self.detector.detect(
                 frame,
                 refine_points=True
             )
 
         else:
-            # Enforce numpy if not None (could be JAX arrays). If none, keep none.
-            camera_matrix = np.asarray(self._camera_matrix) if self._camera_matrix is not None else None
-            dist_coeffs = np.asarray(self._dist_coeffs) if self._dist_coeffs is not None else None
-
-            self._points2d_np, self._points_ids_np = self.detector.detect(
+            self._points2d, self._pointsIDs = self.detector.detect(
                 frame,
-                camera_matrix=camera_matrix,
-                dist_coeffs=dist_coeffs,
+                K=self._K,
+                D=self._D,
                 refine_markers=True,
                 refine_points=True
             )
@@ -334,8 +336,8 @@ class MonocularCalibrationTool:
 
         # if no threshold, or if the new area is above thrshold
         if min_new_area <= 0 or self._compute_new_area() > min_new_area:
-            self.stack_points2d.append(self._points2d_np[np.newaxis, ...])
-            self.stack_points_ids.append(self._points_ids_np[np.newaxis, ...])
+            self.stack_points2d.append(self._points2d[np.newaxis, ...])
+            self.stack_pointsIDs.append(self._pointsIDs[np.newaxis, ...])
             return True
 
         return False
@@ -344,25 +346,21 @@ class MonocularCalibrationTool:
                            fix_aspect_ratio:    bool = True,
                            distortion_model:    DistortionModel = 'standard',
                            keep_stacks:         bool = False
-                           ) -> bool:
+        ) -> bool:
         """ Compute the camera intrinsics using the accumulated samples """
 
         if len(self.stack_points2d) < self._min_stack:
             return False
 
-        # Enforce numpy if not None (could be JAX arrays). If none, keep none.
-        current_camera_matrix = np.asarray(self._camera_matrix) if self._camera_matrix is not None else None
-        current_dist_coeffs = np.asarray(self._dist_coeffs) if self._dist_coeffs is not None else None
-
         calib_results = calibrate_camera_robust(
             board=self.calibration_board,
             image_points_stack=self.stack_points2d,
-            image_ids_stack=self.stack_points_ids,
+            image_ids_stack=self.stack_pointsIDs,
             image_size_wh=(self._img_w, self._img_h),
-            initial_K=current_camera_matrix,
-            initial_D=current_dist_coeffs,
+            initial_K=self._K,
+            initial_D=self._D,
             distortion_model=distortion_model,
-            fix_aspect_ratio=fix_aspect_ratio and (current_camera_matrix is not None)
+            fix_aspect_ratio=fix_aspect_ratio and (self._K is not None)
         )
 
         if not calib_results.success:
@@ -393,7 +391,7 @@ class MonocularCalibrationTool:
 
         # we need a detection and to have intrinsics to be able to compute extrinsics
         if not self.has_detection or not self.has_intrinsics:
-            self._curr_rvec_b2c, self._curr_tvec_b2c = None, None
+            self._curr_rvec_b2c_xp, self._curr_tvec_b2c_xp = None, None
             self._pose_error = np.nan
             return False
 
@@ -401,34 +399,28 @@ class MonocularCalibrationTool:
             # TODO: Check collinearity for classic chessboards too?
 
             # if the points are collinear, extrinsics estimation is garbage, so abort
-            if cv2.aruco.testCharucoCornersCollinear(self.calibration_board.to_opencv(), self._points_ids_np):
-                self._curr_rvec_b2c, self._curr_tvec_b2c = None, None
+            if cv2.aruco.testCharucoCornersCollinear(self.calibration_board.to_opencv(), self._pointsIDs):
+                self._curr_rvec_b2c_xp, self._curr_tvec_b2c_xp = None, None
                 self._pose_error = np.nan
                 return False
 
-        object_points_subset = self.calibration_board.object_points[self._points_ids_np]
-
-        # Enforce numpy if not None (could be JAX arrays). If none, keep none.
-        camera_matrix = np.asarray(self._camera_matrix) if self._camera_matrix is not None else None
-        dist_coeffs = np.asarray(self._dist_coeffs) if self._dist_coeffs is not None else None
+        object_points_subset = self.calibration_board.object_points[self._pointsIDs]
 
         success, rvec_b2c, tvec_b2c, pose_errors = solve_pnp_robust(
-            object_points=object_points_subset,
-            image_points=self._points2d_np,
-            camera_matrix=camera_matrix,
-            dist_coeffs=dist_coeffs,
+            points3d=object_points_subset,
+            points2d=self._points2d,
+            K=self._K,
+            D=self._D,
             refine_method='VVS' if refine else None
         )
 
         if not success:
-            self._curr_rvec_b2c, self._curr_tvec_b2c = None, None
+            self._curr_rvec_b2c_xp, self._curr_tvec_b2c_xp = None, None
             self._pose_error = np.nan
             return False
 
-        # if all good, push to GPU and store
-        self._curr_rvec_b2c = xp.asarray(rvec_b2c.squeeze())
-        self._curr_tvec_b2c = xp.asarray(tvec_b2c.squeeze())
-        # and store the standard RMS error
+        self._curr_rvec_b2c_xp = rvec_b2c
+        self._curr_tvec_b2c_xp = tvec_b2c
         self._pose_error = pose_errors['rms']
 
         return True
@@ -439,9 +431,12 @@ class MonocularCalibrationTool:
         if not self.has_intrinsics or not self.has_extrinsics:
             return None
 
+        # project() is the only call in this that *might* use JAX in this class
+        K_xp = xp.asarray(self._K)
+        D_xp = xp.asarray(self._D)
+        # self._curr_rvec_b2c and self._curr_tvec_b2c are already xp
+        self._reprojected_points_xp, _ = project(self._points3d_xp, self._curr_rvec_b2c_xp, self._curr_tvec_b2c_xp, K_xp, D_xp)
         # TODO: store the validity mask maybe?
-        self._reprojected_points, _ = project(
-            self._object_points_3d, self._curr_rvec_b2c, self._curr_tvec_b2c, self._camera_matrix, self._dist_coeffs)
 
     def clear_grid(self):
         if self._cumul_grid is not None:
@@ -452,4 +447,4 @@ class MonocularCalibrationTool:
     def clear_stacks(self):
         self.clear_grid()
         self.stack_points2d.clear()
-        self.stack_points_ids.clear()
+        self.stack_pointsIDs.clear()

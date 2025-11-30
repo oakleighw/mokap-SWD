@@ -2,7 +2,7 @@ import logging
 import cv2
 
 import numpy as np
-from mokap.utils.geometry.backend import xp
+from mokap.utils.geometry.backend import xp, ArrayLike
 
 from typing import Tuple, Optional, Literal, Union, Sequence
 from mokap.utils.geometry.projective import project, reprojection_errors
@@ -12,13 +12,44 @@ from mokap.utils.datatypes import ChessBoard, CharucoBoard, CalibrateCameraResul
 logger = logging.getLogger(__name__)
 
 
+def PnP_wrapper(points3d, points2d, K, D, mode: Literal['IPPE', 'SQPNP', 'Iterative']):
+
+    flags = {
+        'sqpnp': cv2.SOLVEPNP_SQPNP,
+        'iterative': cv2.SOLVEPNP_ITERATIVE,
+        'ippe': cv2.SOLVEPNP_IPPE
+    }
+
+    if mode.lower() == 'iterative':
+        try:
+            success, rvec, tvec = cv2.solvePnPGeneric(points3d, points2d, K, D, flags=flags[mode.lower()])
+            if success and tvec[2] > 0:
+                return rvec, tvec
+        except cv2.error:
+            return None, None
+
+    if mode.lower() in ['sqpnp', 'ippe']:
+        try:
+            nb, rvecs, tvecs, errs = cv2.solvePnPGeneric(points3d, points2d, K, D, flags=flags[mode.lower()])
+        except cv2.error:
+            return None, None
+
+        if nb > 0:
+            solutions = [{'rvec': r, 'tvec': t, 'error': e[0]} for r, t, e in zip(rvecs, tvecs, errs) if t[2] > 0]
+            if solutions:
+                best_solution = min(solutions, key=lambda x: x['error'])
+                return best_solution['rvec'], best_solution['tvec']
+
+    return None, None
+
+
 def solve_pnp_robust(
-        object_points:  np.ndarray,
-        image_points:   np.ndarray,
-        camera_matrix:  np.ndarray,
-        dist_coeffs:    np.ndarray,
+        points3d:       ArrayLike,
+        points2d:       ArrayLike,
+        K:              Optional[ArrayLike],
+        D:              Optional[ArrayLike],
         refine_method:  Optional[Literal['VVS', 'LM', 'none']] = None
-) -> Tuple[bool, Optional[np.ndarray], Optional[np.ndarray], Optional[dict]]:
+) -> Tuple[bool, Optional[xp.ndarray], Optional[xp.ndarray], Optional[dict]]:
     """
     A robust wrapper for solvePnP that handles the ambiguity of planar targets
     It returns a single, physically plausible pose with the lowest reprojection error
@@ -31,113 +62,83 @@ def solve_pnp_robust(
         Optionally refines the final pose
     """
 
-    obj_pts_np = np.asarray(object_points, dtype=np.float32)
-    img_pts_np = np.asarray(image_points, dtype=np.float32)
-    cam_mat_np = np.asarray(camera_matrix, dtype=np.float32)
-    dist_np = np.asarray(dist_coeffs if dist_coeffs is not None else np.zeros(5), dtype=np.float32)
+    # OpenCV needs these as numpy arrays, no matter what's mokap's backend
+    points3d = np.asarray(points3d, dtype=np.float32)
+    points2d = np.asarray(points2d, dtype=np.float32)
+    K = np.asarray(K, dtype=np.float32) if K is not None else None
+    D = np.asarray(D, dtype=np.float32) if D is not None else None
 
     # Shape validation
-    if obj_pts_np.ndim != 2 or obj_pts_np.shape[1] != 3:
-        raise ValueError(f"Object points must have shape (N, 3), but got {obj_pts_np.shape}")
+    if points3d.ndim != 2 or points3d.shape[1] != 3:
+        raise ValueError(f"Object points must have shape (N, 3), but got {points3d.shape}")
 
-    if img_pts_np.ndim != 2 or img_pts_np.shape[1] != 2:
-        raise ValueError(f"Image points must have shape (N, 2), but got {img_pts_np.shape}")
+    if points2d.ndim != 2 or points2d.shape[1] != 2:
+        raise ValueError(f"Image points must have shape (N, 2), but got {points2d.shape}")
 
-    if obj_pts_np.shape[0] != img_pts_np.shape[0]:
+    if points3d.shape[0] != points2d.shape[0]:
         raise ValueError("Mismatch in number of object and image points.")
 
-    if obj_pts_np.shape[0] < 4:
+    if points3d.shape[0] < 4:
         # most PnP methods require at least 4 points
         return False, None, None, None
 
-    if cam_mat_np.shape != (3, 3):
-        raise ValueError(f"Camera matrix must have shape (3, 3), but got {cam_mat_np.shape}")
+    if K.shape != (3, 3):
+        raise ValueError(f"Camera matrix must have shape (3, 3), but got {K.shape}")
 
     best_rvec, best_tvec, best_error = None, None, None
+    points2d_xp = None
+    points3d_xp = None
+    K_xp = None
+    D_xp = None
 
-    # Strategy 1: Try IPPE
-    if hasattr(cv2, 'SOLVEPNP_IPPE'):
-        try:
-            nb, rvecs, tvecs, errs = cv2.solvePnPGeneric(obj_pts_np, img_pts_np, cam_mat_np, dist_np,
-                                                         flags=cv2.SOLVEPNP_IPPE)
-            if nb > 0:
-                valid_solutions = [{'rvec': r, 'tvec': t, 'error': e[0]} for r, t, e in zip(rvecs, tvecs, errs) if
-                                   t[2] > 0]
-                if valid_solutions:
-                    best = min(valid_solutions, key=lambda x: x['error'])
-                    best_rvec, best_tvec = best['rvec'], best['tvec']
-        except cv2.error:
-            pass  # continue to fallback
+    # Try IPPE
+    best_rvec, best_tvec = PnP_wrapper(points3d, points2d, K, D, 'IPPE')
 
-        # Strategies 2 and 3: Try SQPNP, or Iterative
-        if best_rvec is None:
-            candidate_rvec, candidate_tvec = None, None
+    # Try SQPNP
+    if best_rvec is None:
+        candidate_rvec, candidate_tvec = PnP_wrapper(points3d, points2d, K, D, 'SQPNP')
 
-            # First try to get a candidate pose from SQPNP
-            try:
-                nb, rvecs_cv, tvecs_cv, errs_cv = cv2.solvePnPGeneric(obj_pts_np, img_pts_np,
-                                                                      cam_mat_np, dist_np,
-                                                                      flags=cv2.SOLVEPNP_SQPNP)
-                if nb > 0:
-                    valid_solutions = [{'rvec': r, 'tvec': t, 'error': e[0]}
-                                       for r, t, e in zip(rvecs_cv, tvecs_cv, errs_cv) if t[2] > 0]
-                    if valid_solutions:
-                        # get the best candidate from the list
-                        best_candidate = min(valid_solutions, key=lambda x: x['error'])
-                        candidate_rvec, candidate_tvec = best_candidate['rvec'], best_candidate['tvec']
+        # Try Iterative
+        if candidate_rvec is None:
+            candidate_rvec, candidate_tvec = PnP_wrapper(points3d, points2d, K, D, 'Iterative')
 
-            except cv2.error:
-                pass  # continue to final fallback
+        # Manual disambiguation for the best candidate
+        if candidate_rvec is not None and candidate_tvec is not None:
 
-            # if SQPNP failed, try to get a candidate from Iterative
-            if candidate_rvec is None:
-                try:
-                    success, rvec, tvec = cv2.solvePnP(obj_pts_np, img_pts_np, cam_mat_np, dist_np,
-                                                       flags=cv2.SOLVEPNP_ITERATIVE)
-                    if success and tvec[2] > 0:
-                        candidate_rvec, candidate_tvec = rvec, tvec
-                except cv2.error:
-                    pass  # all solvers failed
+            rvec_xp = xp.asarray(candidate_rvec).squeeze()
+            tvec_xp = xp.asarray(candidate_tvec).squeeze()
 
-            # Manual disambiguation for the best candidate
-            if candidate_rvec is not None and candidate_tvec is not None:
-                rvec1, tvec1 = candidate_rvec, candidate_tvec
+            rvec_flip_xp, tvec_flip_xp = flip_pose_180(rvec_xp, tvec_xp)
 
-                rvec1_xp = xp.asarray(rvec1).squeeze()
-                tvec1_xp = xp.asarray(tvec1).squeeze()
-                obj_pts_xp = xp.asarray(obj_pts_np)
-                img_pts_xp = xp.asarray(img_pts_np)
-                cam_mat_xp = xp.asarray(cam_mat_np)
-                dist_xp = xp.asarray(dist_np)
+            if tvec_flip_xp[2] <= 0:
+                # The ambiguous pose is invalid, so the first candidate is probably correct
+                best_rvec, best_tvec = candidate_rvec, candidate_tvec
 
-                rvec2_xp, tvec2_xp = flip_pose_180(rvec1_xp, tvec1_xp)
+            else:
+                # if both are valid, compare their errors
 
-                if tvec2_xp[2] <= 0:
-                    # The ambiguous pose is invalid, so the candidate is probably correct
-                    best_rvec, best_tvec = rvec1, tvec1
+                points2d_xp = xp.asarray(points2d)
+                points3d_xp = xp.asarray(points3d)
+                K_xp = xp.asarray(K)
+                D_xp = xp.asarray(D)
+
+                reproj, _ = project(points3d_xp, rvec_xp, tvec_xp, K_xp, D_xp)
+                reproj_flip, _ = project(points3d_xp, rvec_flip_xp, tvec_flip_xp, K_xp, D_xp)
+
+                reproj_errors = reprojection_errors(points2d_xp, reproj)
+                reproj_errors_flip = reprojection_errors(points2d_xp, reproj_flip)
+
+                # Compare using the standard RMS error
+                if reproj_errors['rms'] <= reproj_errors_flip['rms']:
+                    best_rvec, best_tvec = candidate_rvec, candidate_tvec
+                    best_error = reproj_errors
                 else:
-                    # if both are valid, compare their errors
-                    reproj1, _ = project(obj_pts_xp, rvec1_xp, tvec1_xp, cam_mat_xp, dist_xp)
-                    reproj2, _ = project(obj_pts_xp, rvec2_xp, tvec2_xp, cam_mat_xp, dist_xp)
+                    best_rvec, best_tvec = rvec_flip_xp.reshape(3, 1), tvec_flip_xp.reshape(3, 1)  # Note [1]: still xp
+                    best_error = reproj_errors_flip
 
-                    errors1 = reprojection_errors(img_pts_xp, reproj1)
-                    errors2 = reprojection_errors(img_pts_xp, reproj2)
-
-                    # Compare using the standard RMS error
-                    if errors1['rms'] <= errors2['rms']:
-                        best_rvec, best_tvec = rvec1, tvec1
-                        best_error = errors1
-                    else:
-                        best_rvec, best_tvec = np.asarray(rvec2_xp).reshape(3, 1), np.asarray(tvec2_xp).reshape(3, 1)
-                        best_error = errors2
-
-        if best_rvec is None or best_tvec is None:
-            # all methods failed to produce a valid pose
-            return False, None, None, None
-
-    # If we got here from IPPE, we haven't calculated the error dict yet
-    # If we got here from manual disambiguation, best_error is already set
-    needs_error_recalc = best_error is None
+    if best_rvec is None or best_tvec is None:
+        # all methods failed to produce a valid pose
+        return False, None, None, None
 
     # Optionally refine
     if refine_method and refine_method.lower() != 'none':
@@ -146,25 +147,32 @@ def solve_pnp_robust(
             refine_func = refine_func_map[refine_method.lower()]
 
             best_rvec, best_tvec = refine_func(
-                objectPoints=obj_pts_np, imagePoints=img_pts_np, cameraMatrix=cam_mat_np,
-                distCoeffs=dist_np, rvec=best_rvec, tvec=best_tvec
+                objectPoints=points3d, imagePoints=points2d, cameraMatrix=K,
+                distCoeffs=D, rvec=np.asarray(best_rvec), tvec=np.asarray(best_tvec)   # Re note [1]: convert if needed
             )
             # After refinement, the already-calculated error is invalid and must be recalculated
-            needs_error_recalc = True
+            best_error = None
         except (cv2.error, AttributeError, KeyError):
             pass
 
-    best_rvec = best_rvec.squeeze()
-    best_tvec = best_tvec.squeeze()
+    # No need for OpenCV anymore, these can be moved to GPU if needed
+    best_rvec_xp = xp.asarray(best_rvec).squeeze()
+    best_tvec_xp = xp.asarray(best_tvec).squeeze()
 
-    if needs_error_recalc:
-        final_reproj, _ = project(obj_pts_np, best_rvec, best_tvec, cam_mat_np, dist_np)
-        final_errors = reprojection_errors(img_pts_np, final_reproj)
+    if best_error is None:
+        if points2d_xp is None or points3d_xp is None or K is None or D is None:
+            # TODO: is this possible here?
+            points2d_xp = xp.asarray(points2d)
+            points3d_xp = xp.asarray(points3d)
+            K_xp = xp.asarray(K)
+            D_xp = xp.asarray(D)
+        final_reproj, _ = project(points3d_xp, best_rvec_xp, best_tvec_xp, K_xp, D_xp)
+        final_errors = reprojection_errors(points2d_xp, final_reproj)
     else:
         # otherwise, the one we stored is the correct one
         final_errors = best_error
 
-    return True, best_rvec, best_tvec, final_errors
+    return True, best_rvec_xp, best_tvec_xp, final_errors
 
 
 def calibrate_camera_robust(
@@ -172,12 +180,16 @@ def calibrate_camera_robust(
     image_points_stack:     Sequence[np.ndarray],
     image_ids_stack:        Sequence[np.ndarray],
     image_size_wh:          Sequence[int],
-    initial_K:              Optional[np.ndarray] = None,
-    initial_D:              Optional[np.ndarray] = None,
+    initial_K:              Optional[ArrayLike] = None,
+    initial_D:              Optional[ArrayLike] = None,
     distortion_model:       DistortionModel = 'standard',
     fix_aspect_ratio:       bool = False
 ) -> CalibrateCameraResult:
     """ A convenience wrapper for OpenCV's camera calibration functions """
+
+    # OpenCV needs numpy no matter what
+    initial_K = np.asarray(initial_K) if initial_K is not None else None
+    initial_D = np.asarray(initial_D) if initial_D is not None else None
 
     # Build calibration flags
     calib_flags = 0
@@ -202,9 +214,7 @@ def calibrate_camera_robust(
 
     # 'standard' and 'full' don't need special flags, they are the default behavior
     # when the corresponding CALIB_FIX_K* flags are not set
-
     try:
-
         if board.type == 'charuco':
 
             # calib_flags |= cv2.CALIB_USE_LU   # TODO: Should we use LU or QR? How 'worse' are they?
@@ -245,7 +255,7 @@ def calibrate_camera_robust(
         if invalid_vals or negative_K_vals or invalid_central_point:
             return CalibrateCameraResult(success=False, error_message="Calibration resulted in an invalid camera matrix.")
 
-        # These limits are for standard rectilinear lenses using the Brown-Conrady model
+        # TODO: These limits are for standard rectilinear lenses using the Brown-Conrady model
         # They are NOT suitable for fisheye lenses, which use a different model and calibration pipeline (cv2.fisheye.calibrate)
         absurd_distortion = False
         reason = ''

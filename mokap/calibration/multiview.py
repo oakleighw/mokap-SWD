@@ -283,10 +283,10 @@ class MultiviewCalibrationTool:
 
         # Reestimate the board-to-camera pose and validate it
         success, rvec, tvec, pose_errors = solve_pnp_robust(
-            object_points=np.asarray(self._object_points[detection.pointsIDs]),
-            image_points=detection.points2D,
-            camera_matrix=np.asarray(self._cam_matrices[cam_idx]),
-            dist_coeffs=np.asarray(self._dist_coeffs[cam_idx])
+            points3d=np.asarray(self._object_points[detection.pointsIDs]),
+            points2d=detection.points2D,
+            K=np.asarray(self._cam_matrices[cam_idx]),
+            D=np.asarray(self._dist_coeffs[cam_idx])
         )
 
         # if PnP fails, return
@@ -470,8 +470,8 @@ class MultiviewCalibrationTool:
                 #
                 logger.debug(f"[BA] >>> STAGE 1: Consolidating cameras position with {current_P} frames...")
                 success_s1, results_s1 = bundle_adjustment.run_bundle_adjustment(
-                    camera_matrices_initial=K_online,
-                    distortion_coeffs_initial=D_online,
+                    K_initial=K_online,
+                    D_initial=D_online,
                     cam_rvecs_initial=cam_r_online,
                     cam_tvecs_initial=cam_t_online,
 
@@ -517,8 +517,8 @@ class MultiviewCalibrationTool:
                 poses_r_s2_init, poses_t_s2_init = results_s1['poses_r_opt'], results_s1['poses_t_opt']
 
                 success_s2, results_s2 = bundle_adjustment.run_bundle_adjustment(
-                    camera_matrices_initial=K_s2_init,
-                    distortion_coeffs_initial=D_s2_init,
+                    K_initial=K_s2_init,
+                    D_initial=D_s2_init,
                     cam_rvecs_initial=cam_r_s2_init,
                     cam_tvecs_initial=cam_t_s2_init,
 
@@ -563,8 +563,8 @@ class MultiviewCalibrationTool:
                 poses_r_s3_init, poses_t_s3_init = results_s2['poses_r_opt'], results_s2['poses_t_opt']
 
                 success_s3, final_results_attempt = bundle_adjustment.run_bundle_adjustment(
-                    camera_matrices_initial=K_s3_init,
-                    distortion_coeffs_initial=D_s3_init,
+                    K_initial=K_s3_init,
+                    D_initial=D_s3_init,
                     cam_rvecs_initial=cam_r_s3_init,
                     cam_tvecs_initial=cam_t_s3_init,
 

@@ -190,10 +190,13 @@ def _get_bounds(
     # Set bounds for camera intrinsics
     if not cfg['fix_cameras_intrinsics']:
         for i in range(nb_intr_sets):
-            cam_idx = 0 if is_shared else i
-            w, h = images_sizes_wh[cam_idx]
+            if is_shared:
+                w = np.max(images_sizes_wh[:, 0])
+                h = np.max(images_sizes_wh[:, 1])
+            else:
+                w, h = images_sizes_wh[i]
 
-            # Focal Length and Principal Point
+            # Focal length and principal point
             if 'cam_mat' in spec['blocks']:
                 info = spec['blocks']['cam_mat']
                 size_per_set = info['size'] // nb_intr_sets
@@ -778,8 +781,8 @@ def _validate_inputs(**kwargs):
 
 
 def run_bundle_adjustment(
-        camera_matrices_initial:    jnp.ndarray,
-        distortion_coeffs_initial:  jnp.ndarray,
+        K_initial:                  jnp.ndarray,
+        D_initial:                  jnp.ndarray,
         cam_rvecs_initial:          jnp.ndarray,
         cam_tvecs_initial:          jnp.ndarray,
         images_sizes_wh:            ArrayLike,
@@ -847,13 +850,13 @@ def run_bundle_adjustment(
     # Prepare and pad distortion coefficients if necessary
     if not fix_cameras_intrinsics:
         n_d = spec['config']['n_d']
-        current_d = distortion_coeffs_initial.shape[1]
+        current_d = D_initial.shape[1]
         if current_d < n_d:
             padding = ((0, 0), (0, n_d - current_d))
-            distortion_coeffs_initial = jnp.pad(distortion_coeffs_initial, padding, mode='constant')
+            D_initial = jnp.pad(D_initial, padding, mode='constant')
 
     x0, fixed_params = _pack_params(
-        camera_matrices_initial, distortion_coeffs_initial,
+        K_initial, D_initial,
         cam_rvecs_initial, cam_tvecs_initial,
         object_points_initial, poses_rvecs_initial, poses_tvecs_initial,
         spec
@@ -875,7 +878,7 @@ def run_bundle_adjustment(
     weights = residual_weights(
         points2d=image_points,
         visibility_mask=visibility_mask,
-        camera_matrices=camera_matrices_initial,
+        camera_matrices=K_initial,
         distance_falloff_gamma=radial_penalty
     )
 
