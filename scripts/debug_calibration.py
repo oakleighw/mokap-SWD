@@ -58,7 +58,7 @@ def load_calibration_data(folder: Path):
 if __name__ == "__main__":
 
     folder = Path.home() / "Desktop/3d_ant_data/240905-1616/calibration"
-    frame_idx = None
+    frame_idx = 53
 
     if not folder.exists():
         print(f"Folder not found: {folder}")

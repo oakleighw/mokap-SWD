@@ -1,5 +1,8 @@
 from typing import Tuple
-from .backend import xp, jit, _eps, _tiny
+try:
+    from .backend import xp, jit, _eps, _tiny
+except ImportError:
+    from backend import xp, jit, _eps, _tiny
 
 
 def homogenize(
@@ -29,7 +32,7 @@ def dehomogenize(
     Returns:
         Euclidean points (..., D)
     """
-    w_coord = points[:, -1:]
+    w_coord = points[..., -1:]
     safe_w = xp.where(xp.abs(w_coord) < _tiny, _tiny, w_coord)
 
     # Divide the coordinate components (all but the last) by w

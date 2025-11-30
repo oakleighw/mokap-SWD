@@ -262,12 +262,12 @@ def plot_points_3d(
                                  color=color,
                                  marker='o', label=label, alpha=0.5)
 
-    for p, name in enumerate(points_names):
-        if errors is not None:
-            c = pts_scatter.to_rgba(errors[p]) if np.isfinite(errors[p]) else color
-        else:
-            c = color
-        ax.text(xs[p], ys[p], zs[p], f"  {name}", c=c, alpha=0.8, fontweight='bold')
+    # for p, name in enumerate(points_names):
+    #     if errors is not None:
+    #         c = pts_scatter.to_rgba(errors[p]) if np.isfinite(errors[p]) else color
+    #     else:
+    #         c = color
+    #     ax.text(xs[p], ys[p], zs[p], f"  {name}", c=c, alpha=0.8, fontweight='bold')
 
     ax.legend()
 
@@ -488,16 +488,13 @@ def plot_triangulation_scene(
     # Vector from each camera center to each 3D point -> shape (C, N, 3)
     cam_to_point_vectors = xp.asarray(points3d)[None, :, :] - xp.asarray(tvecs_c2w)[:, None, :]
 
-    E_c2w = compose_transform_matrix(rvecs_c2w, tvecs_c2w)
-    # Extract camera Z axis (look direction) in world coordinates from the rotation matrix
-    cam_z_axes = E_c2w[:, :3, 2]  # shape (C, 3)
-
-    # Project the vectors onto the camera Z axes to get Z-depths (planar depth)
-    # Dot product: (C, N, 3) . (C, 1, 3) -> (C, N)
-    depths_to_3d_points = xp.sum(cam_to_point_vectors * cam_z_axes[:, None, :], axis=2)
+    # Distance from each camera to each 3D point -> shape (C, N)
+    depths_to_3d_points = xp.linalg.norm(cam_to_point_vectors, axis=2)
 
     # Scale these depths to plot the back-projected points slightly closer to the camera
     plot_depths = depths_to_3d_points * detections_depth
+
+    E_c2w = compose_transform_matrix(rvecs_c2w, tvecs_c2w)
 
     # Back-project the 2D points using the calculated dynamic depths
     points2d_in_3d = unproject(

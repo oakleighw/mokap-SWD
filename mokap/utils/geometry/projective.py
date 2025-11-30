@@ -1,8 +1,13 @@
 from functools import partial
 from typing import Tuple, Union, Optional, Dict
-from .backend import xp, jit, lax, _eps, _tiny, align_batch_dims
-from .transforms import rotation_matrix, compose_transform_matrix, projection_matrix, decompose_transform_matrix, \
-    invert_intrinsics, homogenize, dehomogenize
+try:
+    from .backend import xp, jit, lax, _eps, _tiny, align_batch_dims
+    from .transforms import rotation_matrix, compose_transform_matrix, projection_matrix, decompose_transform_matrix, \
+        invert_intrinsics, homogenize, dehomogenize
+except ImportError:
+    from backend import xp, jit, lax, _eps, _tiny, align_batch_dims
+    from transforms import rotation_matrix, compose_transform_matrix, projection_matrix, decompose_transform_matrix, \
+        invert_intrinsics, homogenize, dehomogenize
 
 
 @partial(jit, static_argnames=['distortion_model'])
@@ -132,7 +137,7 @@ def undistort(
 
     if R is not None:
         R = align_batch_dims(target_ndim, R, data_dims=2)
-        pts_rectified = xp.einsum('...ij,...j->...i', R, pts_h)
+        pts_rectified = xp.einsum('...ji,...j->...i', R, pts_h)
     else:
         pts_rectified = pts_h
 
@@ -145,20 +150,7 @@ def undistort(
         new_f = f
         new_c = c
 
-    # Perspective division to get back to plane z=1
-    z_rect = pts_rectified[..., 2:3]
-
-    # Check for points behind the camera
-    is_valid_z = z_rect > _tiny
-
-    safe_z = xp.where(is_valid_z, z_rect, 1.0)
-    uv_rect = pts_rectified[..., :2] / safe_z
-
-    # Apply new intrinsics
-    result = uv_rect * new_f + new_c
-
-    # Mask invalid points
-    result = xp.where(is_valid_z, result, xp.nan)
+    result = pts_rectified[..., :2] * new_f + new_c
 
     return result
 
