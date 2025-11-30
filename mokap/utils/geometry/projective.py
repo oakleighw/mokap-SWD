@@ -205,11 +205,13 @@ def project(
     Xc = xp.einsum('...ij,...j->...i', R, points3d) + tvec
     z = Xc[..., 2]
 
-    valid_mask = (z > 1e-4).astype(xp.float32)  # small positive threshold for safety
+    valid_mask_bool = z > 1e-4  # small positive threshold for safety
+    valid_mask = valid_mask_bool.astype(xp.float32)
 
     # Project invalid points to (0, 0), but their mask will be False
-    z_safe = xp.where(valid_mask, z, 1.0)  # we don't use _eps here because 1e-4 is small enough to cause overflow in x/z
-    x_norm = Xc[..., :2] / z_safe[..., None]
+    z_safe = xp.where(valid_mask_bool, z, 1.0)  # we don't use _eps here because 1e-4 is small enough to cause overflow in x/z
+    x_norm_raw = Xc[..., :2] / z_safe[..., None]
+    x_norm = xp.where(valid_mask_bool[..., None], x_norm_raw, 0.0)
 
     # dist_coeffs alignment happens inside here based on x.ndim
     radial, tangential = distort(x_norm, D, distortion_model)
