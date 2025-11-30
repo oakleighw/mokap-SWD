@@ -1,7 +1,11 @@
 from functools import partial
 from typing import Tuple, Dict, Optional
-from .backend import USE_JAX, xp, jit, lax, vmap, _tiny, align_batch_dims
-from .transforms import quaternion_distance, rotation_matrix, rotation_vector, homogenize
+try:
+    from .backend import USE_JAX, xp, jit, lax, vmap, _tiny, align_batch_dims
+    from .transforms import quaternion_distance, rotation_matrix, rotation_vector, homogenize
+except ImportError:
+    from mokap.utils.geometry.backend import USE_JAX, xp, jit, lax, vmap, _tiny, align_batch_dims
+    from mokap.utils.geometry.transforms import quaternion_distance, rotation_matrix, rotation_vector, homogenize
 
 
 @jit

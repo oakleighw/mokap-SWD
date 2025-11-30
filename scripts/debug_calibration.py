@@ -21,7 +21,9 @@ def load_calibration_data(folder: Path):
     print(f"Loading parameters from: {param_file}")
     data = toml.load(param_file)
 
-    cam_names = sorted(list(data.keys()))
+    # cam_names = sorted(list(data.keys()))
+    cam_names = ['avocado', 'coconut', 'banana', 'strawberry', 'blueberry'] # order is from the VIDEO FILES # TODO: fix this
+
     print(f"Found {len(cam_names)} cameras: {cam_names}")
 
     Ks = []
@@ -132,9 +134,9 @@ if __name__ == "__main__":
         cameras_names=cam_names,
         imsizes=(1440, 1080),
         frustums_depth=0.5,
-        detections_depth=0.8,
+        detections_depth=1.0,
         # trust_volume=volume
-    )
+        )
 
     plt.suptitle(f"Calibration Scene (frame {frame_idx})")
     plt.show()

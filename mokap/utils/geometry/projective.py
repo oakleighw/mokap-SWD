@@ -5,9 +5,10 @@ try:
     from .transforms import rotation_matrix, compose_transform_matrix, projection_matrix, decompose_transform_matrix, \
         invert_intrinsics, homogenize, dehomogenize
 except ImportError:
-    from backend import xp, jit, lax, _eps, _tiny, align_batch_dims
-    from transforms import rotation_matrix, compose_transform_matrix, projection_matrix, decompose_transform_matrix, \
-        invert_intrinsics, homogenize, dehomogenize
+    from mokap.utils.geometry.backend import xp, jit, lax, _eps, _tiny, align_batch_dims
+    from mokap.utils.geometry.transforms import (rotation_matrix, compose_transform_matrix, projection_matrix,
+                                                 decompose_transform_matrix, invert_intrinsics, homogenize,
+                                                 dehomogenize)
 
 
 @partial(jit, static_argnames=['distortion_model'])
@@ -137,7 +138,7 @@ def undistort(
 
     if R is not None:
         R = align_batch_dims(target_ndim, R, data_dims=2)
-        pts_rectified = xp.einsum('...ji,...j->...i', R, pts_h)
+        pts_rectified = xp.einsum('...ij,...j->...i', R, pts_h)
     else:
         pts_rectified = pts_h
 
@@ -150,7 +151,23 @@ def undistort(
         new_f = f
         new_c = c
 
-    result = pts_rectified[..., :2] * new_f + new_c
+    # Extract Z coordinate
+    z_rect = pts_rectified[..., 2:3]
+
+    # Check for points behind the camera or at z=0 (singularities)
+    is_valid_z = z_rect > 1e-6  # slightly larger epsilon than _tiny for stability in division
+
+    # Avoid division by zero for invalid points (they are masked later anyways)
+    safe_z = xp.where(is_valid_z, z_rect, 1.0)
+
+    # Project back to normalised plane
+    uv_rect = pts_rectified[..., :2] / safe_z
+
+    # Apply new intrinsics
+    result = uv_rect * new_f + new_c
+
+    # Mask invalid points (behind camera)
+    result = xp.where(is_valid_z, result, xp.nan)
 
     return result
 
@@ -283,33 +300,17 @@ def project_multiple_to_multiple(
         valid_mask: (C, P, N)
     """
 
-    # Explicit tiling to ensure robust broadcasting for JAX einsum
-    # Target shape: (C, P, N, ...)
+    # If points are (N, 3), make them (1, 1, N, 3) to broadcast over C and P
+    if points3d.ndim == 2:
+        obj_exp = points3d[None, None, ...] # (1, P, N, 3)
+    else:
+        obj_exp = points3d[None, ...]       # (1, P, N, 3)
 
-    P, N, _ = points3d.shape
-    C = rvecs.shape[0]
+    rvec_exp = rvecs[:, None, None, :]      # (C, 1, 1, 3)
+    tvec_exp = tvecs[:, None, None, :]      # (C, 1, 1, 3)
+    K_exp = K[:, None, None, :, :]          # (C, 1, 1, 3, 3)
+    D_exp = D[:, None, None, :]             # (C, 1, 1, D)
 
-    # Expand Points: (P, N, 3) -> (1, P, N, 3) -> Tile to (C, P, N, 3)
-    obj_exp = points3d[None, ...].repeat(C, axis=0)
-
-    # Expand Extrinsics: (C, 3) -> (C, 1, 1, 3) -> Tile to (C, P, 1, 3)
-    # N stays as singleton to let project_points broadcast the matrix mult
-    rvec_exp = rvecs[:, None, None, :].repeat(P, axis=1)
-    tvec_exp = tvecs[:, None, None, :].repeat(P, axis=1)
-
-    # Expand Intrinsics
-    if K.ndim == 3:  # (C, 3, 3)
-        K_exp = K[:, None, None, :, :].repeat(P, axis=1)
-    else:  # (3, 3)
-        K_exp = K[None, None, None, :, :].repeat(C, axis=0).repeat(P, axis=1)
-
-    if D.ndim == 2:  # (C, D)
-        D_exp = D[:, None, None, :].repeat(P, axis=1)
-    else:  # (D,)
-        D_exp = D[None, None, None, :].repeat(C, axis=0).repeat(P, axis=1)
-
-    # All inputs have batch shape (C, P, N) or (C, P, 1)
-    # project_points handles the final broadcast over N
     return project(obj_exp, rvec_exp, tvec_exp, K_exp, D_exp, distortion_model)
 
 

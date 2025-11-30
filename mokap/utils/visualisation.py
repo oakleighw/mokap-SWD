@@ -210,9 +210,8 @@ def plot_cameras_3d(
             volume_centre = [(x_min + x_max) / 2, (y_min + y_max) / 2, (z_min + z_max) / 2]
             volume_size = [x_max - x_min, y_max - y_min, z_max - z_min]
 
-        ax = plot_box_3d(centre=volume_centre, size=volume_size, ax=ax, color='green', alpha=0.15)
-        # ax = plot_ellipsoid_3d(centre=volume_centre, size=volume_size, ax=ax, color='green', alpha=0.15)
-        ax.scatter(*volume_centre, marker='s', color='green', s=25)
+        ax = plot_box_3d(centre=volume_centre, size=volume_size, ax=ax, color='#96d895', alpha=0.05)
+        ax.scatter(*volume_centre, marker='s', color='#96d895', s=25)
 
     ax.legend()
     ax.set_xlabel('X')
@@ -233,17 +232,14 @@ def plot_points_3d(
 ) -> Axes3D:
     """ Matplotlib 3D plot for points, their names and the associated errors """
 
+    points3d = np.asarray(points3d)
+
     if points3d.ndim != 2:
         raise ValueError('This function should be called for N 3D points!')
-
-    points3d = np.asarray(points3d)
 
     if errors is not None:
         errors = np.asarray(errors)
         assert points3d.shape[0] == errors.shape[0]
-
-    if points_names is None or len(points_names) != points3d.shape[0]:
-        points_names = [str(i) for i in range(points3d.shape[0])]
 
     if ax is None:
         fig = plt.figure(figsize=(12, 12))
@@ -262,12 +258,13 @@ def plot_points_3d(
                                  color=color,
                                  marker='o', label=label, alpha=0.5)
 
-    # for p, name in enumerate(points_names):
-    #     if errors is not None:
-    #         c = pts_scatter.to_rgba(errors[p]) if np.isfinite(errors[p]) else color
-    #     else:
-    #         c = color
-    #     ax.text(xs[p], ys[p], zs[p], f"  {name}", c=c, alpha=0.8, fontweight='bold')
+    if points_names is not None:
+        for p, name in enumerate(points_names):
+            if errors is not None:
+                c = pts_scatter.to_rgba(errors[p]) if np.isfinite(errors[p]) else color
+            else:
+                c = color
+            ax.text(xs[p], ys[p], zs[p], f"  {name}", c=c, alpha=0.8, fontweight='bold')
 
     ax.legend()
 
@@ -484,6 +481,8 @@ def plot_triangulation_scene(
             ax=ax
         )
 
+    E_c2w = compose_transform_matrix(rvecs_c2w, tvecs_c2w)
+
     # Calculate dynamic depth for back-projection
     # Vector from each camera center to each 3D point -> shape (C, N, 3)
     cam_to_point_vectors = xp.asarray(points3d)[None, :, :] - xp.asarray(tvecs_c2w)[:, None, :]
@@ -493,8 +492,6 @@ def plot_triangulation_scene(
 
     # Scale these depths to plot the back-projected points slightly closer to the camera
     plot_depths = depths_to_3d_points * detections_depth
-
-    E_c2w = compose_transform_matrix(rvecs_c2w, tvecs_c2w)
 
     # Back-project the 2D points using the calculated dynamic depths
     points2d_in_3d = unproject(
