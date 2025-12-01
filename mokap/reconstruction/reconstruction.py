@@ -19,8 +19,8 @@ from mokap.reconstruction.utils import solve_mwis_networkx, prepare_reconstructi
 
 from mokap.geometry import (
     unproject, triangulate_from_projections,
-    project_to_multiple_cameras, undistort, project,
-    compose_transform_matrix, projection_matrix, invert_vectors,
+    project_to_cameras, undistort, project,
+    compose_transform_matrix, projection_matrix,
     decompose_transform_matrix, invert_transform, intersect_aabb
 )
 
@@ -94,19 +94,17 @@ class Reconstructor:
         self.num_cams = len(self.camera_names)
 
         # Convert all params to JAX arrays
-        self.Ks = xp.stack([camera_parameters[name]['camera_matrix'] for name in self.camera_names])
-        self.Ds = xp.stack([camera_parameters[name]['dist_coeffs'] for name in self.camera_names])
+        self.K = xp.stack([camera_parameters[name]['camera_matrix'] for name in self.camera_names])
+        self.D = xp.stack([camera_parameters[name]['dist_coeffs'] for name in self.camera_names])
 
         # Extrinsics: World-to-camera (for projection/triangulation)
-        self.rvecs_c2w = xp.stack([camera_parameters[name]['rvec'] for name in self.camera_names])
-        self.tvecs_c2w = xp.stack([camera_parameters[name]['tvec'] for name in self.camera_names])
+        rvecs_c2w = xp.stack([camera_parameters[name]['rvec'] for name in self.camera_names])
+        tvecs_c2w = xp.stack([camera_parameters[name]['tvec'] for name in self.camera_names])
 
-        self.rvecs_w2c, self.tvecs_w2c = invert_vectors(self.rvecs_c2w, self.tvecs_c2w)
-        self.Es = compose_transform_matrix(self.rvecs_w2c, self.tvecs_w2c)
-        self.Ps = projection_matrix(self.Ks, self.Es)
+        self.T_c2w = compose_transform_matrix(rvecs_c2w, tvecs_c2w)
+        self.T_w2c = invert_transform(self.T_c2w)
 
-        # Extrinsics: Camera-to-world (ror ray casting / back proj)
-        self.Es_c2w = compose_transform_matrix(self.rvecs_c2w, self.tvecs_c2w)
+        self.P = projection_matrix(self.K, self.T_w2c)
 
     @property
     def max_point_score(self) -> float:
@@ -246,9 +244,9 @@ class Reconstructor:
         """
 
         # Gather parameters for each point based on its camera ID
-        Ks_batch = self.Ks[cam_ids]  # (N, 3, 3)
+        Ks_batch = self.K[cam_ids]  # (N, 3, 3)
         Es_c2w_batch = self.Es_c2w[cam_ids]  # (N, 4, 4)
-        Ds_batch = self.Ds[cam_ids]  # (N, k)
+        Ds_batch = self.D[cam_ids]  # (N, k)
 
         pts_uv = xp.array(coords)  # (N, 2)
 
@@ -360,14 +358,14 @@ class Reconstructor:
     @partial(jit, static_argnums=(0,))
     def _triangulate_and_check(self, matched_uvs, tri_weights):
 
-        undistorted_uvs = undistort(matched_uvs, self.Ks, self.Ds)
-        points3d = triangulate_from_projections(undistorted_uvs, self.Ps, weights=tri_weights)
+        undistorted_uvs = undistort(matched_uvs, self.K, self.D)
+        points3d = triangulate_from_projections(undistorted_uvs, self.P, weights=tri_weights)
 
         # Validation
         valid_triangulation = ~xp.any(xp.isnan(points3d), axis=1)
 
-        all_reprojected, proj_validity = project_to_multiple_cameras(
-            points3d, self.rvecs_w2c, self.tvecs_w2c, self.Ks, self.Ds
+        all_reprojected, proj_validity = project_to_cameras(
+            points3d, self.T_w2c, self.K, self.D
         )
 
         # Errors
@@ -487,8 +485,8 @@ class Reconstructor:
         Dynamic shape cost matrix. No padding computations, a bit more CPU-friendly.
         """
         Ni, Nj = dets_i.shape[0], dets_j.shape[0]
-        K_i, D_i, E_i = self.Ks[i], self.Ds[i], self.Es[i]
-        K_j, D_j, E_j = self.Ks[j], self.Ds[j], self.Es[j]
+        K_i, D_i, E_i = self.K[i], self.D[i], self.T_w2c[i]
+        K_j, D_j, E_j = self.K[j], self.D[j], self.T_w2c[j]
         rvec_w2c_j, tvec_w2c_j = decompose_transform_matrix(E_j)
 
         udets_j = undistort(dets_j, K_j, D_j)
@@ -660,8 +658,8 @@ class Reconstructor:
         NaNs in input result in large costs, which are filtered later.
         """
         Ni, Nj = dets_i_padded.shape[0], dets_j_padded.shape[0]
-        K_i, D_i, E_i = self.Ks[i], self.Ds[i], self.Es[i]
-        K_j, D_j, E_j = self.Ks[j], self.Ds[j], self.Es[j]
+        K_i, D_i, E_i = self.K[i], self.D[i], self.T_w2c[i]
+        K_j, D_j, E_j = self.K[j], self.D[j], self.T_w2c[j]
         rvec_w2c_j, tvec_w2c_j = decompose_transform_matrix(E_j)
 
         udets_j = undistort(dets_j_padded, K_j, D_j)

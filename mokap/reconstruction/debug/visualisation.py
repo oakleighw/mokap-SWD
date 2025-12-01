@@ -73,7 +73,7 @@ class ReconstructorVisualizer:
 
         # Backproject rays from i -> project to j
         udets_i = undistort(dets_i, self.r.K[cam_idx_i], self.r.D[cam_idx_i])
-        E_c2w_i = xp.linalg.inv(self.r.Es[cam_idx_i])
+        E_c2w_i = xp.linalg.inv(self.r.T_w2c[cam_idx_i])
         cam_center_i = E_c2w_i[:3, 3]
 
         p_3d_ray = unproject(udets_i, 1.0, self.r.K[cam_idx_i], E_c2w_i, D=None)
@@ -84,7 +84,7 @@ class ReconstructorVisualizer:
         p_near, p_far, hit = intersect_aabb(cam_center_i, ray_dirs, self.r.aabb_min, self.r.aabb_max)
 
         # Project segments to cam j
-        rvec_j, tvec_j = decompose_transform_matrix(self.r.Es[cam_idx_j])
+        rvec_j, tvec_j = decompose_transform_matrix(self.r.T_w2c[cam_idx_j])
         segments_3d = xp.vstack([p_near, p_far])
         segments_2d, _ = project(segments_3d, rvec_j, tvec_j, new_K_j, D=xp.zeros_like(D_j))
 
