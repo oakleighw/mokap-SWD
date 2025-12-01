@@ -7,19 +7,16 @@ from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QHBoxLayout, QFrame, QVBoxLayout, QGroupBox, QGridLayout, QLabel, QComboBox, QPushButton, \
     QSpinBox, QDoubleSpinBox, QFileDialog, QWidget
 
-from pyqtgraph.opengl import GLGridItem, GLViewWidget, GLScatterPlotItem, GLLinePlotItem, GLMeshItem, MeshData
+from pyqtgraph.opengl import GLGridItem, GLViewWidget, GLScatterPlotItem, GLLinePlotItem, GLMeshItem
 
 import numpy as np
-from mokap.utils.geometry.backend import xp
+from mokap.geometry import xp
 
 from mokap.gui.style.commons import *
 from mokap.gui.widgets import BOARD_TYPES
 from mokap.gui.widgets.widgets_base import Base
 from mokap.utils import hex_to_rgb
 from mokap.utils.datatypes import CharucoBoard, ChessBoard
-
-from mokap.utils.geometry.transforms import rotate_points, rotate_pose
-
 
 logger = logging.getLogger(__name__)
 

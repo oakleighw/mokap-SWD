@@ -4,15 +4,15 @@ from typing import Union, Optional, Tuple, Sequence
 import cv2
 
 import numpy as np
-from mokap.utils.geometry.backend import xp, ArrayLike
+from mokap.geometry.backend import xp, ArrayLike
 
 from scipy import stats as stats
 from mokap.calibration.common import solve_pnp_robust, calibrate_camera_robust
 from mokap.calibration.detectors import ChessboardDetector, CharucoDetector
 from mokap.utils.datatypes import ChessBoard, CharucoBoard, DistortionModel
 from mokap.utils import SENSOR_SIZES, estimate_camera_matrix
-from mokap.utils.geometry.projective import project
-from mokap.utils.geometry.transforms import compose_transform_matrix, decompose_transform_matrix
+
+from mokap.geometry import project, compose_transform_matrix, decompose_transform_matrix
 
 logger = logging.getLogger(__name__)
 

@@ -1,5 +1,5 @@
 import numpy as np
-from mokap.utils.geometry.backend import xp
+from mokap.geometry import xp
 
 import pickle
 import polars as pl

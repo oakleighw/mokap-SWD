@@ -2,7 +2,7 @@ from typing import Tuple
 try:
     from .backend import xp, jit, _eps, _tiny
 except ImportError:
-    from mokap.utils.geometry.backend import xp, jit, _eps, _tiny
+    from mokap.geometry.backend import xp, jit, _eps, _tiny
 
 
 def homogenize(

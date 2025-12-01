@@ -1,8 +1,7 @@
 import numpy as np
-from mokap.utils.geometry.backend import xp
+from mokap.geometry import xp
 
 import matplotlib.pyplot as plt
-from mpl_toolkits.mplot3d import Axes3D
 from matplotlib.widgets import Slider
 import cv2
 from scipy.spatial.distance import cdist
@@ -11,12 +10,12 @@ from typing import List, Tuple
 
 from mokap.reconstruction.datatypes import SoupData
 
-from mokap.utils.geometry.projective import (
+from mokap.geometry import (
     undistort, unproject, project, project_to_multiple_cameras
 )
 
-from mokap.utils.geometry.transforms import compose_transform_matrix, decompose_transform_matrix
-from mokap.utils.geometry.fitting import intersect_aabb
+from mokap.geometry import compose_transform_matrix, decompose_transform_matrix
+from mokap.geometry.fitting import intersect_aabb
 
 from mokap.utils.visualisation import plot_cameras_3d, CUSTOM_COLORS
 

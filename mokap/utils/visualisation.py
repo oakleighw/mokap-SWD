@@ -3,15 +3,13 @@ import matplotlib
 
 import numpy as np
 np.set_printoptions(precision=3, suppress=True, threshold=150)
-from mokap.utils.geometry.backend import xp, ArrayLike
+from mokap.geometry.backend import xp, ArrayLike
 
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-from mokap.utils.geometry.fitting import intersect_rays
-from mokap.utils.geometry.projective import unproject
-from mokap.utils.geometry.transforms import compose_transform_matrix
+from mokap.geometry import intersect_rays, unproject, compose_transform_matrix
 
 
 CUSTOM_COLORS = ['#9B5DE5', '#EF476F', '#FFD166', '#00BBF9', '#00F5D4', '#118ab2', '#073b4c', '#ee6c4d']

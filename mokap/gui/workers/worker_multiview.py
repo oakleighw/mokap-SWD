@@ -3,7 +3,7 @@ from typing import List, Optional, Union, Dict
 from PySide6.QtCore import QTimer, Slot, Signal
 
 import numpy as np
-from mokap.utils.geometry.backend import xp, ArrayLike
+from mokap.geometry import xp, ArrayLike
 
 from mokap.calibration.multiview import MultiviewCalibrationTool
 from mokap.gui.workers.workers_base import CalibrationProcessingWorker
@@ -11,11 +11,10 @@ from mokap.gui.workers.workers_base import CalibrationProcessingWorker
 from mokap.utils.datatypes import (CalibrationData, DetectionPayload, ExtrinsicsPayload, IntrinsicsPayload,
                                    ChessBoard, CharucoBoard)
 
-from mokap.utils.geometry.projective import unproject
+from mokap.geometry import unproject
 
-from mokap.utils.geometry.transforms import (
-    compose_transform_matrix, invert_vectors, rotate_pose, rotate_points,
-    matrix_from_axis_angle, invert_transform, rotation_matrix
+from mokap.geometry import (
+    compose_transform_matrix, invert_vectors, rotate_points
 )
 
 

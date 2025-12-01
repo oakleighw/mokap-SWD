@@ -3,7 +3,7 @@ from typing import List, Dict, Tuple
 from collections import defaultdict
 
 import numpy as np
-from mokap.utils.geometry.backend import xp
+from mokap.geometry.backend import xp
 
 from itertools import combinations
 from scipy.optimize import linear_sum_assignment
@@ -13,7 +13,7 @@ from alive_progress import alive_bar
 from mokap.reconstruction.config import MergerConfig, LinkerConfig
 from mokap.reconstruction.datatypes import TrackletData
 
-from mokap.utils.geometry.fitting import align_rigid
+from mokap.geometry import align_rigid
 
 
 logger = logging.getLogger(__name__)

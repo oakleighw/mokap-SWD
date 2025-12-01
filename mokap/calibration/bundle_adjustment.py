@@ -3,7 +3,7 @@ from scipy.optimize import least_squares
 from scipy.sparse import lil_matrix, csr_matrix
 from typing import Tuple, Dict, Optional
 
-from mokap.utils.geometry import USE_JAX
+from mokap.geometry.backend import USE_JAX
 if not USE_JAX:
     print('[WARNING] Mokap math backend set to NumPy. Enabling JAX for the Bundle Adjustment module only.')
 
@@ -12,12 +12,10 @@ import jax.numpy as jnp
 from jax.typing import ArrayLike
 
 from functools import partial
-from mokap.utils import CallbackOutputStream
 from mokap.utils.datatypes import DistortionModel
 # from alive_progress import alive_bar
 
-from mokap.utils.geometry.projective import project, project_to_cameras_multi, project_object_to_cameras
-from mokap.utils.geometry.transforms import compose_transform_matrix, invert_transform
+from mokap.geometry import project_to_cameras_multi, project_object_to_cameras, compose_transform_matrix, invert_transform
 
 DIST_MODEL_MAP = {'none': 0, 'simple': 4, 'standard': 5, 'full': 8, 'rational': 8}
 

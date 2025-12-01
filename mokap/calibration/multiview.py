@@ -5,21 +5,17 @@ import gc
 import psutil
 
 import numpy as np
-from mokap.utils.geometry.backend import xp, ArrayLike, set_at
+from mokap.geometry.backend import xp, ArrayLike, set_at
 
 from mokap.calibration import bundle_adjustment
 from mokap.calibration.common import solve_pnp_robust
 
 from mokap.utils.datatypes import DetectionPayload
-
-from mokap.utils.geometry.projective import project_to_cameras, reprojection_errors, project_to_cameras_multi
-
-from mokap.utils.geometry.fitting import (quaternion_average, average_qtposes, compute_bounds,
-                                          flip_transform_180)
-
-from mokap.utils.geometry.transforms import (compose_transform_matrix, decompose_transform_matrix,
-                                             quaternion_from_vector, quaternion_from_matrix, vector_from_quaternion,
-                                             invert_transform, quaternion_distance)
+from mokap.geometry import (project_to_cameras, reprojection_errors, project_to_cameras_multi,
+                            quaternion_average, average_qtposes, compute_bounds, flip_transform_180,
+                            compose_transform_matrix, decompose_transform_matrix,
+                            quaternion_from_vector, quaternion_from_matrix, vector_from_quaternion,
+                            invert_transform, quaternion_distance)
 
 logger = logging.getLogger(__name__)
 

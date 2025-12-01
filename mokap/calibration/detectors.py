@@ -3,7 +3,7 @@ from typing import Tuple, Union, Optional
 import cv2
 
 import numpy as np
-from mokap.utils.geometry.backend import ArrayLike
+from mokap.geometry.backend import ArrayLike
 
 from mokap.utils.datatypes import CharucoBoard, ChessBoard
 

@@ -62,7 +62,12 @@ from .projective import (
     project_to_multiple_cameras,
     project_multiple_to_multiple,
     project_object_to_camera,
+    project_object_to_cameras,
     project_object_views_batched,
+
+    project_to_cameras,
+    project_to_cameras_multi
+    # TODO: clean up these wrappers
 )
 
 from .fitting import (
@@ -87,5 +92,3 @@ from .fitting import (
     # Others
     flip_transform_180,
 )
-
-from .backend import USE_JAX, xp

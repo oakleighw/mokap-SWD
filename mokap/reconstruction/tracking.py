@@ -5,7 +5,6 @@ from collections import defaultdict
 import networkx as nx
 
 import numpy as np
-from mokap.utils.geometry.backend import xp
 
 from alive_progress import alive_bar
 from filterpy.common import Q_discrete_white_noise
@@ -15,7 +14,7 @@ from scipy.optimize import linear_sum_assignment
 from scipy.spatial import cKDTree
 
 from mokap.utils import fileio
-from mokap.utils.geometry.fitting import align_rigid
+from mokap.geometry import align_rigid
 
 from mokap.reconstruction.config import AssemblerConfig, TrackerConfig, AnatomyConfig
 from mokap.reconstruction.datatypes import Bone, AssembledSkeleton, CandidateSkeleton, SoupData

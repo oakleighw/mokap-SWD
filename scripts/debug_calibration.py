@@ -5,8 +5,7 @@ import toml
 import matplotlib.pyplot as plt
 
 from mokap.utils.visualisation import plot_cameras_3d, plot_triangulation_scene
-from mokap.utils.geometry.projective import triangulate
-from mokap.utils.geometry.transforms import invert_vectors
+from mokap.geometry import triangulate, invert_vectors
 
 
 def load_calibration_data(folder: Path):

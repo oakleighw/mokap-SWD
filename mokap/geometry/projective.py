@@ -5,10 +5,10 @@ try:
     from .transforms import compose_transform_matrix, projection_matrix, decompose_transform_matrix, \
         invert_intrinsics, homogenize, dehomogenize
 except ImportError:
-    from mokap.utils.geometry.backend import xp, jit, lax, _eps, _tiny, align_batch_dims
-    from mokap.utils.geometry.transforms import (compose_transform_matrix, projection_matrix,
-                                                 decompose_transform_matrix, invert_intrinsics, homogenize,
-                                                 dehomogenize)
+    from mokap.geometry.backend import xp, jit, lax, _eps, _tiny, align_batch_dims
+    from mokap.geometry.transforms import (compose_transform_matrix, projection_matrix,
+                                           decompose_transform_matrix, invert_intrinsics, homogenize,
+                                           dehomogenize)
 
 
 @partial(jit, static_argnames=['distortion_model'])
