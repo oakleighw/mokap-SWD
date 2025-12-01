@@ -94,7 +94,7 @@ def align_rigid(
 
     # Need to scale the last column of U by sign(det_R) * 1.0 (since det is -1 or 1 usually)
     ones = xp.ones_like(det_R)
-    s = xp.stack([ones, ones, det_R], axis=-1)  # (..., 3)
+    s = xp.stack([ones, ones, xp.sign(det_R)], axis=-1)  # (..., 3)
 
     # Apply scaling to U before recomputing R
     # U is (..., 3, 3), we want to scale the 3rd column

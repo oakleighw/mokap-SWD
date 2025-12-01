@@ -58,16 +58,16 @@ from .projective import (
     triangulate_from_projections,
 
     # Batched / Helper Wrappers
-    project_multiple_poses,
-    project_to_multiple_cameras,
-    project_multiple_to_multiple,
-    project_object_to_camera,
-    project_object_to_cameras,
-    project_object_views_batched,
+    # project_multiple_poses,
+    # project_to_multiple_cameras,
+    # project_multiple_to_multiple,
+    # project_object_to_camera,
+    # project_object_views_batched,
+    # TODO: clean up these wrappers
 
     project_to_cameras,
-    project_to_cameras_multi
-    # TODO: clean up these wrappers
+    project_to_cameras_multi,
+    project_object_to_cameras,
 )
 
 from .fitting import (

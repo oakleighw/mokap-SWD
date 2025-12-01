@@ -17,6 +17,7 @@ def homogenize(
     Returns:
         Homogeneous points (..., D+1)
     """
+    points = xp.asarray(points)
     return xp.concatenate([points, xp.ones_like(points[..., :1])], axis=-1)
 
 
@@ -32,6 +33,7 @@ def dehomogenize(
     Returns:
         Euclidean points (..., D)
     """
+    points = xp.asarray(points)
     w_coord = points[..., -1:]
     safe_w = xp.where(xp.abs(w_coord) < _tiny, _tiny, w_coord)
 
