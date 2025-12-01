@@ -10,6 +10,28 @@ except ImportError:
                                            decompose_transform_matrix, invert_intrinsics, homogenize,
                                            dehomogenize)
 
+@jit
+def normalize_pixel_coordinates(
+        points2d: xp.ndarray,
+        K: xp.ndarray
+) -> xp.ndarray:
+    """
+    Normalises pixel coordinates to the image plane (Z=1).
+    Inverse of applying intrinsics: (uv - c) / f
+    """
+
+    # Align params
+    target_ndim = points2d.ndim - 1
+    K = align_batch_dims(target_ndim, K, data_dims=2)
+
+    # Extract intrinsics
+    # f = [fx, fy], c = [cx, cy]
+    f = xp.stack([K[..., 0, 0], K[..., 1, 1]], axis=-1)
+    c = K[..., :2, 2]
+
+    # Normalise
+    return (points2d - c) / (f + _tiny)
+
 
 @partial(jit, static_argnames=['distortion_model'])
 def distort(
@@ -19,6 +41,8 @@ def distort(
 ) -> Tuple[xp.ndarray, xp.ndarray]:
     """
     Computes tangential and radial distortion factors given normalised coordinates.
+    Distortion models (OpenCV standard, Fisheye, etc.) are defined on the normalised
+    image plane (where Z=1), so this accepts only normalised coordinates, for consistency.
 
     Args:
         points2d_normalised: Normalised 2D points coordinates
@@ -47,7 +71,7 @@ def distort(
     k1, k2, p1, p2, k3, k4, k5, k6 = [dist_coeffs[..., i:i + 1] for i in range(8)]
 
     # We use keepdims=True to ensure r2 (..., 1) broadcasts correctly against k1 (..., 1)
-    # and x (..., 1) in the tangential block.
+    # and x (..., 1) in the tangential block
     r2 = xp.sum(xp.square(points2d_normalised), axis=-1, keepdims=True)
     r4 = r2 * r2
     r6 = r4 * r2
@@ -112,20 +136,12 @@ def undistort(
         Undistorted points (..., 2)
     """
 
-    # Align dimensions
     target_ndim = points2d.ndim - 1
-    K = align_batch_dims(target_ndim, K, data_dims=2)
-    D = align_batch_dims(target_ndim, D, data_dims=1)
-
-    # Extract intrinsics as vectors (..., 2)
-    # f = [fx, fy], c = [cx, cy]
-    f = xp.stack([K[..., 0, 0], K[..., 1, 1]], axis=-1)
-    c = K[..., :2, 2]
 
     # Normalise: (uv - c) / f
-    uv_distorted = (points2d - c) / (f + _tiny)
+    uv_distorted = normalize_pixel_coordinates(points2d, K)
 
-    # Newton-Raphson Iteration
+    # Newton-Raphson iteration
     def newton_raphson(i, uv_current):
         radial, tangential = distort(uv_current, D, distortion_model)
         safe_radial = xp.where(xp.abs(radial) < _tiny, _tiny, radial)
@@ -142,14 +158,12 @@ def undistort(
     else:
         pts_rectified = pts_h
 
-    # Project to new Camera (P)
-    if P is not None:
-        P = align_batch_dims(target_ndim, P, data_dims=2)
-        new_f = xp.stack([P[..., 0, 0], P[..., 1, 1]], axis=-1)
-        new_c = P[..., :2, 2]
-    else:
-        new_f = f
-        new_c = c
+    # Project to new camera (P)
+    P_eff = K if P is not None else K   # default to original K if P is not provided
+    P_eff = align_batch_dims(target_ndim, P_eff, data_dims=2)
+
+    new_f = xp.stack([P_eff[..., 0, 0], P_eff[..., 1, 1]], axis=-1)
+    new_c = P_eff[..., :2, 2]
 
     # Extract Z coordinate
     z_rect = pts_rectified[..., 2:3]
@@ -170,6 +184,38 @@ def undistort(
     result = xp.where(is_valid_z, result, xp.nan)
 
     return result
+
+
+@jit
+def project_to_normalized(
+        points3d: xp.ndarray,
+        T: xp.ndarray
+) -> Tuple[xp.ndarray, xp.ndarray]:
+    """
+    Transforms 3D points to camera frame and projects them to the normalised plane.
+    """
+    target_batch_dim = points3d.ndim - 1
+    T = align_batch_dims(target_batch_dim, T, data_dims=2)
+
+    # R @ P + t
+    R = T[..., :3, :3]
+    t = T[..., :3, 3]
+    Xc = xp.einsum('...ij,...j->...i', R, points3d) + t
+
+    z = Xc[..., 2]
+
+    # Mask logic
+    valid_mask_bool = z > 1e-4
+    valid_mask = valid_mask_bool.astype(xp.float32)
+
+    # Project
+    z_safe = xp.where(valid_mask_bool, z, 1.0)
+    x_norm_raw = Xc[..., :2] / z_safe[..., None]
+
+    # Zero out invalid points
+    x_norm = xp.where(valid_mask_bool[..., None], x_norm_raw, 0.0)
+
+    return x_norm, valid_mask
 
 
 @partial(jit, static_argnames=['distortion_model'])
@@ -194,35 +240,19 @@ def project(
         image_points: Projected 2D points in the image plane (..., 2)
         valid_mask: Boolean mask indicating points strictly in front of the camera (Z > 0)
     """
-    # points3d is (..., 3), so batch dims are ndim - 1
-    target_batch_dim = points3d.ndim - 1
 
-    # Transform matrix is (..., 4, 4) or (..., 3, 4), data_dims=2
-    T = align_batch_dims(target_batch_dim, T, data_dims=2)
-    K = align_batch_dims(target_batch_dim, K, data_dims=2)
+    # Transform and project to normalised plane
+    x_norm, valid_mask = project_to_normalized(points3d, T)
 
-    # Extract R and t from T (works for both 4x4 and 3x4)
-    R = T[..., :3, :3]
-    t = T[..., :3, 3]
-
-    # R @ P + t
-    Xc = xp.einsum('...ij,...j->...i', R, points3d) + t
-    z = Xc[..., 2]
-
-    valid_mask_bool = z > 1e-4  # small positive threshold for safety
-    valid_mask = valid_mask_bool.astype(xp.float32)
-
-    # Project invalid points to (0, 0), but their mask will be False
-    z_safe = xp.where(valid_mask_bool, z, 1.0)  # we don't use _eps here because 1e-4 is small enough to cause overflow in x/z
-    x_norm_raw = Xc[..., :2] / z_safe[..., None]
-    x_norm = xp.where(valid_mask_bool[..., None], x_norm_raw, 0.0)
-
+    # Apply Distortion
     # dist_coeffs alignment happens inside here based on x.ndim
     radial, tangential = distort(x_norm, D, distortion_model)
     points_distorted = x_norm * radial + tangential
 
-    # Apply intrinsics
-    # f = [fx, fy], c = [cx, cy]
+    # Apply intrinsics (denormalise)
+    target_batch_dim = points3d.ndim - 1
+    K = align_batch_dims(target_batch_dim, K, data_dims=2)
+
     f = xp.stack([K[..., 0, 0], K[..., 1, 1]], axis=-1)
     c = K[..., :2, 2]
 

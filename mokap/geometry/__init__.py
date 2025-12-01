@@ -44,6 +44,8 @@ from .transforms import (
 
 from .projective import (
     # Core projection
+    normalize_pixel_coordinates,
+    # project_to_normalized, # probably not very useful to export this one
     distort,
     undistort,
     project,
@@ -57,14 +59,7 @@ from .projective import (
     triangulate,
     triangulate_from_projections,
 
-    # Batched / Helper Wrappers
-    # project_multiple_poses,
-    # project_to_multiple_cameras,
-    # project_multiple_to_multiple,
-    # project_object_to_camera,
-    # project_object_views_batched,
-    # TODO: clean up these wrappers
-
+    # Helper wrappers
     project_to_cameras,
     project_to_cameras_multi,
     project_object_to_cameras,
