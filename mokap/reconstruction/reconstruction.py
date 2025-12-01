@@ -21,7 +21,7 @@ from mokap.geometry import (
     unproject, triangulate_from_projections,
     project_to_cameras, undistort, project,
     compose_transform_matrix, projection_matrix,
-    decompose_transform_matrix, invert_transform, intersect_aabb
+    invert_transform, intersect_aabb
 )
 
 logger = logging.getLogger(__name__)
@@ -245,7 +245,7 @@ class Reconstructor:
 
         # Gather parameters for each point based on its camera ID
         Ks_batch = self.K[cam_ids]  # (N, 3, 3)
-        Es_c2w_batch = self.Es_c2w[cam_ids]  # (N, 4, 4)
+        Ts_c2w_batch = self.T_c2w[cam_ids]  # (N, 4, 4)
         Ds_batch = self.D[cam_ids]  # (N, k)
 
         pts_uv = xp.array(coords)  # (N, 2)
@@ -254,13 +254,13 @@ class Reconstructor:
             pts_uv,
             xp.ones(len(cam_ids)),
             Ks_batch,
-            Es_c2w_batch,
+            Ts_c2w_batch,
             Ds_batch
         )
 
         # Compute directions
         # Camera centers are the translation component of C2W
-        origins = Es_c2w_batch[:, :3, 3]
+        origins = Ts_c2w_batch[:, :3, 3]
 
         ray_vecs = world_pts - origins
         ray_dirs = ray_vecs / (xp.linalg.norm(ray_vecs, axis=1, keepdims=True) + 1e-8)
@@ -485,13 +485,12 @@ class Reconstructor:
         Dynamic shape cost matrix. No padding computations, a bit more CPU-friendly.
         """
         Ni, Nj = dets_i.shape[0], dets_j.shape[0]
-        K_i, D_i, E_i = self.K[i], self.D[i], self.T_w2c[i]
-        K_j, D_j, E_j = self.K[j], self.D[j], self.T_w2c[j]
-        rvec_w2c_j, tvec_w2c_j = decompose_transform_matrix(E_j)
+        K_i, D_i, T_i = self.K[i], self.D[i], self.T_w2c[i]
+        K_j, D_j, T_j = self.K[j], self.D[j], self.T_w2c[j]
 
         udets_j = undistort(dets_j, K_j, D_j)
 
-        E_c2w_i = invert_transform(E_i)
+        E_c2w_i = invert_transform(T_i)
         cam_center_i = E_c2w_i[:3, 3]
 
         # Back project
@@ -517,7 +516,7 @@ class Reconstructor:
 
         # Project segments to camera j
         segments_2d, _ = project(
-            segments_3d, rvec_w2c_j, tvec_w2c_j, K_j, xp.zeros_like(D_j), 'none'
+            segments_3d, T_j, K_j, xp.zeros_like(D_j), 'none'
         )
 
         a_pts = segments_2d[:Ni]
@@ -658,13 +657,12 @@ class Reconstructor:
         NaNs in input result in large costs, which are filtered later.
         """
         Ni, Nj = dets_i_padded.shape[0], dets_j_padded.shape[0]
-        K_i, D_i, E_i = self.K[i], self.D[i], self.T_w2c[i]
-        K_j, D_j, E_j = self.K[j], self.D[j], self.T_w2c[j]
-        rvec_w2c_j, tvec_w2c_j = decompose_transform_matrix(E_j)
+        K_i, D_i, T_i = self.K[i], self.D[i], self.T_w2c[i]
+        K_j, D_j, T_j = self.K[j], self.D[j], self.T_w2c[j]
 
         udets_j = undistort(dets_j_padded, K_j, D_j)
 
-        E_c2w_i = invert_transform(E_i)
+        E_c2w_i = invert_transform(T_i)
         cam_center_i = E_c2w_i[:3, 3]
 
         # Back project
@@ -680,7 +678,7 @@ class Reconstructor:
         segments_3d = xp.nan_to_num(segments_3d)       # Prevent projection issues
 
         # Project segments to camera J
-        segments_2d, _ = project(segments_3d, rvec_w2c_j, tvec_w2c_j, K_j, xp.zeros_like(D_j), 'none')
+        segments_2d, _ = project(segments_3d, T_j, K_j, xp.zeros_like(D_j), 'none')
 
         a_pts = segments_2d[:Ni]
         b_pts = segments_2d[Ni:]
