@@ -248,8 +248,8 @@ def run_extrinsics(folder: Path,
         nb_cameras=C,
         images_sizes_wh=np.flip(sizes[:, :2], axis=1),  # tool expects w, h
         object_points=DEFAULT_BOARD.object_points,
-        init_cam_matrices=Ks,
-        init_dist_coeffs=Ds,
+        K_init=Ks,
+        D_init=Ds,
         origin_idx=origin_idx,
         min_detections=ba_frames,
         max_detections=ba_frames * 2

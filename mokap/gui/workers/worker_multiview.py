@@ -109,8 +109,8 @@ class MultiviewWorker(CalibrationProcessingWorker):
                 nb_cameras=self._C,
                 images_sizes_wh=np.array(image_sizes_wh_list),
                 origin_idx=self._orig_cam_idx,
-                init_cam_matrices=self._cameras_matrices,
-                init_dist_coeffs=self._dist_coeffs,
+                K_init=self._cameras_matrices,
+                D_init=self._dist_coeffs,
                 object_points=self.calibration_board.object_points,
                 min_detections=self._min_ba_samples,
                 max_detections=self._max_ba_samples

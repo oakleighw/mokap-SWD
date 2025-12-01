@@ -92,7 +92,7 @@ class MonocularCalibrationTool:
         if isinstance(sensor_size, str):
             self._cam_sensor_size = np.array(SENSOR_SIZES.get(f'''{sensor_size.strip('"')}"''', [0.0, 0.0]))
 
-        elif isinstance(sensor_size, (tuple, list, set, ArrayLike)) and len(sensor_size) == 2:
+        elif isinstance(sensor_size, Sequence) and len(sensor_size) == 2:
             self._cam_sensor_size = np.array(sensor_size)
 
         # Estimate K if possible (this helps the first intrinsics estimation)
