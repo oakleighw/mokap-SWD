@@ -635,10 +635,9 @@ def triangulate_from_projections(
 
 def triangulate(
         points2d: xp.ndarray,
+        T_w2c: xp.ndarray,
         K: xp.ndarray,
         D: xp.ndarray,
-        rvecs_w2c: xp.ndarray,
-        tvecs_w2c: xp.ndarray,
         weights: Optional[xp.ndarray] = None,
         distortion_model: str = 'standard',
 ):
@@ -648,10 +647,9 @@ def triangulate(
 
     Args:
         points2d: Observed points (C, N, 2)
+        T_w2c: World-to-camera transforms (C, 4, 4)
         K: Intrinsics (C, 3, 3)
         D: Distortion coeffs
-        rvecs_w2c: Camera rotations (C, 3)
-        tvecs_w2c: Camera translations (C, 3)
         weights: Optional weights (C, N)
 
     Returns:
@@ -665,7 +663,6 @@ def triangulate(
         weights = xp.isfinite(points2d[..., 0]).astype(points2d.dtype)
     weights = weights.astype(xp.float32)
 
-    T_w2c = compose_transform_matrix(rvecs_w2c, tvecs_w2c)
     P_mats = projection_matrix(K, T_w2c)
 
     return triangulate_from_projections(pts2d_ud, P_mats, weights=weights)

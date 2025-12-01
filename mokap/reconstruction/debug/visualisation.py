@@ -31,7 +31,7 @@ class ReconstructorVisualizer:
 
         fig = plt.figure(figsize=(12, 12))
         ax = fig.add_subplot(111, projection='3d')
-        plot_cameras_3d(self.r.rvecs_c2w, self.r.tvecs_c2w, self.r.Ks, self.r.Ds,
+        plot_cameras_3d(self.r.rvecs_c2w, self.r.tvecs_c2w, self.r.K, self.r.D,
                         cameras_names=self.r.camera_names, trust_volume=self.r.volume_bounds, ax=ax)
 
         E_c2w = compose_transform_matrix(self.r.rvecs_c2w, self.r.tvecs_c2w)
@@ -42,7 +42,7 @@ class ReconstructorVisualizer:
             cam_center = self.r.tvecs_c2w[c]
 
             # Back project to get points on the rays far away (z=1000)
-            points_3d = unproject(dets_per_cam[c], 1000.0, self.r.Ks[c], E_c2w[c], self.r.Ds[c])
+            points_3d = unproject(dets_per_cam[c], 1000.0, self.r.K[c], E_c2w[c], self.r.D[c])
 
             for pt_3d in points_3d:
                 # Draw line from camera center to point
@@ -59,7 +59,7 @@ class ReconstructorVisualizer:
             return
 
         h, w = img_j.shape[:2]
-        K_j, D_j = self.r.Ks[cam_idx_j], self.r.Ds[cam_idx_j]
+        K_j, D_j = self.r.K[cam_idx_j], self.r.D[cam_idx_j]
 
         # Undistort image
         new_K_j, _ = cv2.getOptimalNewCameraMatrix(np.asarray(K_j), np.asarray(D_j), (w, h), 1, (w, h))
@@ -72,11 +72,11 @@ class ReconstructorVisualizer:
             udets_j = undistort(dets_j, K_j, D_j, P=new_K_j)
 
         # Backproject rays from i -> project to j
-        udets_i = undistort(dets_i, self.r.Ks[cam_idx_i], self.r.Ds[cam_idx_i])
+        udets_i = undistort(dets_i, self.r.K[cam_idx_i], self.r.D[cam_idx_i])
         E_c2w_i = xp.linalg.inv(self.r.Es[cam_idx_i])
         cam_center_i = E_c2w_i[:3, 3]
 
-        p_3d_ray = unproject(udets_i, 1.0, self.r.Ks[cam_idx_i], E_c2w_i, D=None)
+        p_3d_ray = unproject(udets_i, 1.0, self.r.K[cam_idx_i], E_c2w_i, D=None)
         ray_dirs = p_3d_ray - cam_center_i
         ray_dirs /= xp.linalg.norm(ray_dirs, axis=-1, keepdims=True)
 
@@ -118,8 +118,8 @@ class ReconstructorVisualizer:
         """Visualises a specific 3D hypothesis reprojected onto all views."""
 
         C = self.r.num_cams
-        reproj, _ = project_to_multiple_cameras(point3d[None, :], self.r.rvecs_w2c, self.r.tvecs_w2c, self.r.Ks,
-                                                self.r.Ds)
+        reproj, _ = project_to_multiple_cameras(point3d[None, :], self.r.rvecs_w2c, self.r.tvecs_w2c, self.r.K,
+                                                self.r.D)
         reproj_pts = np.squeeze(np.array(reproj), axis=1)
 
         fig, axes = plt.subplots(1, C, figsize=(5 * C, 5))
@@ -157,7 +157,7 @@ class ReconstructorVisualizer:
             fig = plt.figure(figsize=(10, 10))
             ax = fig.add_subplot(111, projection='3d')
 
-        plot_cameras_3d(self.r.rvecs_c2w, self.r.tvecs_c2w, self.r.Ks, self.r.Ds,
+        plot_cameras_3d(self.r.rvecs_c2w, self.r.tvecs_c2w, self.r.K, self.r.D,
                         cameras_names=self.r.camera_names, ax=ax)
 
         if soup.num_points == 0: return ax

@@ -3,7 +3,8 @@ from mokap.geometry.backend import xp, USE_JAX
 
 import matplotlib.pyplot as plt
 
-from mokap.geometry import invert_vectors, rotation_matrix, rotation_vector, project, triangulate
+from mokap.geometry import invert_vectors, rotation_matrix, rotation_vector, project, triangulate, \
+    compose_transform_matrix
 from mokap.utils.visualisation import plot_cameras_3d, plot_points_3d
 
 print("[ Triangulation Sanity Check ]")
@@ -190,12 +191,12 @@ def main():
     # Now use the triangulation function with the observed 2D points and camera parameters
     # to see if we can recover the original 3D points
     print("\nAttempting to triangulate 3D points from 2D observations...")
+    T_w2c = compose_transform_matrix(scene['rvecs_w2c'], scene['tvecs_w2c'])
     points_3d_triangulated = triangulate(
         points2d=points_2d_observed,
+        T_w2c=T_w2c,
         K=scene['Ks'],
         D=scene['Ds'],
-        rvecs_w2c=scene['rvecs_w2c'],
-        tvecs_w2c=scene['tvecs_w2c'],
         weights=None,  # Let the function infer from non-NaN values
         distortion_model='standard'
     )
@@ -221,8 +222,8 @@ def main():
     plot_cameras_3d(
         rvecs_c2w=np.array(scene['rvecs_c2w']),
         tvecs_c2w=np.array(scene['tvecs_c2w']),
-        camera_matrices=np.array(scene['Ks']),
-        dist_coeffs=np.array(scene['Ds']),
+        K=np.array(scene['Ks']),
+        D=np.array(scene['Ds']),
         cameras_names=[f"Cam {i + 1}" for i in range(scene['Ks'].shape[0])],
         imsizes=np.array(scene['image_sizes']),
         depth=30.0,

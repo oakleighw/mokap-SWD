@@ -1,11 +1,14 @@
 import sys
 from pathlib import Path
-import numpy as np
 import toml
+
+import numpy as np
+from mokap.geometry.backend import xp
+
 import matplotlib.pyplot as plt
 
 from mokap.utils.visualisation import plot_cameras_3d, plot_triangulation_scene
-from mokap.geometry import triangulate, invert_vectors
+from mokap.geometry import triangulate, compose_transform_matrix, invert_transform
 
 
 def load_calibration_data(folder: Path):
@@ -43,8 +46,7 @@ def load_calibration_data(folder: Path):
 
     Ks = np.array(Ks, dtype=np.float32)
     Ds = np.array(Ds, dtype=np.float32)
-    rvecs_c2w = np.array(rvecs, dtype=np.float32)
-    tvecs_c2w = np.array(tvecs, dtype=np.float32)
+    T_c2w = compose_transform_matrix(xp.stack(rvecs), xp.stack(tvecs))
 
     # Load Volume of Trust if it exists
     volume = None
@@ -53,7 +55,7 @@ def load_calibration_data(folder: Path):
         volume = toml.load(vol_path)
         print("Loaded Volume of Trust.")
 
-    return cam_names, Ks, Ds, rvecs_c2w, tvecs_c2w, volume
+    return cam_names, Ks, Ds, T_c2w, volume
 
 
 if __name__ == "__main__":
@@ -66,7 +68,7 @@ if __name__ == "__main__":
         sys.exit(1)
 
     # Load data
-    cam_names, Ks, Ds, rvecs_c2w, tvecs_c2w, volume = load_calibration_data(folder)
+    cam_names, K, D, T_c2w, volume = load_calibration_data(folder)
 
     # Check for debug point data
     pts_path = folder / 'points2d_stacked.npz'
@@ -78,10 +80,9 @@ if __name__ == "__main__":
         print("No debug points found (points2d_stacked.npz). Plotting cameras only.")
 
         plot_cameras_3d(
-            rvecs_c2w=rvecs_c2w,
-            tvecs_c2w=tvecs_c2w,
-            camera_matrices=Ks,
-            dist_coeffs=Ds,
+            T_c2w=T_c2w,
+            K=K,
+            D=D,
             cameras_names=cam_names,
             trust_volume=volume,
             depth_ratio=0.5
@@ -112,12 +113,12 @@ if __name__ == "__main__":
     points2d_frame[~vis_mask_frame] = np.nan
 
     # Triangulate
-    rvecs_w2c, tvecs_w2c = invert_vectors(rvecs_c2w, tvecs_c2w)
+    T_w2c = invert_transform(T_c2w)
 
     points3d = triangulate(
         points2d_frame,
-        Ks, Ds,
-        rvecs_w2c, tvecs_w2c,
+        T_w2c,
+        K, D,
         weights=vis_mask_frame
     )
 
@@ -125,10 +126,9 @@ if __name__ == "__main__":
     plot_triangulation_scene(
         points3d=points3d,
         points2d=points2d_frame,
-        rvecs_c2w=rvecs_c2w,
-        tvecs_c2w=tvecs_c2w,
-        camera_matrices=Ks,
-        dist_coeffs=Ds,
+        T_c2w=T_c2w,
+        K=K,
+        D=D,
         visibility_mask=vis_mask_frame,
         cameras_names=cam_names,
         imsizes=(1440, 1080),

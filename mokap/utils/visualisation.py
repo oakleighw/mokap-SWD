@@ -3,6 +3,7 @@ import matplotlib
 
 import numpy as np
 np.set_printoptions(precision=3, suppress=True, threshold=150)
+
 from mokap.geometry.backend import xp, ArrayLike
 
 import matplotlib.pyplot as plt
@@ -87,10 +88,9 @@ def plot_ellipsoid_3d(
 
 
 def plot_cameras_3d(
-        rvecs_c2w:          ArrayLike,
-        tvecs_c2w:          ArrayLike,
-        camera_matrices:    ArrayLike,
-        dist_coeffs:        ArrayLike,
+        T_c2w:              ArrayLike,
+        K:                  ArrayLike,
+        D:                  ArrayLike,
         imsizes:            ArrayLike = np.array([1440, 1080]),
         cameras_names:      Optional[Sequence[Any]] = None,
         depth:              Optional[Union[float, ArrayLike]] = None,
@@ -99,10 +99,13 @@ def plot_cameras_3d(
         trust_volume:       Optional[Dict[str, ArrayLike]] = None,
         ax:                 Optional[Axes3D] = None,
 ) -> Axes3D:
-
     """ Matplotlib 3D plot for viewing C cameras, with their frustums, and the global focal point """
 
-    if rvecs_c2w.ndim != 2 or tvecs_c2w.ndim != 2 or camera_matrices.ndim != 3 or dist_coeffs.ndim != 2:
+    T_c2w = xp.asarray(T_c2w)
+    K = xp.asarray(K)
+    D = xp.asarray(D)
+
+    if K.ndim != 3 or D.ndim != 2:
         raise ValueError('This function should be called for C cameras!')
 
     if ax is None:
@@ -112,7 +115,7 @@ def plot_cameras_3d(
     if colors is None:
         colors = CUSTOM_COLORS
 
-    C = camera_matrices.shape[0]
+    C = K.shape[0]
 
     if cameras_names is None:
         cameras_names = [f'Cam #{c}' for c in range(C)]
@@ -140,15 +143,14 @@ def plot_cameras_3d(
     ax.set_ylabel('Y')
     ax.set_zlabel('Z')
 
-    E_c2w = compose_transform_matrix(rvecs_c2w, tvecs_c2w)
-
     # First, find the shared focal point. The calculation is independent of the initial depth
     # used for back-projection, we only need the normalized direction vectors
     # so we use a dummy depth of 1.0 to get the directions
     frustums_for_direction = unproject(
-        frustums_2d, xp.ones(C), camera_matrices, E_c2w, dist_coeffs, distortion_model='full'
+        frustums_2d, xp.ones(C), K, T_c2w, D, distortion_model='full'
     )
 
+    tvecs_c2w = T_c2w[..., :3, 3]
     directions = frustums_for_direction[:, -1] - tvecs_c2w
     directions_normalised = directions / np.linalg.norm(directions, axis=1)[:, None]
     focal_point = intersect_rays(tvecs_c2w, directions_normalised)
@@ -166,9 +168,9 @@ def plot_cameras_3d(
     frustums_3d = unproject(
         frustums_2d,
         plot_depths,
-        camera_matrices,
-        E_c2w,
-        dist_coeffs,
+        K,
+        T_c2w,
+        D,
         distortion_model='full'
     )
 
@@ -323,19 +325,23 @@ def plot_object_3d(
 
 
 def plot_points2d_3d(
-        points2d:           ArrayLike,
-        rvecs_c2w:          ArrayLike,
-        tvecs_c2w:          ArrayLike,
-        camera_matrices:    ArrayLike,
-        dist_coeffs:        ArrayLike,
-        depth:              float = 10.0,
-        points_names:       Optional[Iterable[Any]] = None,
-        errors:             Optional[ArrayLike] = None,
-        colors:             Optional[str] = None,
-        ax:                 Optional[Axes3D] = None,
+        points2d:     ArrayLike,
+        T_c2w:        ArrayLike,
+        K:            ArrayLike,
+        D:            ArrayLike,
+        depth:        float = 10.0,
+        points_names: Optional[Iterable[Any]] = None,
+        errors:       Optional[ArrayLike] = None,
+        colors:       Optional[str] = None,
+        ax:           Optional[Axes3D] = None,
 ) -> Axes3D:
 
-    if points2d.ndim != 3 or rvecs_c2w.ndim != 2 or tvecs_c2w.ndim != 2 or camera_matrices.ndim != 3 or dist_coeffs.ndim != 2:
+    points2d = np.asarray(points2d)
+    T_c2w = xp.asarray(T_c2w)
+    K = xp.asarray(K)
+    D = xp.asarray(D)
+
+    if points2d.ndim != 3 or K.ndim != 3 or D.ndim != 2:
         raise ValueError('This function should be called for CxN 2D points!')
 
     if ax is None:
@@ -347,8 +353,7 @@ def plot_points2d_3d(
     if colors is None:
         colors = CUSTOM_COLORS
 
-    E_c2w = compose_transform_matrix(rvecs_c2w, tvecs_c2w)
-    points2d_3d = unproject(points2d, xp.asarray([depth] * C), camera_matrices, E_c2w, dist_coeffs, distortion_model='full')
+    points2d_3d = unproject(points2d, xp.asarray([depth] * C), K, T_c2w, D, distortion_model='full')
 
     for n in range(C):
 
@@ -385,10 +390,9 @@ def plot_points2d_3d(
 def plot_triangulation_scene(
         points3d:           ArrayLike,
         points2d:           ArrayLike,
-        rvecs_c2w:          ArrayLike,
-        tvecs_c2w:          ArrayLike,
-        camera_matrices:    ArrayLike,
-        dist_coeffs:        ArrayLike,
+        T_c2w:              ArrayLike,
+        K:                  ArrayLike,
+        D:                  ArrayLike,
         visibility_mask:    Optional[ArrayLike] = None,
         points_names:       Optional[Sequence[Any]] = None,
         errors:             Optional[ArrayLike] = None,
@@ -420,8 +424,8 @@ def plot_triangulation_scene(
         points3d: Triangulated 3D points (N, 3)
         points2d: 2D detections for each camera (C, N, 2)
         rvecs_c2w, tvecs_c2w: Camera-to-world extrinsics (C, 3) and (C, 3)
-        camera_matrices: Camera intrinsics (C, 3, 3)
-        dist_coeffs: Distortion coefficients (C, D)
+        K: Camera intrinsics (C, 3, 3)
+        D: Distortion coefficients (C, D)
         visibility_mask: Boolean mask for valid 2D points (C, N)
         points_names: Optional names for the N points
         errors: Optional per-point errors for coloring
@@ -437,6 +441,12 @@ def plot_triangulation_scene(
         ax: Optional existing Matplotlib Axes3D object
     """
 
+    points3d = xp.asarray(points3d)
+    points2d = xp.asarray(points2d)
+    T_c2w = xp.asarray(T_c2w)
+    K = xp.asarray(K)
+    D = xp.asarray(D)
+
     if ax is None:
         fig = plt.figure(figsize=(16, 16))
         ax = fig.add_subplot(111, projection='3d')
@@ -444,13 +454,13 @@ def plot_triangulation_scene(
     if colors is None:
         colors = CUSTOM_COLORS
 
-    points2d_plot = np.asarray(points2d).copy()
+    points2d_plot = points2d.copy()
     if visibility_mask is not None:
-        points2d_plot[~np.asarray(visibility_mask)] = np.nan
+        points2d_plot[~xp.asarray(visibility_mask)] = xp.nan
 
     # Plot cameras and frustums
     ax = plot_cameras_3d(
-        rvecs_c2w, tvecs_c2w, camera_matrices, dist_coeffs,
+        T_c2w, K, D,
         cameras_names=cameras_names,
         imsizes=imsizes,
         depth_ratio=frustums_depth,
@@ -479,11 +489,11 @@ def plot_triangulation_scene(
             ax=ax
         )
 
-    E_c2w = compose_transform_matrix(rvecs_c2w, tvecs_c2w)
+    tvecs_c2w = T_c2w[..., :3, 3]
 
     # Calculate dynamic depth for back-projection
     # Vector from each camera center to each 3D point -> shape (C, N, 3)
-    cam_to_point_vectors = xp.asarray(points3d)[None, :, :] - xp.asarray(tvecs_c2w)[:, None, :]
+    cam_to_point_vectors = points3d[None, :, :] - tvecs_c2w[:, None, :]
 
     # Distance from each camera to each 3D point -> shape (C, N)
     depths_to_3d_points = xp.linalg.norm(cam_to_point_vectors, axis=2)
@@ -493,9 +503,11 @@ def plot_triangulation_scene(
 
     # Back-project the 2D points using the calculated dynamic depths
     points2d_in_3d = unproject(
-        xp.asarray(points2d_plot), plot_depths, camera_matrices, E_c2w, dist_coeffs, distortion_model='simple'
+        points2d_plot, plot_depths, K, T_c2w, D, distortion_model='simple'
     )
-    points2d_in_3d = np.asarray(points2d_in_3d)  # convert to numpy for plotting
+
+    # Enforce to numpy for plotting
+    points2d_in_3d = np.asarray(points2d_in_3d)
 
     # Plot the back-projected points and the rays
     C, N, _ = points2d_in_3d.shape
