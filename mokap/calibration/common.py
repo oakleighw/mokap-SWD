@@ -1,14 +1,32 @@
 import logging
+from dataclasses import dataclass, field
+
 import cv2
 
 import numpy as np
 from mokap.geometry.backend import xp, ArrayLike
 
 from typing import Tuple, Optional, Literal, Union, Sequence
-from mokap.geometry import project, reprojection_errors, compose_transform_matrix
-from mokap.utils.datatypes import ChessBoard, CharucoBoard, CalibrateCameraResult, DistortionModel
+from mokap.geometry import project, reprojection_errors, compose_transform_matrix, flip_pose_180
+from mokap.utils.datatypes import ChessBoard, CharucoBoard, DistortionModel
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass
+class CalibrateCameraResult:
+    """A container for the results of an intrinsic camera calibration."""
+    success: bool
+    rms_error: float = np.inf
+    K_new: Optional[np.ndarray] = None
+    D_new: Optional[np.ndarray] = None
+    rvecs: Optional[np.ndarray] = None
+    tvecs: Optional[np.ndarray] = None
+    std_devs_intrinsics: Optional[np.ndarray] = None
+    error_message: str = ""
+    # field avoids including the large error array in the __repr__
+    per_view_errors: Optional[np.ndarray] = field(default=None, repr=False)
+
 
 
 def PnP_wrapper(points3d, points2d, K, D, mode: Literal['IPPE', 'SQPNP', 'Iterative']):

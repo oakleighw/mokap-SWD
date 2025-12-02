@@ -11,21 +11,6 @@ from mokap.utils import fileio
 DistortionModel = Literal['none', 'simple', 'standard', 'full', 'rational']
 
 
-@dataclass
-class CalibrateCameraResult:
-    """ A container for the results of an intrinsic camera calibration """
-    success: bool
-    rms_error: float = np.inf
-    K_new: Optional[np.ndarray] = None
-    D_new: Optional[np.ndarray] = None
-    rvecs: Optional[np.ndarray] = None
-    tvecs: Optional[np.ndarray] = None
-    std_devs_intrinsics: Optional[np.ndarray] = None
-    error_message: str = ""
-    # field avoids including the large error array in the __repr__
-    per_view_errors: Optional[np.ndarray] = field(default=None, repr=False)
-
-
 class ChessBoard:
 
     type = 'ChessBoard'
@@ -127,9 +112,10 @@ class CharucoBoard(ChessBoard):
         f = square_size_px if square_size_px else 1
         return self.to_opencv().generateImage((w * f, h * f), marginSize=self.margin, borderBits=self.padding)
 
+
 ##
 
-# TODO: merge some of these payloads
+# TODO: all of this is going to he handled by the new shared CameraModel classes
 
 @dataclass
 class ReprojectionPayload:

@@ -17,7 +17,8 @@ from mokap.utils.datatypes import DistortionModel
 # from alive_progress import alive_bar
 
 from mokap.geometry import (
-    project,
+    project_object_to_cameras,
+    project_to_cameras_multi,
     compose_transform_matrix,
     decompose_transform_matrix,
     invert_transform
@@ -616,44 +617,28 @@ def cost_function(
     cfg = spec['config']
     C, P, N = cfg['nb_cams'], cfg['nb_frames'], cfg['nb_points']
 
-    # Expand Intrinsics for broadcasting: (C, 3, 3) -> (C, 1, 1, 3, 3)
-    Ks_exp = Ks[:, None, None, :, :]
-    # (C, k) -> (C, 1, 1, k)
-    Ds_exp = Ds[:, None, None, :]
-
     # Workflow-dependent reprojection
     is_rigid_object = not cfg['fix_poses']
 
     if is_rigid_object:
         # Workflow: Rigid object (calibration board)
-        # Projects a single set of N points for each of the P poses
-        # Compose object poses (object-to-world)
+
+        # Compose object poses (object-to-world): (P, 4, 4)
         T_o2w = compose_transform_matrix(poses_r, poses_t)
 
-        # T_w2c: (C, 4, 4) -> (C, 1, 1, 4, 4)
-        T_c = T_w2c[:, None, None, :, :]
-        # T_o2w: (P, 4, 4) -> (1, P, 1, 4, 4)
-        T_o = T_o2w[None, :, None, :, :]
-
-        # Combine to camera-frame transforms: (C, P, 1, 4, 4)
-        T_total = T_c @ T_o
-
-        # Expand Points: (N, 3) -> (1, 1, N, 3)
-        pts_exp = object_points[None, None, :, :]
-
-        reproj, valid_depth = project(pts_exp, T_total, Ks_exp, Ds_exp, distortion_model)
+        # This wrapper for project does C x P broadcasting
+        reproj, valid_depth = project_object_to_cameras(
+            object_points, T_w2c, T_o2w, Ks, Ds, distortion_model
+        )
 
     else:
         # Workflows: Scaffolding or Temporally-consistent non-rigid (animal)
 
-        # T_w2c: (C, 4, 4) -> (C, 1, 1, 4, 4)
-        T_c = T_w2c[:, None, None, :, :]
-
-        # Points: (P, N, 3) -> (1, P, N, 3)
         object_points_per_frame = object_points.reshape(P, N, 3)
-        pts_exp = object_points_per_frame[None, :, :, :]
 
-        reproj, valid_depth = project(pts_exp, T_c, Ks_exp, Ds_exp, distortion_model)
+        reproj, valid_depth = project_to_cameras_multi(
+            object_points_per_frame, T_w2c, Ks, Ds, distortion_model
+        )
 
     # Residuals calculation
     resid = reproj - image_points

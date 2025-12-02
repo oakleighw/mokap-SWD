@@ -318,48 +318,6 @@ def project_to_cameras_multi(
     return project(obj_exp, T_exp, K_exp, D_exp, distortion_model)
 
 
-# # Legacy wrappers for backward compatibility (deprecated)
-# def project_multiple_poses(
-#         points3d: xp.ndarray,
-#         rvec: xp.ndarray,
-#         tvec: xp.ndarray,
-#         K: xp.ndarray,
-#         D: xp.ndarray,
-#         distortion_model: str = 'standard'
-# ):
-#     """DEPRECATED: Use project() with transform matrices directly."""
-#     T = compose_transform_matrix(rvec, tvec)
-#     obj_exp = points3d[None, ...]
-#     T_exp = T[:, None, :, :]
-#     return project(obj_exp, T_exp, K, D, distortion_model)
-
-
-# def project_to_multiple_cameras(
-#         points3d: xp.ndarray,
-#         rvec: xp.ndarray,
-#         tvec: xp.ndarray,
-#         K: xp.ndarray,
-#         D: xp.ndarray,
-#         distortion_model: str = 'standard'
-# ):
-#     """DEPRECATED: Use project_to_cameras() with transform matrices directly."""
-#     T = compose_transform_matrix(rvec, tvec)
-#     return project_to_cameras(points3d, T, K, D, distortion_model)
-
-
-# def project_multiple_to_multiple(
-#         points3d: xp.ndarray,
-#         rvecs: xp.ndarray,
-#         tvecs: xp.ndarray,
-#         K: xp.ndarray,
-#         D: xp.ndarray,
-#         distortion_model: str = 'standard'
-# ) -> Tuple[xp.ndarray, xp.ndarray]:
-#     """DEPRECATED: Use project_to_cameras_multi() with transform matrices directly."""
-#     T = compose_transform_matrix(rvecs, tvecs)
-#     return project_to_cameras_multi(points3d, T, K, D, distortion_model)
-
-
 @partial(jit, static_argnames=['distortion_model'])
 def project_with_object_pose(
         object_points3d: xp.ndarray,
@@ -436,39 +394,6 @@ def project_object_to_cameras(
         D_exp = D
 
     return project(obj_exp, T_net_exp, K_exp, D_exp, distortion_model)
-
-
-# Legacy wrappers (deprecated)
-# def project_object_to_camera(
-#         object_points3d: xp.ndarray,
-#         r_w2c: xp.ndarray,
-#         t_w2c: xp.ndarray,
-#         r_o2w: xp.ndarray,
-#         t_o2w: xp.ndarray,
-#         K: xp.ndarray,
-#         D: xp.ndarray,
-#         distortion_model: str = 'standard'
-# ) -> Tuple[xp.ndarray, xp.ndarray]:
-#     """DEPRECATED: Use project_with_object_pose() with transform matrices."""
-#     T_w2c = compose_transform_matrix(r_w2c, t_w2c)
-#     T_o2w = compose_transform_matrix(r_o2w, t_o2w)
-#     return project_with_object_pose(object_points3d, T_w2c, T_o2w, K, D, distortion_model)
-
-
-# def project_object_views_batched(
-#         object_points3d: xp.ndarray,
-#         r_w2c: xp.ndarray,
-#         t_w2c: xp.ndarray,
-#         r_o2w: xp.ndarray,
-#         t_o2w: xp.ndarray,
-#         K: xp.ndarray,
-#         D: xp.ndarray,
-#         distortion_model: str = 'standard'
-# ):
-#     """DEPRECATED: Use project_object_to_cameras() with transform matrices."""
-#     T_w2c = compose_transform_matrix(r_w2c, t_w2c)
-#     T_o2w = compose_transform_matrix(r_o2w, t_o2w)
-#     return project_object_to_cameras(object_points3d, T_w2c, T_o2w, K, D, distortion_model)
 
 
 @partial(jit, static_argnames=['distortion_model'])
@@ -593,8 +518,6 @@ def reprojection_errors(
                                             xp.nan) if visibility_mask is not None else distances
     return results
 
-
-# TODO: having two triangulate functions is stupid, should use the Pmat version everywhere
 
 @partial(jit, static_argnames=['lambda_reg'])
 def triangulate_from_projections(

@@ -62,6 +62,7 @@ from .projective import (
     # Helper wrappers
     project_to_cameras,
     project_to_cameras_multi,
+    project_with_object_pose,
     project_object_to_cameras,
 )
 
@@ -85,5 +86,5 @@ from .fitting import (
     average_qtposes,
 
     # Others
-    flip_transform_180,
+    flip_transform_180
 )
