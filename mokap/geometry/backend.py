@@ -8,21 +8,16 @@ if USE_JAX:
     from jax.typing import ArrayLike
 
     # JAX (float32 default)
-    # # Threshold to switch to Taylor series (float32 needs this earlier than float64)
-    # _eps = 1e-4
-    #
-    # # A very tiny value to avoid division by zero
-    # _tiny = 1e-12
+    # Threshold to switch to Taylor series (float32 needs this earlier than float64)
+    _eps = 1e-4
 
-    # Or match precision:
-    # from jax.config import config
-    # config.update("jax_enable_x64", True)
-    xp_float = jnp.float64
+    # A very tiny value to avoid division by zero
+    _tiny = 1e-12
 
     xp = jnp
     jit = jax.jit
     vmap = jax.vmap
-    # xp_float = jnp.float32
+    xp_float = jnp.float32
 
     def set_at(arr, indices, values, inplace=True):
         return arr.at[indices].set(values)

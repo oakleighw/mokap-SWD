@@ -409,7 +409,7 @@ class MonocularCalibrationTool:
 
         object_points_subset = self.calibration_board.object_points[self._pointsIDs]
 
-        success, rvec_b2c, tvec_b2c, pose_errors = solve_pnp_robust(
+        success, T_b2c, pose_errors = solve_pnp_robust(
             points3d=object_points_subset,
             points2d=self._points2d,
             K=self._K,
@@ -422,7 +422,7 @@ class MonocularCalibrationTool:
             self._pose_error = np.nan
             return False
 
-        self._curr_T_b2c = compose_transform_matrix(rvec_b2c, tvec_b2c)
+        self._curr_T_b2c = T_b2c
         self._pose_error = pose_errors['rms']
 
         return True
@@ -436,8 +436,7 @@ class MonocularCalibrationTool:
         # project() is the only call in this that *might* use JAX in this class
         K_xp = xp.asarray(self._K)
         D_xp = xp.asarray(self._D)
-        # self._curr_rvec_b2c and self._curr_tvec_b2c are already xp
-        self._reprojected_points_xp, _ = project(self._points3d_xp, self._curr_rvec_b2c_xp, self._curr_tvec_b2c_xp, K_xp, D_xp)
+        self._reprojected_points_xp, _ = project(self._points3d_xp, self._curr_T_b2c, K_xp, D_xp)
         # TODO: store the validity mask maybe?
 
     def clear_grid(self):

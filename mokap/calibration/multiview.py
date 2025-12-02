@@ -61,7 +61,9 @@ class MultiviewCalibrationTool:
 
         # State for extrinsics (camera-to-world)
         self._has_extrinsics = np.zeros(nb_cameras, dtype=bool)
-        self._T_c2w_all: xp.ndarray = xp.zeros((nb_cameras, 4, 4), dtype=xp.float32)
+
+        identity = xp.eye(4, dtype=xp.float32)
+        self._T_c2w_all = xp.repeat(identity[None, ...], nb_cameras, axis=0)
 
         # State for board pose (world)
         self._latest_board_pose_w: Optional[xp.ndarray] = None
@@ -97,8 +99,8 @@ class MultiviewCalibrationTool:
         # bs results
         self._refined = False
         self._refined_intrinsics = None
-        self._refined_extrinsics = None
-        self._refined_board_poses = None
+        self._refined_extrinsics = None  # T matrices (C, 4, 4)
+        self._refined_board_poses = None  # T matrices (P, 4, 4)
         self._points2d = None
         self._visibility_mask = None
         self._volume_of_trust = None
@@ -167,22 +169,20 @@ class MultiviewCalibrationTool:
 
             history_q = quaternion_from_matrix(xp.stack(list(self._board_pose_history)))
 
-            # We average the rotation (via quaternions) and translation separately
+            # We average the rotation (via quaternions)
             q_ref = quaternion_average(history_q)
-            # t_ref = xp.mean(history_t, axis=0)   # these are not super useful, the quaternion is the most important
-            # r_ref = quaternion_to_axisangle(q_ref)
 
-            # Get the alternative PnP solutions (180-degree flip) using transform directly
+            # Get the alternative PnP solutions (180-degree flip)
             T_b2c_alt = flip_transform_180(T_b2c_known)
 
-            # Calculate world poses for both the original and the alternative PnP result
+            # Calculate world poses for alternative PnP result
             T_b2w_votes_alt = T_c2w_known @ T_b2c_alt
 
             # For each vote determine which (original or alternative) is closer to the stable ref
             q_votes = quaternion_from_matrix(T_b2w_votes)
             q_votes_alt = quaternion_from_matrix(T_b2w_votes_alt)
 
-            # Calculate angular distance to the reference for both sets of poses
+            # Calculate angular distance to the reference
             dist_original = quaternion_distance(q_votes, q_ref)
             dist_alt = quaternion_distance(q_votes_alt, q_ref)
 
@@ -216,6 +216,7 @@ class MultiviewCalibrationTool:
         self._latest_board_pose_w = T_b2w
         self._board_pose_history.append(T_b2w)
 
+        # Calculate new camera extrinsics based on the optimised board pose
         T_c2b_all = invert_transform(T_b2c_all)
         T_c2w_new = T_b2w @ T_c2b_all
 
@@ -268,7 +269,7 @@ class MultiviewCalibrationTool:
             return
 
         # Reestimate the board-to-camera pose and validate it
-        success, rvec, tvec, pose_errors = solve_pnp_robust(
+        success, T_b2c, pose_errors = solve_pnp_robust(
             points3d=self._object_points[detection.pointsIDs],
             points2d=detection.points2D,
             K=self._K[cam_idx],
@@ -279,12 +280,10 @@ class MultiviewCalibrationTool:
         if not success:
             return
 
-        # From here on rvec and tvec should be sane
+        # From here on T_b2c should be sane
 
         f = detection.frame
         self._last_frame[cam_idx] = f
-
-        T_b2c = compose_transform_matrix(xp.asarray(rvec), xp.asarray(tvec))
         self._detection_buffer[cam_idx][f] = (T_b2c, detection.points2D, detection.pointsIDs)
 
         # The origin camera's extrinsics are fixed at identity, so its flag is always true
@@ -414,7 +413,7 @@ class MultiviewCalibrationTool:
                         vis_buf[cam_idx, p_idx, ids] = True
 
                 # Initial guess for board poses (from online estimation)
-                r_board_w_list, t_board_w_list = [], []
+                T_board_w_list = []
 
                 for p_idx, entries in enumerate(current_samples):
 
@@ -428,21 +427,21 @@ class MultiviewCalibrationTool:
                     r_stack, t_stack = decompose_transform_matrix(T_b2w_votes)
                     q_stack = quaternion_from_vector(r_stack)
 
-                    # here we use the simple, lenient average for BA initialization
+                    # Simple average for BA initialisation
                     # (Because the spread of this cluster is a direct result of the accumulated errors
                     # during online camera pose estimates - which are unavoidable!!
                     # The hardcore filter used online would likely jusyt eliminate everyone here)
-                    r_board_w_list.append(vector_from_quaternion(quaternion_average(q_stack)))
-                    t_board_w_list.append(xp.median(t_stack, axis=0))
+                    q_avg = quaternion_average(q_stack)
+                    t_avg = xp.median(t_stack, axis=0)
 
-                # Start with the online estimates
-                cam_r_online, cam_t_online = decompose_transform_matrix(self._T_c2w_all)
+                    T_board_w_list.append(compose_transform_matrix(vector_from_quaternion(q_avg), t_avg))
+
+                # Prepare initial matrices
+                poses_T_initial = xp.stack(T_board_w_list)  # (P, 4, 4)
+                cam_T_online = self._T_c2w_all  # (C, 4, 4)
 
                 K_online = self._K
                 D_online = self._D
-
-                poses_r_initial = xp.stack(r_board_w_list)
-                poses_t_initial = xp.stack(t_board_w_list)
 
                 pts2d_buf = xp.asarray(pts2d_buf)
                 vis_buf = xp.asarray(vis_buf)
@@ -457,33 +456,30 @@ class MultiviewCalibrationTool:
                 success_s1, results_s1 = bundle_adjustment.run_bundle_adjustment(
                     camera_matrices_initial=K_online,
                     distortion_coeffs_initial=D_online,
-                    cam_rvecs_initial=cam_r_online,
-                    cam_tvecs_initial=cam_t_online,
+                    cam_poses_initial=cam_T_online,
 
                     images_sizes_wh=self._images_sizes_wh,
 
                     image_points=pts2d_buf,
                     visibility_mask=vis_buf,
 
-                    object_points_initial=self._object_points,  # The board's 3D model
-                    poses_rvecs_initial=poses_r_initial,
-                    poses_tvecs_initial=poses_t_initial,
+                    object_points_initial=self._object_points,
+                    object_poses_initial=poses_T_initial,
 
-                    # BA logic control flags
                     fix_cameras_intrinsics=False,
                     fix_cameras_extrinsics=False,
-                    fix_object_points=True,              # The board's shape is known and rigid
-                    fix_poses=False,                # The board's pose is being optimized
+                    fix_object_points=True,  # The board's shape is known and rigid
+                    fix_poses=False,  # The board's pose is being optimized
                     time_independent_points=False,  # It's the same board over time
 
                     # Stage 1 specific flags
-                    shared_intrinsics=True,         # Forces a single camera model for all views
-                    fix_aspect_ratio=True,          # Assume fx = fy
+                    shared_intrinsics=True,  # Forces a single camera model for all views
+                    fix_aspect_ratio=True,  # Assume fx = fy
                     distortion_model='none',
                     priors=priors_stage1,
 
                     origin_idx=self.origin_idx,
-                    radial_penalty=0.0      # for fisrst stage we want to consider all points, even at the edge
+                    radial_penalty=0.0  # for fisrst stage we want to consider all points, even at the edge
                 )
                 if not success_s1:
                     raise RuntimeError("BA Stage 1 failed.")
@@ -497,15 +493,15 @@ class MultiviewCalibrationTool:
                 #
                 logger.debug(f"[BA] >>> STAGE 2: Consolidating per-camera intrinsics with {current_P} frames...")
 
-                K_s2_init, D_s2_init = results_s1['K_opt'], results_s1['D_opt']
-                cam_r_s2_init, cam_t_s2_init = results_s1['cam_r_opt'], results_s1['cam_t_opt']
-                poses_r_s2_init, poses_t_s2_init = results_s1['poses_r_opt'], results_s1['poses_t_opt']
+                K_s2_init = results_s1['K_opt']
+                D_s2_init = results_s1['D_opt']
+                cam_T_s2_init = results_s1['cam_poses_opt']
+                poses_T_s2_init = results_s1['object_poses_opt']
 
                 success_s2, results_s2 = bundle_adjustment.run_bundle_adjustment(
                     camera_matrices_initial=K_s2_init,
                     distortion_coeffs_initial=D_s2_init,
-                    cam_rvecs_initial=cam_r_s2_init,
-                    cam_tvecs_initial=cam_t_s2_init,
+                    cam_poses_initial=cam_T_s2_init,
 
                     images_sizes_wh=self._images_sizes_wh,
 
@@ -513,8 +509,7 @@ class MultiviewCalibrationTool:
                     visibility_mask=vis_buf,
 
                     object_points_initial=self._object_points,
-                    poses_rvecs_initial=poses_r_s2_init,
-                    poses_tvecs_initial=poses_t_s2_init,
+                    object_poses_initial=poses_T_s2_init,
 
                     # BA logic control flags
                     fix_cameras_intrinsics=False,
@@ -524,8 +519,8 @@ class MultiviewCalibrationTool:
                     time_independent_points=False,
 
                     # Stage 2 specific flags
-                    shared_intrinsics=False,    # We now optimize per-camera intrinsics
-                    fix_aspect_ratio=False,     # We relax the aspect ratio constraint
+                    shared_intrinsics=False,  # We now optimize per-camera intrinsics
+                    fix_aspect_ratio=False,  # We relax the aspect ratio constraint
                     distortion_model='simple',  # And start optimising distortion
 
                     priors=priors_stage2,
@@ -543,15 +538,15 @@ class MultiviewCalibrationTool:
                 #
                 logger.debug(f"[BA] >>> STAGE 3: Full refinement with {current_P} frames...")
 
-                K_s3_init, D_s3_init = results_s2['K_opt'], results_s2['D_opt']
-                cam_r_s3_init, cam_t_s3_init = results_s2['cam_r_opt'], results_s2['cam_t_opt']
-                poses_r_s3_init, poses_t_s3_init = results_s2['poses_r_opt'], results_s2['poses_t_opt']
+                K_s3_init = results_s2['K_opt']
+                D_s3_init = results_s2['D_opt']
+                cam_T_s3_init = results_s2['cam_poses_opt']
+                poses_T_s3_init = results_s2['object_poses_opt']
 
                 success_s3, final_results_attempt = bundle_adjustment.run_bundle_adjustment(
                     camera_matrices_initial=K_s3_init,
                     distortion_coeffs_initial=D_s3_init,
-                    cam_rvecs_initial=cam_r_s3_init,
-                    cam_tvecs_initial=cam_t_s3_init,
+                    cam_poses_initial=cam_T_s3_init,
 
                     images_sizes_wh=self._images_sizes_wh,
 
@@ -559,8 +554,7 @@ class MultiviewCalibrationTool:
                     visibility_mask=vis_buf,
 
                     object_points_initial=self._object_points,
-                    poses_rvecs_initial=poses_r_s3_init,
-                    poses_tvecs_initial=poses_t_s3_init,
+                    object_poses_initial=poses_T_s3_init,
 
                     # BA logic control flags
                     fix_cameras_intrinsics=False,
@@ -572,11 +566,11 @@ class MultiviewCalibrationTool:
                     # Stage 3 specific flags
                     shared_intrinsics=False,
                     fix_aspect_ratio=False,
-                    distortion_model='full',    # Full distortion model
+                    distortion_model='full',  # Full distortion model
 
-                    priors=priors_stage3,       # Priors are mega important at this stage
+                    priors=priors_stage3,  # Priors are mega important at this stage
 
-                    radial_penalty=4.0   # now we kinda want to ignore the points far from the working volume
+                    radial_penalty=4.0  # now we kinda want to ignore the points far from the working volume
                 )
                 if not success_s3:
                     raise RuntimeError("BA Stage 3 failed.")
@@ -590,7 +584,7 @@ class MultiviewCalibrationTool:
                 break
 
             except MemoryError:
-                gc.collect()  # Force garbage collection
+                gc.collect()
                 mem = psutil.virtual_memory()
                 logger.warning(
                     f"[BA] Memory error encountered with {current_P} samples. "
@@ -609,17 +603,10 @@ class MultiviewCalibrationTool:
         if ba_succeeded and final_results is not None:
             logger.info(f"Bundle adjustment complete using {current_P} samples. Storing refined parameters.")
 
-            # store the globally optimized results
-            final_K = final_results['K_opt']
-            final_D = final_results['D_opt']
-            final_cam_r = final_results['cam_r_opt']
-            final_cam_t = final_results['cam_t_opt']
-            final_poses_r = final_results['poses_r_opt']
-            final_poses_t = final_results['poses_t_opt']
-
-            self._refined_intrinsics = (final_K, final_D)
-            self._refined_extrinsics = (final_cam_r, final_cam_t)
-            self._refined_board_poses = (final_poses_r, final_poses_t)
+            # Store globally optimised results
+            self._refined_intrinsics = (final_results['K_opt'], final_results['D_opt'])
+            self._refined_extrinsics = final_results['cam_poses_opt']  # (C, 4, 4)
+            self._refined_board_poses = final_results['object_poses_opt']  # (P, 4, 4)
 
             self._refined = True
             self.volume_of_trust()
@@ -635,11 +622,9 @@ class MultiviewCalibrationTool:
         return self._K, self._D
 
     @property
-    def extrinsics(self) -> Tuple[xp.ndarray, xp.ndarray]:
-        # TODO: mask these using self._has_extrinsics to only return the non-zero ones (well and the origin which is 0)
-        rvecs, tvecs = decompose_transform_matrix(self._T_c2w_all)
-        return rvecs, tvecs
-        # TODO: No need to return rvecs/tvecs anymore
+    def extrinsics(self) -> xp.ndarray:
+        # Returns (C, 4, 4) matrix
+        return self._T_c2w_all
 
     @property
     def is_estimated(self) -> bool:
@@ -654,11 +639,11 @@ class MultiviewCalibrationTool:
         return self._refined_intrinsics
 
     @property
-    def refined_extrinsics(self) -> Tuple[xp.ndarray, xp.ndarray]:
+    def refined_extrinsics(self) -> xp.ndarray:
         return self._refined_extrinsics
 
     @property
-    def refined_board_poses(self) -> Tuple[xp.ndarray, xp.ndarray]:
+    def refined_board_poses(self) -> xp.ndarray:
         return self._refined_board_poses
 
     @property
@@ -672,14 +657,16 @@ class MultiviewCalibrationTool:
 
         if self._refined:
             # calculate the 3D world coordinates of all point instances using the refined poses
-            T_b2w_all_opt = compose_transform_matrix(*self.refined_board_poses)
+            # Board Poses: (P, 4, 4)
+            # Board Points: (N, 4) (Homogeneous)
+            T_b2w_all_opt = self.refined_board_poses
             world_pts_all_instances = xp.einsum('pij,nj->pni', T_b2w_all_opt, self._board_pts_hom)[:, :, :3]
 
             # Reprojection and error calculation
             observed_pts2d, visibility_mask = self.image_points
 
             # Get world-to-camera transforms
-            T_c2w = compose_transform_matrix(*self._refined_extrinsics)
+            T_c2w = self.refined_extrinsics  # (C, 4, 4)
             T_w2c = invert_transform(T_c2w)
 
             # Project all 3D points into all cameras
@@ -692,9 +679,9 @@ class MultiviewCalibrationTool:
 
             effective_visibility = visibility_mask * valid_depth_mask
 
-            # Compute the raw, per-point Euclidean distance errors
+            # Compute the raw per-point Euclidean distance errors
             raw_errors = xp.linalg.norm(observed_pts2d - reprojected_pts, axis=-1)
-            all_errors = xp.where(effective_visibility, raw_errors, xp.nan)    # And mark non-observed points as nan
+            all_errors = xp.where(effective_visibility, raw_errors, xp.nan)    # and mark non-observed points as nan
 
             # And compute the reliable bounding box using the world points and their errors
             volume_of_trust = compute_bounds(
