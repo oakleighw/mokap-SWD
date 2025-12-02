@@ -375,8 +375,7 @@ def invert_intrinsics(
 @jit
 def fundamental_matrix(
         K_pair: Tuple[xp.ndarray, xp.ndarray],
-        rvecs_w2c_pair: Tuple[xp.ndarray, xp.ndarray],
-        tvecs_w2c_pair: Tuple[xp.ndarray, xp.ndarray],
+        T_w2c_pair: Tuple[xp.ndarray, xp.ndarray],
 ) -> xp.ndarray:
     """
     Computes the Fundamental Matrix (F) between two cameras.
@@ -386,22 +385,21 @@ def fundamental_matrix(
 
     Args:
         K_pair: Tuple of (K1, K2), each (..., 3, 3)
-        rvecs_w2c_pair: Tuple of (rvec1, rvec2), each (..., 3)
-        tvecs_w2c_pair: Tuple of (tvec1, tvec2), each (..., 3)
+        T_w2c_pair: Tuple of (T1, T2), world-to-camera transforms, each (..., 4, 4)
 
     Returns:
         F: Fundamental matrices (..., 3, 3).
     """
     K1, K2 = K_pair
-    r1, r2 = rvecs_w2c_pair
-    t1, t2 = tvecs_w2c_pair
+    T1, T2 = T_w2c_pair
 
-    R1 = rotation_matrix(r1)  # world to camera 1 rotation
-    R2 = rotation_matrix(r2)  # world to camera 2 rotation
+    R1 = T1[..., :3, :3]
+    R2 = T2[..., :3, :3]
+    t1 = T1[..., :3, 3]
+    t2 = T2[..., :3, 3]
 
-    # The relative transformation from camera 1's coordinate system to camera 2's is
-    # T_c1_c2 = T_w_c2 * inv(T_w_c1)
-
+    # Relative transformation from camera 1 to camera 2
+    # T_c1_c2 = T_w_c2 @ inv(T_w_c1)
     R_c1_c2 = R2 @ xp.swapaxes(R1, -1, -2)
 
     Rt1 = xp.einsum('...ij,...j->...i', R_c1_c2, t1)
@@ -410,7 +408,7 @@ def fundamental_matrix(
     # Construct skew matrix
     t_skew = skew_symmetric(t_c1_c2)
 
-    # The essential matrix E relates a point x1 in cam 1 to a point x2 in cam 2 via: x2^T * E * x1 = 0
+    # Essential matrix: x2^T * E * x1 = 0
     E_mat = t_skew @ R_c1_c2
 
     invK2_T = xp.swapaxes(invert_intrinsics(K2), -1, -2)
@@ -422,7 +420,6 @@ def fundamental_matrix(
     mask = xp.array([1.0, 1.0, 0.0], dtype=S.dtype)
     S_new = S * mask
 
-    # Recompose U @ diag(S) @ Vt
     F_corrected = (U * S_new[..., None, :]) @ Vt
 
     norm = xp.linalg.norm(F_corrected, axis=(-1, -2), keepdims=True)
