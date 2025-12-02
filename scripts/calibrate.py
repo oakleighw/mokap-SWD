@@ -9,6 +9,7 @@ import toml
 
 from mokap.calibration.monocular import MonocularCalibrationTool
 from mokap.calibration.multiview import MultiviewCalibrationTool
+from mokap.geometry import decompose_transform_matrix
 from mokap.utils import fileio
 from mokap.utils.datatypes import CharucoBoard, DetectionPayload
 
@@ -342,14 +343,22 @@ def run_extrinsics(folder: Path,
 
     # Finish
     K_opt, D_opt = mv_tool.refined_intrinsics
-    r_opt, t_opt = mv_tool.refined_extrinsics
+    T_opt = mv_tool.refined_extrinsics
+
+    # TODO: New io classes will save the matrix directly
+    r_opt, t_opt = decompose_transform_matrix(T_opt)
+
+    r_opt_np = np.asarray(r_opt)
+    t_opt_np = np.asarray(t_opt)
+    K_opt_np = np.asarray(K_opt)
+    D_opt_np = np.asarray(D_opt)
 
     print("\nCalibration Refinement Complete.")
 
     if confirm_save("Save Extrinsics (and refined Intrinsics) to disk?"):
         for i, name in enumerate(cam_names):
-            fileio.write_intrinsics(work_dir, name, np.asarray(K_opt)[i], np.asarray(D_opt)[i])
-            fileio.write_extrinsics(work_dir, name, np.asarray(r_opt)[i], np.asarray(t_opt)[i])
+            fileio.write_intrinsics(work_dir, name, K_opt_np[i], D_opt_np[i])
+            fileio.write_extrinsics(work_dir, name, r_opt_np[i], t_opt_np[i])
 
         # Save Volume of Trust
         vol = mv_tool.volume_of_trust()
