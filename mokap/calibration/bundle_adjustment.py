@@ -4,6 +4,7 @@ from scipy.sparse import lil_matrix, csr_matrix
 from typing import Tuple, Dict, Optional
 
 from mokap.geometry.backend import USE_JAX
+
 if not USE_JAX:
     print('[WARNING] Mokap math backend set to NumPy. Enabling JAX for the Bundle Adjustment module only.')
 
@@ -15,7 +16,13 @@ from functools import partial
 from mokap.utils.datatypes import DistortionModel
 # from alive_progress import alive_bar
 
-from mokap.geometry import project_to_cameras_multi, project_object_to_cameras, compose_transform_matrix, invert_transform
+from mokap.geometry import (
+    project_to_cameras_multi,
+    project_object_to_cameras,
+    compose_transform_matrix,
+    decompose_transform_matrix,
+    invert_transform
+)
 
 DIST_MODEL_MAP = {'none': 0, 'simple': 4, 'standard': 5, 'full': 8, 'rational': 8}
 
@@ -599,10 +606,11 @@ def cost_function(
 ) -> jnp.ndarray:
     """Cost function calculating reprojection and prior residuals."""
 
+    # Unpack parameters (rvecs and tvecs are the best form for optimisation efficiency)
     Ks, Ds, cam_r, cam_t, object_points, poses_r, poses_t = _unpack_params(params, fixed_params, spec)
     all_residuals = []
 
-    # Build camera transforms: cam_r/t are camera-to-world, we need world-to-camera
+    # Build camera transforms: cam_r/t are camera-to-world (pose), we need world-to-camera (extrinsics)
     T_c2w = compose_transform_matrix(cam_r, cam_t)
     T_w2c = invert_transform(T_c2w)
 
@@ -615,7 +623,9 @@ def cost_function(
     if is_rigid_object:
         # Workflow: Rigid object (calibration board)
         # Projects a single set of N points for each of the P poses
+        # Compose object poses (object-to-world)
         T_o2w = compose_transform_matrix(poses_r, poses_t)
+
         reproj, valid_depth = project_object_to_cameras(
             object_points, T_w2c, T_o2w, Ks, Ds, distortion_model
         )
@@ -632,7 +642,7 @@ def cost_function(
     weighted_resid = resid * effective_weights[..., None]
     all_residuals.append(weighted_resid.ravel())
 
-    # RMS Error
+    # RMS Error for debug printing
     total_nb_points = jnp.sum(effective_weights > 0)  # Number of visible observations
     # total_sum_sq_err = jnp.sum(jnp.square(weighted_resid))  # Sum of all (x, y) squared errors
     # rms_error = jnp.sqrt(total_sum_sq_err / jnp.maximum(1, 2 * total_nb_points))
@@ -645,7 +655,7 @@ def cost_function(
 
     # Prior residuals
 
-    # Cameras extrinsics priors
+    # Cameras extrinsics priors (on the underlying rvecs/tvecs)
     if prior_weight_r > 0.0 or prior_weight_t > 0.0:
         origin_idx = spec['config']['origin_idx']
 
@@ -727,13 +737,9 @@ def _validate_inputs(**kwargs):
         raise ValueError(
             f"Shape mismatch: camera_matrices_initial should be ({C}, 3, 3), but got {camera_matrices_initial.shape}.")
 
-    if cam_rvecs_initial.shape != (C, 3):
+    if cam_poses_initial.shape != (C, 4, 4):
         raise ValueError(
-            f"Shape mismatch: cam_rvecs_initial should be ({C}, 3) to match the number of cameras, but got {cam_rvecs_initial.shape}.")
-
-    if cam_tvecs_initial.shape != (C, 3):
-        raise ValueError(
-            f"Shape mismatch: cam_tvecs_initial should be ({C}, 3) to match the number of cameras, but got {cam_tvecs_initial.shape}.")
+            f"Shape mismatch: cam_poses_initial should be ({C}, 4, 4) T matrices, but got {cam_poses_initial.shape}.")
 
     if distortion_coeffs_initial.ndim != 2 or distortion_coeffs_initial.shape[0] != C:
         raise ValueError(
@@ -748,11 +754,12 @@ def _validate_inputs(**kwargs):
 
     if not fix_poses:
         # Workflow: Rigid object (calibration board)
-        if poses_rvecs_initial is None or poses_tvecs_initial is None:
-            raise ValueError("For rigid object optimization (fix_poses=False), initial poses must be provided.")
-        if poses_rvecs_initial.shape != (P, 3) or poses_tvecs_initial.shape != (P, 3):
+        if object_poses_initial is None:
             raise ValueError(
-                f"Shape mismatch: initial poses must be ({P}, 3), but got {poses_rvecs_initial.shape} and {poses_tvecs_initial.shape}.")
+                "For rigid object optimization (fix_poses=False), object_poses_initial (matrices) must be provided.")
+        if object_poses_initial.shape != (P, 4, 4):
+            raise ValueError(
+                f"Shape mismatch: object_poses_initial must be ({P}, 4, 4), but got {object_poses_initial.shape}.")
         if object_points_initial is None:
             raise ValueError("For rigid object optimization, object_points_initial must be provided.")
         if object_points_initial.ndim != 2 or object_points_initial.shape[0] != N or object_points_initial.shape[
@@ -780,14 +787,12 @@ def _validate_inputs(**kwargs):
 def run_bundle_adjustment(
         camera_matrices_initial:    jnp.ndarray,
         distortion_coeffs_initial:  jnp.ndarray,
-        cam_rvecs_initial:          jnp.ndarray,
-        cam_tvecs_initial:          jnp.ndarray,
+        cam_poses_initial:          jnp.ndarray,
         images_sizes_wh:            ArrayLike,
         image_points:               jnp.ndarray,
         visibility_mask:            jnp.ndarray,
         object_points_initial:      Optional[jnp.ndarray] = None,
-        poses_rvecs_initial:        Optional[jnp.ndarray] = None,
-        poses_tvecs_initial:        Optional[jnp.ndarray] = None,
+        object_poses_initial:       Optional[jnp.ndarray] = None,
         fix_cameras_intrinsics:     bool = False,
         fix_cameras_extrinsics:     bool = False,
         fix_object_points:          bool = False,
@@ -802,8 +807,33 @@ def run_bundle_adjustment(
         tolerance:                  float = 1e-8,
         max_nfev:                   int = 500
 ) -> Tuple[bool, Dict]:
+    """
+    Runs Bundle Adjustment optimisation.
 
+    Args:
+        camera_matrices_initial: (C, 3, 3)
+        distortion_coeffs_initial: (C, k)
+        cam_poses_initial: Camera-to-World transforms (C, 4, 4)
+        images_sizes_wh: (C, 2)
+        image_points: Observations (C, P, N, 2)
+        visibility_mask: (C, P, N)
+        object_points_initial: 3D points
+        object_poses_initial: Object-to-World transforms (P, 4, 4) [Only used if fix_poses=False]
+
+    Returns:
+        success: bool
+        ret_vals: Dict containing optimized 'cam_poses_opt', 'object_poses_opt', etc.
+    """
+
+    # Validate inputs
     # _validate_inputs(**locals())
+
+    # Optimising the vectors is better than the matrices
+    cam_rvecs_initial, cam_tvecs_initial = decompose_transform_matrix(cam_poses_initial)
+
+    poses_rvecs_initial, poses_tvecs_initial = None, None
+    if object_poses_initial is not None:
+        poses_rvecs_initial, poses_tvecs_initial = decompose_transform_matrix(object_poses_initial)
 
     C, P, N, _ = image_points.shape
     images_sizes_wh = np.atleast_2d(images_sizes_wh)
@@ -931,11 +961,18 @@ def run_bundle_adjustment(
         jnp.asarray(result.x), fixed_params, spec
     )
 
+    # Compose optimised vectors back into T mats
+    cam_poses_opt = compose_transform_matrix(cam_r_opt, cam_t_opt)
+
+    object_poses_opt = None
+    if poses_r_opt is not None and poses_t_opt is not None:
+        object_poses_opt = compose_transform_matrix(poses_r_opt, poses_t_opt)
+
     ret_vals = {
         'K_opt': K_opt, 'D_opt': D_opt,
-        'cam_r_opt': cam_r_opt, 'cam_t_opt': cam_t_opt,
+        'cam_poses_opt': cam_poses_opt,
         'object_points_opt': object_points_opt,
-        'poses_r_opt': poses_r_opt, 'poses_t_opt': poses_t_opt
+        'object_poses_opt': object_poses_opt
     }
 
     return result.success, ret_vals
