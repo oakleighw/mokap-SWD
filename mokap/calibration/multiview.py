@@ -267,7 +267,7 @@ class MultiviewCalibrationTool:
             return
 
         # Reestimate the board-to-camera pose and validate it
-        success, rvec, tvec, pose_errors = solve_pnp_robust(
+        success, T_b2c, pose_errors = solve_pnp_robust(
             points3d=self._object_points[detection.pointsIDs],
             points2d=detection.points2D,
             K=self._K[cam_idx],
@@ -278,12 +278,10 @@ class MultiviewCalibrationTool:
         if not success:
             return
 
-        # From here on rvec and tvec should be sane
+        # From here on T_b2c should be sane
 
         f = detection.frame
         self._last_frame[cam_idx] = f
-
-        T_b2c = compose_transform_matrix(xp.asarray(rvec), xp.asarray(tvec))
         self._detection_buffer[cam_idx][f] = (T_b2c, detection.points2D, detection.pointsIDs)
 
         # The origin camera's extrinsics are fixed at identity, so its flag is always true

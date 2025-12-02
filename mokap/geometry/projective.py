@@ -1,14 +1,8 @@
 from functools import partial
 from typing import Tuple, Union, Optional, Dict
-try:
-    from .backend import xp, jit, lax, _eps, _tiny, align_batch_dims
-    from .transforms import compose_transform_matrix, projection_matrix, decompose_transform_matrix, \
-        invert_intrinsics, homogenize, dehomogenize
-except ImportError:
-    from mokap.geometry.backend import xp, jit, lax, _eps, _tiny, align_batch_dims
-    from mokap.geometry.transforms import (compose_transform_matrix, projection_matrix,
-                                           decompose_transform_matrix, invert_intrinsics, homogenize,
-                                           dehomogenize)
+
+from mokap.geometry.backend import xp, jit, lax, _eps, _tiny, align_batch_dims
+from mokap.geometry import projection_matrix, invert_intrinsics, homogenize, dehomogenize
 
 @jit
 def normalize_pixel_coordinates(

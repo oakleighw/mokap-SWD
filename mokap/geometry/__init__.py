@@ -86,5 +86,6 @@ from .fitting import (
     average_qtposes,
 
     # Others
-    flip_transform_180
+    flip_transform_180,
+    flip_rotation_180
 )

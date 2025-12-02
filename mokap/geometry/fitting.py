@@ -564,6 +564,32 @@ def compute_bounds(
 
 
 @jit
+def flip_rotation_180(
+        R: xp.ndarray
+) -> xp.ndarray:
+    """
+    Generates the ambiguous "flipped" rotation matrix for a planar object.
+    This corresponds to a 180-degree rotation of the object around its own X-axis.
+
+    Args:
+        R: Original rotation matrix (..., 3, 3)
+
+    Returns:
+        R_alt: Flipped rotation matrix (..., 3, 3)
+
+    """
+
+    #                 [1, 0, 0]
+    # Flip matrix is  [0,-1, 0]
+    #                 [0, 0,-1]
+    diag = xp.array([1.0, -1.0, -1.0], dtype=R.dtype)
+    R_flip = xp.diag(diag)  # (3, 3)
+
+    # R_alt = R @ R_flip
+    return xp.matmul(R, R_flip)
+
+
+@jit
 def flip_transform_180(
         T_o2c: xp.ndarray
 ) -> xp.ndarray:
@@ -580,14 +606,7 @@ def flip_transform_180(
     R = T_o2c[..., :3, :3]
     t = T_o2c[..., :3, 3]
 
-    #                 [1, 0, 0]
-    # Flip matrix is  [0,-1, 0]
-    #                 [0, 0,-1]
-    diag = xp.array([1.0, -1.0, -1.0], dtype=T_o2c.dtype)
-    R_flip = xp.diag(diag)  # (3, 3)
-
-    # R_alt = R @ R_flip
-    R_alt = xp.matmul(R, R_flip)
+    R_alt = flip_rotation_180(R)
 
     # Build output matrix
     batch_shape = T_o2c.shape[:-2]

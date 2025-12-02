@@ -1,30 +1,57 @@
 import numpy as np
+import importlib
 from scipy.optimize import least_squares
 from scipy.sparse import lil_matrix, csr_matrix
 from typing import Tuple, Dict, Optional
+from functools import partial
 
-from mokap.geometry.backend import USE_JAX
+import mokap.geometry.backend as geom_backend
+import mokap.geometry.transforms as geom_transforms
+import mokap.geometry.projective as geom_projective
 
-if not USE_JAX:
-    print('[WARNING] Mokap math backend set to NumPy. Enabling JAX for the Bundle Adjustment module only.')
+GLOBAL_USE_JAX = geom_backend.USE_JAX
+
+if not GLOBAL_USE_JAX:
+    print('[INFO] Mokap math backend is NumPy. Bundle Adjustment will context-switch to JAX during optimization.')
+
+xp = geom_backend.xp
 
 import jax
 import jax.numpy as jnp
 from jax.typing import ArrayLike
-
-from functools import partial
 from mokap.utils.datatypes import DistortionModel
-# from alive_progress import alive_bar
-
-from mokap.geometry import (
-    project_object_to_cameras,
-    project_to_cameras_multi,
-    compose_transform_matrix,
-    decompose_transform_matrix,
-    invert_transform
-)
 
 DIST_MODEL_MAP = {'none': 0, 'simple': 4, 'standard': 5, 'full': 8, 'rational': 8}
+
+
+class JaxGeometryContext:
+    """
+    A Context Manager that forces the mokap.geometry modules to reload
+    using JAX configuration, and restores the original configuration upon exit.
+    """
+
+    def __init__(self):
+        self.original_use_jax = geom_backend.USE_JAX
+
+    def __enter__(self):
+        # Force backend to JAX
+        if not self.original_use_jax:
+            geom_backend.USE_JAX = True
+            importlib.reload(geom_backend)
+
+            # Reload dependent modules so they pick up 'xp = jax.numpy'
+            importlib.reload(geom_transforms)
+            importlib.reload(geom_projective)
+
+    def __exit__(self, exc_type, exc_val, exc_tb):
+        # Restore original backend state
+        if not self.original_use_jax:
+            geom_backend.USE_JAX = False
+            importlib.reload(geom_backend)
+
+            # Reload dependents so they pick up 'xp = numpy' again
+            importlib.reload(geom_transforms)
+            importlib.reload(geom_projective)
 
 
 def _get_parameter_spec(
@@ -345,6 +372,7 @@ def _unpack_params(
     # Cameras intrinsics
     K_out = fixed_params.get('K', jnp.zeros((C, 3, 3), dtype=x.dtype))
     D_out = fixed_params.get('D', jnp.zeros((C, 8), dtype=x.dtype))
+
     if not cfg['fix_cameras_intrinsics']:
         info_mat = spec['blocks']['cam_mat']
         fp_flat = x[info_mat['offset']: info_mat['offset'] + info_mat['size']]
@@ -438,12 +466,12 @@ def residual_weights(
         - Reprojection error (optional)
     """
 
-    C, P, N, _ = points2d.shape
-
     # Distance to center
     cx = camera_matrices[:, 0, 2][:, None, None]  # (C, 1, 1)
     cy = camera_matrices[:, 1, 2][:, None, None]
+
     center = jnp.stack([cx, cy], axis=-1)
+
     dists = jnp.linalg.norm(points2d - center, axis=-1)
     max_dist = jnp.sqrt(cx[:, 0, 0] ** 2 + cy[:, 0, 0] ** 2)[:, None, None] + 1e-8
     dist_weight = 1.0 / (1.0 + (dists / max_dist) ** distance_falloff_gamma)
@@ -561,16 +589,12 @@ def make_jacobian_sparsity(
         info = spec['blocks']['extrinsics']
         nb_optim_cams = C - 1
 
-        # Priors are applied to the flattened block of rvecs then tvecs
-        r_cols = info['offset']
-        t_cols = info['offset'] + 3 * nb_optim_cams
-
-        # Add identity blocks for rotation and translation priors
-        S[curr_prior_row:curr_prior_row + 3 * nb_optim_cams, r_cols:r_cols + 3 * nb_optim_cams] = np.eye(
-            3 * nb_optim_cams, dtype=bool)
+        S[curr_prior_row:curr_prior_row + 3 * nb_optim_cams, info['offset']:info['offset'] + 3 * nb_optim_cams] = True
         curr_prior_row += 3 * nb_optim_cams
-        S[curr_prior_row:curr_prior_row + 3 * nb_optim_cams, t_cols:t_cols + 3 * nb_optim_cams] = np.eye(
-            3 * nb_optim_cams, dtype=bool)
+
+        t_off = info['offset'] + 3 * nb_optim_cams
+
+        S[curr_prior_row:curr_prior_row + 3 * nb_optim_cams, t_off:t_off + 3 * nb_optim_cams] = True
         curr_prior_row += 3 * nb_optim_cams
 
     # Cameras intrinsics priors
@@ -578,15 +602,12 @@ def make_jacobian_sparsity(
 
         if 'cam_mat' in spec['blocks']:
             info = spec['blocks']['cam_mat']
-            S[curr_prior_row:curr_prior_row + info['size'], info['offset']:info['offset'] + info[
-                'size']] = np.eye(info['size'], dtype=bool)
+            S[curr_prior_row:curr_prior_row + info['size'], info['offset']:info['offset'] + info['size']] = True
             curr_prior_row += info['size']
 
         if 'distortion' in spec['blocks']:
             info = spec['blocks']['distortion']
-            S[curr_prior_row:curr_prior_row + info['size'], info['offset']:info['offset'] + info[
-                'size']] = np.eye(info['size'], dtype=bool)
-            curr_prior_row += info['size']
+            S[curr_prior_row:curr_prior_row + info['size'], info['offset']:info['offset'] + info['size']] = True
 
     return S.tocsr()
 
@@ -610,9 +631,9 @@ def cost_function(
     Ks, Ds, cam_r, cam_t, object_points, poses_r, poses_t = _unpack_params(params, fixed_params, spec)
     all_residuals = []
 
-    # Build camera transforms: cam_r/t are camera-to-world (pose), we need world-to-camera (extrinsics)
-    T_c2w = compose_transform_matrix(cam_r, cam_t)
-    T_w2c = invert_transform(T_c2w)
+    # These calls use JAX because the context manager reloaded the modules
+    T_c2w = geom_transforms.compose_transform_matrix(cam_r, cam_t)
+    T_w2c = geom_transforms.invert_transform(T_c2w)
 
     cfg = spec['config']
     C, P, N = cfg['nb_cams'], cfg['nb_frames'], cfg['nb_points']
@@ -624,10 +645,10 @@ def cost_function(
         # Workflow: Rigid object (calibration board)
 
         # Compose object poses (object-to-world): (P, 4, 4)
-        T_o2w = compose_transform_matrix(poses_r, poses_t)
+        T_o2w = geom_transforms.compose_transform_matrix(poses_r, poses_t)
 
         # This wrapper for project does C x P broadcasting
-        reproj, valid_depth = project_object_to_cameras(
+        reproj, valid_depth = geom_projective.project_object_to_cameras(
             object_points, T_w2c, T_o2w, Ks, Ds, distortion_model
         )
 
@@ -636,7 +657,7 @@ def cost_function(
 
         object_points_per_frame = object_points.reshape(P, N, 3)
 
-        reproj, valid_depth = project_to_cameras_multi(
+        reproj, valid_depth = geom_projective.project_to_cameras_multi(
             object_points_per_frame, T_w2c, Ks, Ds, distortion_model
         )
 
@@ -657,9 +678,7 @@ def cost_function(
     rms_error_px = jnp.sqrt(unweighted_sq_err / jnp.maximum(1, 2 * total_nb_points))
     jax.debug.print("Mean Reprojection Error (RMS): {x:.3f}px", x=rms_error_px)
 
-    # Prior residuals
-
-    # Cameras extrinsics priors (on the underlying rvecs/tvecs)
+    # Priors
     if prior_weight_r > 0.0 or prior_weight_t > 0.0:
         origin_idx = spec['config']['origin_idx']
 
@@ -675,7 +694,7 @@ def cost_function(
     # Cameras intrinsics priors
     if not cfg['fix_cameras_intrinsics']:
         is_shared = cfg['shared_intrinsics'] and cfg['nb_cams'] > 1
-        if cfg['shared_intrinsics'] and cfg['nb_cams'] > 1:
+        if is_shared:
             # When shared, we optimized a single set - compare to mean of initial values
             K_init = jnp.mean(fixed_params['K_init'], axis=0, keepdims=True)  # (1, 3, 3)
             D_init = jnp.mean(fixed_params['D_init'], axis=0, keepdims=True)  # (1, n_d)
@@ -813,171 +832,169 @@ def run_bundle_adjustment(
         max_nfev:                   int = 500
 ) -> Tuple[bool, Dict]:
     """
-    Runs Bundle Adjustment optimisation.
+        Runs Bundle Adjustment optimisation.
 
-    Args:
-        camera_matrices_initial: (C, 3, 3)
-        distortion_coeffs_initial: (C, k)
-        cam_poses_initial: Camera-to-World transforms (C, 4, 4)
-        images_sizes_wh: (C, 2)
-        image_points: Observations (C, P, N, 2)
-        visibility_mask: (C, P, N)
-        object_points_initial: 3D points
-        object_poses_initial: Object-to-World transforms (P, 4, 4) [Only used if fix_poses=False]
+        Args:
+            camera_matrices_initial: (C, 3, 3)
+            distortion_coeffs_initial: (C, k)
+            cam_poses_initial: Camera-to-world transforms (C, 4, 4)
+            images_sizes_wh: (C, 2)
+            image_points: Observations (C, P, N, 2)
+            visibility_mask: (C, P, N)
+            object_points_initial: 3D points
+            object_poses_initial: Object-to-world transforms (P, 4, 4). Only used if fix_poses=False.
 
-    Returns:
-        success: bool
-        ret_vals: Dict containing optimized 'cam_poses_opt', 'object_poses_opt', etc.
-    """
+        Returns:
+            success: bool
+            ret_vals: Dict containing optimized 'cam_poses_opt', 'object_poses_opt', etc.
+        """
 
-    # Validate inputs
     # _validate_inputs(**locals())
 
-    # Optimising the vectors is better than the matrices
-    cam_rvecs_initial, cam_tvecs_initial = decompose_transform_matrix(cam_poses_initial)
+    with JaxGeometryContext():
 
-    poses_rvecs_initial, poses_tvecs_initial = None, None
-    if object_poses_initial is not None:
-        poses_rvecs_initial, poses_tvecs_initial = decompose_transform_matrix(object_poses_initial)
+        cam_rvecs_initial, cam_tvecs_initial = geom_transforms.decompose_transform_matrix(cam_poses_initial)
 
-    C, P, N, _ = image_points.shape
-    images_sizes_wh = np.atleast_2d(images_sizes_wh)
+        poses_rvecs_initial, poses_tvecs_initial = None, None
+        if object_poses_initial is not None:
+            poses_rvecs_initial, poses_tvecs_initial = geom_transforms.decompose_transform_matrix(object_poses_initial)
 
-    nb_points_to_optim = 0
-    if not fix_object_points and object_points_initial is not None:
-        nb_points_to_optim = object_points_initial.shape[0]
+        C, P, N, _ = image_points.shape
+        images_sizes_wh = np.atleast_2d(images_sizes_wh)
+        nb_points_to_optim = 0
+        if not fix_object_points and object_points_initial is not None:
+            nb_points_to_optim = object_points_initial.shape[0]
 
-    spec = _get_parameter_spec(
-        nb_cams=C,
-        nb_frames=P,
-        nb_points=N,  # N is the number of points *per frame*
-        nb_points_to_optim=nb_points_to_optim,  # This is the total number of 3D variables
-        origin_idx=origin_idx,
-        fix_cameras_intrinsics=fix_cameras_intrinsics,
-        fix_cameras_extrinsics=fix_cameras_extrinsics,
-        fix_object_points=fix_object_points,
-        fix_poses=fix_poses,
-        fix_aspect_ratio=fix_aspect_ratio,
-        time_independent_points=time_independent_points,
-        shared_intrinsics=shared_intrinsics,
-        distortion_model=distortion_model
-    )
+        spec = _get_parameter_spec(
+            nb_cams=C,
+            nb_frames=P,
+            nb_points=N,  # N is the number of points *per frame*
+            nb_points_to_optim=nb_points_to_optim,  # This is the total number of 3D variables
+            origin_idx=origin_idx,
+            fix_cameras_intrinsics=fix_cameras_intrinsics,
+            fix_cameras_extrinsics=fix_cameras_extrinsics,
+            fix_object_points=fix_object_points,
+            fix_poses=fix_poses,
+            fix_aspect_ratio=fix_aspect_ratio,
+            time_independent_points=time_independent_points,
+            shared_intrinsics=shared_intrinsics,
+            distortion_model=distortion_model
+        )
 
-    # Unpack priors dictionary
-    # TODO: maybe a dual API with simple and advanced control for the priors would be cool?
+        # Unpack priors dictionary
+        # TODO: maybe a dual API with simple and advanced control for the priors would be cool?
 
-    priors = priors if priors is not None else {}
-    intr_priors = priors.get('intrinsics', {})
-    extr_priors = priors.get('extrinsics', {})
+        priors = priors if priors is not None else {}
+        intr_priors = priors.get('intrinsics', {})
+        extr_priors = priors.get('extrinsics', {})
 
-    prior_weight_f = float(intr_priors.get('focal_length', 0.0))
-    prior_weight_c = float(intr_priors.get('principal_point', 0.0))
-    prior_weight_d = float(intr_priors.get('distortion', 0.0))
-    prior_weight_r = float(extr_priors.get('rotation', 0.0))
-    prior_weight_t = float(extr_priors.get('translation', 0.0))
+        prior_weight_f = float(intr_priors.get('focal_length', 0.0))
+        prior_weight_c = float(intr_priors.get('principal_point', 0.0))
+        prior_weight_d = float(intr_priors.get('distortion', 0.0))
+        prior_weight_r = float(extr_priors.get('rotation', 0.0))
+        prior_weight_t = float(extr_priors.get('translation', 0.0))
 
-    use_extrinsics_prior = prior_weight_r > 0.0 or prior_weight_t > 0.0
-    use_intrinsics_prior = prior_weight_f > 0.0 or prior_weight_c > 0.0 or prior_weight_d > 0.0
+        use_extrinsics_prior = prior_weight_r > 0.0 or prior_weight_t > 0.0
+        use_intrinsics_prior = prior_weight_f > 0.0 or prior_weight_c > 0.0 or prior_weight_d > 0.0
 
-    # Prepare and pad distortion coefficients if necessary
-    if not fix_cameras_intrinsics:
-        n_d = spec['config']['n_d']
-        current_d = distortion_coeffs_initial.shape[1]
-        if current_d < n_d:
-            padding = ((0, 0), (0, n_d - current_d))
-            distortion_coeffs_initial = jnp.pad(distortion_coeffs_initial, padding, mode='constant')
+        # Prepare and pad distortion coefficients if necessary
+        if not fix_cameras_intrinsics:
+            n_d = spec['config']['n_d']
+            current_d = distortion_coeffs_initial.shape[1]
+            if current_d < n_d:
+                padding = ((0, 0), (0, n_d - current_d))
+                distortion_coeffs_initial = jnp.pad(distortion_coeffs_initial, padding, mode='constant')
 
-    x0, fixed_params = _pack_params(
-        camera_matrices_initial, distortion_coeffs_initial,
-        cam_rvecs_initial, cam_tvecs_initial,
-        object_points_initial, poses_rvecs_initial, poses_tvecs_initial,
-        spec
-    )
+        x0, fixed_params = _pack_params(
+            camera_matrices_initial, distortion_coeffs_initial,
+            cam_rvecs_initial, cam_tvecs_initial,
+            object_points_initial, poses_rvecs_initial, poses_tvecs_initial,
+            spec
+        )
 
-    # Bounds and scaling
-    lb, ub = _get_bounds(spec, images_sizes_wh)
-    x0 = np.clip(x0, lb, ub)
+        # Bounds and scaling
+        lb, ub = _get_bounds(spec, images_sizes_wh)
+        x0 = np.clip(x0, lb, ub)
 
-    # Generate per-parameter scales for the optimizer
-    initial_params_for_scaling = {
-        'cam_tvecs': cam_tvecs_initial,
-        'poses_tvecs': poses_tvecs_initial,
-        'object_points': object_points_initial
-    }
-    x_scales_np = _get_parameter_scales(spec, initial_params_for_scaling, images_sizes_wh)
+        # Generate per-parameter scales for the optimizer
+        initial_params_for_scaling = {
+            'cam_tvecs': cam_tvecs_initial,
+            'poses_tvecs': poses_tvecs_initial,
+            'object_points': object_points_initial
+        }
+        x_scales_np = _get_parameter_scales(spec, initial_params_for_scaling, images_sizes_wh)
 
-    # Setup weights for residual function
-    weights = residual_weights(
-        points2d=image_points,
-        visibility_mask=visibility_mask,
-        camera_matrices=camera_matrices_initial,
-        distance_falloff_gamma=radial_penalty
-    )
+        # Setup weights for residual function
+        weights = residual_weights(
+            points2d=image_points,
+            visibility_mask=visibility_mask,
+            camera_matrices=camera_matrices_initial,
+            distance_falloff_gamma=radial_penalty
+        )
 
-    # Create the partial function, baking in all static data
-    residuals_fn_partial = partial(
-        cost_function,
-        fixed_params=fixed_params,
-        spec=spec,
-        image_points=image_points,
-        weights=weights,
-        distortion_model=distortion_model,
-        prior_weight_r=prior_weight_r,
-        prior_weight_t=prior_weight_t,
-        prior_weight_f=prior_weight_f,
-        prior_weight_c=prior_weight_c,
-        prior_weight_d=prior_weight_d
-    )
+        # Create the partial function, baking in all static data
+        residuals_fn_partial = partial(
+            cost_function,
+            fixed_params=fixed_params, spec=spec, image_points=image_points,
+            weights=weights, distortion_model=distortion_model,
+            prior_weight_r=prior_weight_r, prior_weight_t=prior_weight_t,
+            prior_weight_f=prior_weight_f, prior_weight_c=prior_weight_c,
+            prior_weight_d=prior_weight_d
+        )
 
-    jitted_cost_func = jax.jit(residuals_fn_partial)
-    jitted_jac_func = jax.jit(jax.jacfwd(residuals_fn_partial))
+        # JIT compile the cost function *inside* the context
+        jitted_cost_func = jax.jit(residuals_fn_partial)
+        jitted_jac_func = jax.jit(jax.jacfwd(residuals_fn_partial))
 
-    # Prepare for scipy, create wrappers
-    def scipy_cost_wrapper(p):
-        return np.asarray(jitted_cost_func(jnp.asarray(p))).copy()
+        # Wrappers to get back to numpy, needed for scipy
+        def scipy_cost_wrapper(p):
+            return np.asarray(jitted_cost_func(jnp.asarray(p))).copy()
 
-    def scipy_jac_wrapper(p):
-        return np.asarray(jitted_jac_func(jnp.asarray(p))).copy()
+        def scipy_jac_wrapper(p):
+            return np.asarray(jitted_jac_func(jnp.asarray(p))).copy()
 
-    # Pass prior flags to sparsity function
-    jac_sparsity = make_jacobian_sparsity(spec, use_extrinsics_prior, use_intrinsics_prior)
+        # Pass prior flags to sparsity function
+        jac_sparsity = make_jacobian_sparsity(spec, use_extrinsics_prior, use_intrinsics_prior)
 
-    # Call the scipy solver
-    # with alive_bar(title='Bundle adjustment...', length=20, force_tty=True) as bar:
-    #     with CallbackOutputStream(bar, keep_stdout=False):
-    result = least_squares(
-        scipy_cost_wrapper, np.asarray(x0),
-        jac=scipy_jac_wrapper,
-        jac_sparsity=jac_sparsity,
-        bounds=(np.asarray(lb), np.asarray(ub)),
-        x_scale=x_scales_np,
-        method='trf',
-        loss='cauchy',
-        f_scale=2.5,
-        ftol=tolerance,
-        xtol=tolerance,
-        gtol=tolerance,
-        max_nfev=max_nfev,
-        verbose=2
-    )
+        # Call the scipy solver
+        # with alive_bar(title='Bundle adjustment...', length=20, force_tty=True) as bar:
+        #     with CallbackOutputStream(bar, keep_stdout=False):
+        result = least_squares(
+            scipy_cost_wrapper, np.asarray(x0),
+            jac=scipy_jac_wrapper,
+            jac_sparsity=jac_sparsity,
+            bounds=(np.asarray(lb), np.asarray(ub)),
+            x_scale=x_scales_np,
+            method='trf',
+            loss='cauchy',
+            f_scale=2.5,
+            ftol=tolerance,
+            xtol=tolerance,
+            gtol=tolerance,
+            max_nfev=max_nfev,
+            verbose=2
+        )
 
-    # Unpack results
-    K_opt, D_opt, cam_r_opt, cam_t_opt, object_points_opt, poses_r_opt, poses_t_opt = _unpack_params(
-        jnp.asarray(result.x), fixed_params, spec
-    )
+        # Unpack results
+        K_opt, D_opt, cam_r_opt, cam_t_opt, object_points_opt, poses_r_opt, poses_t_opt = _unpack_params(
+            jnp.asarray(result.x), fixed_params, spec
+        )
 
-    # Compose optimised vectors back into T mats
-    cam_poses_opt = compose_transform_matrix(cam_r_opt, cam_t_opt)
+        # Recompose matrices (still using JAX backend here)
+        cam_poses_opt = geom_transforms.compose_transform_matrix(cam_r_opt, cam_t_opt)
 
-    object_poses_opt = None
-    if poses_r_opt is not None and poses_t_opt is not None:
-        object_poses_opt = compose_transform_matrix(poses_r_opt, poses_t_opt)
+        object_poses_opt = None
+        if poses_r_opt is not None and poses_t_opt is not None:
+            object_poses_opt = geom_transforms.compose_transform_matrix(poses_r_opt, poses_t_opt)
 
-    ret_vals = {
-        'K_opt': K_opt, 'D_opt': D_opt,
-        'cam_poses_opt': cam_poses_opt,
-        'object_points_opt': object_points_opt,
-        'object_poses_opt': object_poses_opt
-    }
+        # Convert back to standard backend before returning and exiting context
+        ret_vals = {
+            'K_opt': xp.asarray(K_opt),
+            'D_opt': xp.asarray(D_opt),
+            'cam_poses_opt': xp.array(cam_poses_opt),
+            'object_points_opt': xp.array(object_points_opt) if object_points_opt is not None else None,
+            'object_poses_opt': xp.array(object_poses_opt) if object_poses_opt is not None else None
+        }
 
+    # Context exits here: mokap geometry backend restored
     return result.success, ret_vals
