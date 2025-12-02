@@ -61,7 +61,9 @@ class MultiviewCalibrationTool:
 
         # State for extrinsics (camera-to-world)
         self._has_extrinsics = np.zeros(nb_cameras, dtype=bool)
-        self._T_c2w_all: xp.ndarray = xp.zeros((nb_cameras, 4, 4), dtype=xp.float32)
+
+        identity = xp.eye(4, dtype=xp.float32)
+        self._T_c2w_all = xp.repeat(identity[None, ...], nb_cameras, axis=0)
 
         # State for board pose (world)
         self._latest_board_pose_w: Optional[xp.ndarray] = None
@@ -466,18 +468,18 @@ class MultiviewCalibrationTool:
 
                     fix_cameras_intrinsics=False,
                     fix_cameras_extrinsics=False,
-                    fix_object_points=True,              # The board's shape is known and rigid
-                    fix_poses=False,                # The board's pose is being optimized
+                    fix_object_points=True,  # The board's shape is known and rigid
+                    fix_poses=False,  # The board's pose is being optimized
                     time_independent_points=False,  # It's the same board over time
 
                     # Stage 1 specific flags
-                    shared_intrinsics=True,         # Forces a single camera model for all views
-                    fix_aspect_ratio=True,          # Assume fx = fy
+                    shared_intrinsics=True,  # Forces a single camera model for all views
+                    fix_aspect_ratio=True,  # Assume fx = fy
                     distortion_model='none',
                     priors=priors_stage1,
 
                     origin_idx=self.origin_idx,
-                    radial_penalty=0.0      # for fisrst stage we want to consider all points, even at the edge
+                    radial_penalty=0.0  # for fisrst stage we want to consider all points, even at the edge
                 )
                 if not success_s1:
                     raise RuntimeError("BA Stage 1 failed.")
@@ -517,8 +519,8 @@ class MultiviewCalibrationTool:
                     time_independent_points=False,
 
                     # Stage 2 specific flags
-                    shared_intrinsics=False,    # We now optimize per-camera intrinsics
-                    fix_aspect_ratio=False,     # We relax the aspect ratio constraint
+                    shared_intrinsics=False,  # We now optimize per-camera intrinsics
+                    fix_aspect_ratio=False,  # We relax the aspect ratio constraint
                     distortion_model='simple',  # And start optimising distortion
 
                     priors=priors_stage2,
@@ -564,11 +566,11 @@ class MultiviewCalibrationTool:
                     # Stage 3 specific flags
                     shared_intrinsics=False,
                     fix_aspect_ratio=False,
-                    distortion_model='full',    # Full distortion model
+                    distortion_model='full',  # Full distortion model
 
-                    priors=priors_stage3,       # Priors are mega important at this stage
+                    priors=priors_stage3,  # Priors are mega important at this stage
 
-                    radial_penalty=4.0   # now we kinda want to ignore the points far from the working volume
+                    radial_penalty=4.0  # now we kinda want to ignore the points far from the working volume
                 )
                 if not success_s3:
                     raise RuntimeError("BA Stage 3 failed.")

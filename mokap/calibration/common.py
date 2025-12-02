@@ -154,11 +154,14 @@ def solve_pnp_robust(
     reproj, _ = project(points3d_xp, T, K_xp, D_xp)
     reproj_flip, _ = project(points3d_xp, T_flip, K_xp, D_xp)
 
-    err_1 = reprojection_errors(points2d_xp, reproj)['rms']
-    err_2 = reprojection_errors(points2d_xp, reproj_flip)['rms']
+    reproj_err = reprojection_errors(points2d_xp, reproj)
+    reproj_err_flip = reprojection_errors(points2d_xp, reproj_flip)
 
-    if err_2 < err_1:
-        best_rvec = np.asarray(rvec_flip_xp).reshape(3, 1)
+    if reproj_err['rms'] <= reproj_err_flip['rms']:
+        best_error = reproj_err
+    else:
+        best_rvec = np.asarray(rvec_flip_xp)
+        best_error = reproj_err_flip
 
     if refine_method and refine_method.lower() != 'none':
         try:
@@ -173,6 +176,8 @@ def solve_pnp_robust(
                 rvec=best_rvec,
                 tvec=best_tvec
             )
+            # After refinement, the already-calculated error is invalid and must be recalculated
+            best_error = None
         except (cv2.error, AttributeError, KeyError):
             pass
 
@@ -181,11 +186,20 @@ def solve_pnp_robust(
     t_final_xp = xp.asarray(best_tvec).squeeze()
     T_final = compose_transform_matrix(r_final_xp, t_final_xp)
 
-    # Calculate final error
-    final_reproj, _ = project(points3d_xp, T_final, K_xp, D_xp)
-    final_error = reprojection_errors(points2d_xp, final_reproj)
+    if best_error is None:
+        if points2d_xp is None or points3d_xp is None or K is None or D is None:
+            # TODO: is this possible here?
+            points2d_xp = xp.asarray(points2d)
+            points3d_xp = xp.asarray(points3d)
+            K_xp = xp.asarray(K)
+            D_xp = xp.asarray(D)
+        final_reproj, _ = project(points3d_xp, T_final, K_xp, D_xp)
+        final_errors = reprojection_errors(points2d_xp, final_reproj)
+    else:
+        # otherwise, the one we stored is the correct one
+        final_errors = best_error
 
-    return True, T_final, final_error
+    return True, T_final, final_errors
 
 
 def calibrate_camera_robust(

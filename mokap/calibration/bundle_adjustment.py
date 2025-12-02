@@ -500,7 +500,7 @@ def make_jacobian_sparsity(
         use_intrinsics_prior: bool
 ) -> csr_matrix:
     """
-    Creates the Jacobian sparsity matrix based on the optimization parameter specification
+    Creates the Jacobian sparsity matrix based on the optimization parameter specification.
     """
 
     cfg = spec['config']
@@ -517,10 +517,10 @@ def make_jacobian_sparsity(
     cam_idx_to_optim_pos = {cam_idx: pos for pos, cam_idx in enumerate(optim_cam_indices)}
 
     # Reprojection error dependencies
-    for p in range(P):
-        for c in range(C):
+    for c in range(C):
+        for p in range(P):
             for n in range(N):
-                row = 2 * (p * C * N + c * N + n)
+                row = 2 * (c * P * N + p * N + n)
                 intr_set_idx = 0 if is_shared else c
 
                 # Dependency on camera intrinsics
