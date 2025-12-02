@@ -1,4 +1,4 @@
-USE_JAX = True
+USE_JAX = False
 
 
 if USE_JAX:

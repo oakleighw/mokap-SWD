@@ -37,21 +37,26 @@ class JaxGeometryContext:
         # Force backend to JAX
         if not self.original_use_jax:
             geom_backend.USE_JAX = True
-            importlib.reload(geom_backend)
+            geom_backend.xp = jax.numpy
+            geom_backend.jit = jax.jit
+            geom_backend.vmap = jax.vmap
+            geom_backend._eps = 1e-4
+            geom_backend._tiny = 1e-12
 
-            # Reload dependent modules so they pick up 'xp = jax.numpy'
+            def set_at(arr, indices, values, inplace=True):
+                return arr.at[indices].set(values)
+            geom_backend.set_at = set_at
+
             importlib.reload(geom_transforms)
             importlib.reload(geom_projective)
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         # Restore original backend state
         if not self.original_use_jax:
-            geom_backend.USE_JAX = False
             importlib.reload(geom_backend)
-
-            # Reload dependents so they pick up 'xp = numpy' again
             importlib.reload(geom_transforms)
             importlib.reload(geom_projective)
+
 
 
 def _get_parameter_spec(
