@@ -8,7 +8,8 @@ from mokap.geometry.backend import xp
 import matplotlib.pyplot as plt
 
 from mokap.utils.visualisation import plot_cameras_3d, plot_triangulation_scene
-from mokap.geometry import triangulate, compose_transform_matrix, invert_transform
+from mokap.geometry import (triangulate, compose_transform_matrix, invert_transform,
+                            project_to_cameras, reprojection_errors)
 
 
 def load_calibration_data(folder: Path):
@@ -90,7 +91,7 @@ if __name__ == "__main__":
         plt.title(f"Calibration Setup: {folder.name}")
         plt.show()
 
-    # Triangulation Visualisation
+    # Triangulation visualisation
     print("Debug points found. Calculating scene...")
 
     # Load arrays
@@ -99,7 +100,6 @@ if __name__ == "__main__":
 
     if frame_idx is None:
         # Find the frame with the most detections across all cameras
-        # Sum visibility over Cameras (axis 0) and Points (axis 2) -> Result (Frames,)
         detections_per_frame = np.sum(visibility_masks_stacked, axis=(0, 2))
         frame_idx = np.argmax(detections_per_frame)
         count = detections_per_frame[frame_idx]
@@ -109,7 +109,7 @@ if __name__ == "__main__":
     points2d_frame = points2d_stacked[:, frame_idx, :, :]
     vis_mask_frame = visibility_masks_stacked[:, frame_idx, :]
 
-    # Mask out invalid points with NaN for clean plotting
+    # Mask out invalid points with NaN to clean the plot
     points2d_frame[~vis_mask_frame] = np.nan
 
     # Triangulate
@@ -119,8 +119,49 @@ if __name__ == "__main__":
         points2d_frame,
         T_w2c,
         K, D,
-        weights=vis_mask_frame
+        weights=vis_mask_frame,
+        distortion_model='standard'
     )
+
+    reproj_points, _ = project_to_cameras(
+        points3d, T_w2c, K, D, distortion_model='standard'
+    )
+
+    err_metrics = reprojection_errors(
+        points2d_observed=points2d_frame,
+        points2d_reprojected=reproj_points,
+        visibility_mask=vis_mask_frame,
+        per_point_errors=True
+    )
+
+    # (C, N) array of Euclidean distances
+    per_point_dists = err_metrics['mre_per_point']
+
+    # Per-camera stats
+    camera_stats = {}
+    print("\nReprojection errors (Frame {})".format(frame_idx))
+    for i, name in enumerate(cam_names):
+        cam_errs = per_point_dists[i, :]
+        valid_errs = cam_errs[~np.isnan(cam_errs)]
+
+        if len(valid_errs) > 0:
+            mean_e = np.mean(valid_errs)
+            max_e = np.max(valid_errs)
+        else:
+            mean_e, max_e = np.nan, np.nan
+
+        camera_stats[name] = {'mean': mean_e, 'max': max_e}
+        print(f"  {name:<15}: Mean={mean_e:.4f} px, Max={max_e:.4f} px")
+    print("──────────────────────────────────────")
+
+    # Find worst point
+    max_err_per_point = np.nanmax(per_point_dists, axis=0)
+    if np.all(np.isnan(max_err_per_point)):
+        worst_idx = None
+    else:
+        worst_idx = np.nanargmax(max_err_per_point)
+        worst_val = max_err_per_point[worst_idx]
+        print(f"Worst 3D point (idx={worst_idx}): Max Error = {worst_val:.4f} px)")
 
     # Plot
     plot_triangulation_scene(
@@ -134,8 +175,10 @@ if __name__ == "__main__":
         imsizes=(1440, 1080),
         frustums_depth=0.5,
         detections_depth=1.0,
-        trust_volume=volume
-        )
+        trust_volume=volume,
+        worst_point_idx=worst_idx,
+        camera_stats=camera_stats
+    )
 
     plt.suptitle(f"Calibration Scene (frame {frame_idx})")
     plt.show()

@@ -17,7 +17,7 @@ from mokap.utils.datatypes import CharucoBoard, DetectionPayload
 # ──────────────────────────────────────────────────── Config ──────────────────────────────────────────────────────────
 
 DEFAULT_BOARD = CharucoBoard(rows=6, cols=5, square_length=1.5, markers_size=4)
-DEFAULT_DIST_MODEL = 'simple' # or even none? Basler lenses are pretty linear
+DEFAULT_DIST_MODEL = 'simple'  # or even none? Basler lenses are pretty linear
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -59,6 +59,27 @@ def print_report(errors: Dict[str, float], title: str = "Report"):
         err_str = f"{err:.4f}" if np.isfinite(err) else "Inf"
         print(f"  {name:<15} : {err_str} px RMSE")
     print("────────────────────────────────")
+
+
+def print_intrinsics_details(names: List[str], tools: List[MonocularCalibrationTool]):
+    """Prints detailed intrinsic parameters."""
+    print("\n─── Intrinsics ───")
+    for name, tool in zip(names, tools):
+        if not tool.has_intrinsics:
+            continue
+
+        K, D = tool.intrinsics
+        fx, fy = K[0, 0], K[1, 1]
+        cx, cy = K[0, 2], K[1, 2]
+
+        # Flatten and format distortion coeffs
+        d_str = ", ".join([f"{x:.4g}" for x in D.flatten()])
+
+        print(f"[{name}]")
+        print(f"  Focal:   fx={fx:.2f}, fy={fy:.2f}")
+        print(f"  Center:  cx={cx:.2f}, cy={cy:.2f}")
+        print(f"  Dist:    [{d_str}]")
+    print("───────────────────────────")
 
 
 def confirm_save(prompt: str = "Save these parameters to disk?") -> bool:
@@ -190,6 +211,7 @@ def run_intrinsics(folder: Path,
             print(f"Skipping {name}: Not enough samples.")
 
     print_report(results, "Final Intrinsic Errors")
+    print_intrinsics_details(cam_names, tools)
 
     if confirm_save("Overwrite intrinsic files in calibration folder?"):
         for i, (name, m) in enumerate(zip(cam_names, tools)):
@@ -241,7 +263,6 @@ def run_extrinsics(folder: Path,
 
     caps, sizes_hw = open_cameras(video_paths)
     C = len(caps)
-
 
     # Tools
     mono_tools = []
@@ -363,6 +384,15 @@ def run_extrinsics(folder: Path,
     D_opt_np = np.asarray(D_opt)
 
     print("\nCalibration Refinement Complete.")
+
+    # Create temporary tools to print details easily
+    final_tools = []
+    for i in range(C):
+        m = MonocularCalibrationTool(DEFAULT_BOARD, imsize_hw=sizes_hw[i], distortion_model=DEFAULT_DIST_MODEL)
+        m.set_intrinsics(K_opt_np[i], D_opt_np[i])
+        final_tools.append(m)
+
+    print_intrinsics_details(cam_names, final_tools)
 
     if confirm_save("Save Extrinsics (and refined Intrinsics) to disk?"):
         for i, name in enumerate(cam_names):

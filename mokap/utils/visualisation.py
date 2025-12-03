@@ -8,10 +8,10 @@ from mokap.geometry.backend import xp, ArrayLike
 
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
+from matplotlib.lines import Line2D
 from mpl_toolkits.mplot3d.art3d import Poly3DCollection
 
-from mokap.geometry import intersect_rays, unproject, compose_transform_matrix
-
+from mokap.geometry import intersect_rays, unproject
 
 CUSTOM_COLORS = ['#9B5DE5', '#EF476F', '#FFD166', '#00BBF9', '#00F5D4', '#118ab2', '#073b4c', '#ee6c4d']
 
@@ -149,6 +149,7 @@ def plot_cameras_3d(
     frustums_for_direction = unproject(
         frustums_2d, xp.ones(C), K, T_c2w, D, distortion_model='full'
     )
+    # TODO: Use new raycasting function
 
     tvecs_c2w = T_c2w[..., :3, 3]
     directions = frustums_for_direction[:, -1] - tvecs_c2w
@@ -199,11 +200,11 @@ def plot_cameras_3d(
         first_value = next(iter(trust_volume.values()))
 
         if np.isscalar(first_value):
-            # Case 1: Values are extents (sizes) so we center the box on the shared focal point
+            # Values are extents (sizes) so we center the box on the shared focal point
             volume_centre = focal_point
             volume_size = [trust_volume['x'], trust_volume['y'], trust_volume['z']]
         else:
-            # Case 2: Values are ranges (min, max). Calculate the box's own center and size
+            # Values are ranges (min, max). Calculate the box's own center and size
             x_min, x_max = trust_volume['x']
             y_min, y_max = trust_volume['y']
             z_min, z_max = trust_volume['z']
@@ -278,8 +279,7 @@ def plot_points_3d(
 
 def plot_object_3d(
         object_points:  ArrayLike,
-        rvec_w:         ArrayLike,
-        tvec_w:         ArrayLike,
+        object_pose:    ArrayLike,
         color:          str = 'blue',
         label:          str = 'Object Ground Truth',
         ax:             Optional[Axes3D] = None,
@@ -289,8 +289,7 @@ def plot_object_3d(
 
     Args:
         object_points: The (N, 3) points of the board in its own local coordinate system (often with z=0)
-        rvec_w: The rotation vector (3,) that transforms the board from its local frame to the world frame
-        tvec_w: The translation vector (3,) that transforms the board from its local frame to the world frame
+        object_pose: The b2w object pose as a T matrix
         color: The color for the board points
         label: The legend label for the board points
         ax: Optional existing Matplotlib Axes3D object
@@ -300,9 +299,6 @@ def plot_object_3d(
         fig = plt.figure(figsize=(12, 12))
         ax = fig.add_subplot(111, projection='3d')
 
-    # Create the 4x4 transformation matrix from the board's local frame to the world frame
-    board_pose_matrix = compose_transform_matrix(rvec_w, tvec_w)
-
     # Convert local points to homogeneous coordinates
     local_points_hom = np.hstack([
         np.asarray(object_points),
@@ -310,10 +306,9 @@ def plot_object_3d(
     ])
 
     # Apply the transformation to get the points in world coordinates
-    world_points_hom = (board_pose_matrix @ local_points_hom.T).T
+    world_points_hom = (object_pose @ local_points_hom.T).T
     world_points_3d = world_points_hom[:, :3]
 
-    # Use the existing point plotter to display the board
     ax = plot_points_3d(
         points3d=world_points_3d,
         color=color,
@@ -402,43 +397,14 @@ def plot_triangulation_scene(
         detections_depth:   float = 0.95,
         colors:             Optional[Sequence[str]] = None,
         trust_volume:       Optional[Dict[str, ArrayLike]] = None,
-        object_rvec_w:      Optional[ArrayLike] = None,
-        object_tvec_w:      Optional[ArrayLike] = None,
+        object_pose:        Optional[ArrayLike] = None,
         object_points:      Optional[ArrayLike] = None,
         ax:                 Optional[Axes3D] = None,
+        worst_point_idx:    Optional[int] = None,
+        camera_stats:       Optional[Dict[str, Dict[str, float]]] = None,
 ) -> Axes3D:
     """
     Comprehensive 3D plot of a triangulation scene
-
-    This function orchestrates several plotting utilities to show:
-    1. Cameras, their names, and their viewing frustums
-    2. The final triangulated 3D points
-    3. The 2D detections back-projected into 3D space
-    4. Lines (rays) from camera centers to their corresponding back-projected points
-    5. Optionally a ground-truth object
-
-    The depth of back-projected points is dynamically calculated to be a factor of the
-    distance from the camera to the final 3D point
-
-    Args:
-        points3d: Triangulated 3D points (N, 3)
-        points2d: 2D detections for each camera (C, N, 2)
-        rvecs_c2w, tvecs_c2w: Camera-to-world extrinsics (C, 3) and (C, 3)
-        K: Camera intrinsics (C, 3, 3)
-        D: Distortion coefficients (C, D)
-        visibility_mask: Boolean mask for valid 2D points (C, N)
-        points_names: Optional names for the N points
-        errors: Optional per-point errors for coloring
-        cameras_names: Optional names for the C cameras
-        imsizes: Image dimensions (width, height) for frustum plotting
-        frustums_depth: Ratio for camera frustum depth relative to focal point (default: 90% of the way)
-        detections_depth: Where to place back-projected points along the ray to the 3D point (default: 95% of the way)
-        colors: Optional list of colors for cameras
-        trust_volume: Optional dictionary defining a bounding box to plot (or ranges in the three axes)
-        object_rvec_w: Optional rvec (3,) for the ground truth board's pose in the world
-        object_tvec_w: Optional tvec (3,) for the ground truth board's pose in the world
-        object_points: Optional local coordinates (N, 3) of the ground truth board points
-        ax: Optional existing Matplotlib Axes3D object
     """
 
     points3d = xp.asarray(points3d)
@@ -479,57 +445,62 @@ def plot_triangulation_scene(
         ax=ax
     )
 
-    if all(arg is not None for arg in [object_rvec_w, object_tvec_w, object_points]):
+    # Optional ground truth object
+    if all(arg is not None for arg in [object_pose, object_points]):
         ax = plot_object_3d(
             object_points=object_points,
-            rvec_w=object_rvec_w,
-            tvec_w=object_tvec_w,
+            object_pose=object_pose,
             color='blue',
             label='Ground truth',
             ax=ax
         )
 
+    # Back-projected rays
     tvecs_c2w = T_c2w[..., :3, 3]
-
-    # Calculate dynamic depth for back-projection
-    # Vector from each camera center to each 3D point -> shape (C, N, 3)
     cam_to_point_vectors = points3d[None, :, :] - tvecs_c2w[:, None, :]
-
-    # Distance from each camera to each 3D point -> shape (C, N)
     depths_to_3d_points = xp.linalg.norm(cam_to_point_vectors, axis=2)
-
-    # Scale these depths to plot the back-projected points slightly closer to the camera
     plot_depths = depths_to_3d_points * detections_depth
 
-    # Back-project the 2D points using the calculated dynamic depths
-    points2d_in_3d = unproject(
-        points2d_plot, plot_depths, K, T_c2w, D, distortion_model='simple'
-    )
-
-    # Enforce to numpy for plotting
+    points2d_in_3d = unproject(points2d_plot, plot_depths, K, T_c2w, D, distortion_model='simple')
     points2d_in_3d = np.asarray(points2d_in_3d)
 
-    # Plot the back-projected points and the rays
     C, N, _ = points2d_in_3d.shape
     for c in range(C):
-        # Plot the back-projected points as small dots
-        ax.scatter(points2d_in_3d[c, :, 0], points2d_in_3d[c, :, 1], points2d_in_3d[c, :, 2],
-                   c=colors[c], marker='.', alpha=0.7, s=20)
-
-        # Plot the rays from camera center to back-projected point
         for n in range(N):
-            start_point = tvecs_c2w[c]
-            end_point = points2d_in_3d[c, n, :]
-            if np.all(np.isfinite(end_point)):
-                ax.plot(*np.stack([start_point, end_point]).T,
-                        color=colors[c], linestyle=':', linewidth=0.7, alpha=0.6)
+            if np.all(np.isfinite(points2d_in_3d[c, n, :])):
+                start_point = tvecs_c2w[c]
+                end_point = points2d_in_3d[c, n, :]
 
-    # Manually create a legend entry for the back-projected points
-    from matplotlib.lines import Line2D
+                # Highlight worst point
+                is_worst = (worst_point_idx is not None) and (n == worst_point_idx)
+                if is_worst:
+                    ax.scatter(*end_point, c='red', marker='x', s=25, linewidth=2, zorder=10)
+                    ax.plot(*np.stack([start_point, end_point]).T, color='red', linestyle='--', linewidth=0.9, alpha=0.8)
+                else:
+                    ax.scatter(*end_point, c=colors[c], marker='.', alpha=0.7, s=20)
+                    ax.plot(*np.stack([start_point, end_point]).T, color=colors[c], linestyle=':', linewidth=0.7, alpha=0.6)
+
+    # Legend
     handles, labels = ax.get_legend_handles_labels()
-    legend_elements = [Line2D([0], [0], marker='.', color='gray', label='Back-projected Detections',
+    legend_elements = [Line2D([0], [0], marker='.', color='gray', label='Back-projected rays',
                               markerfacecolor='gray', markersize=8, linestyle='None')]
+    if worst_point_idx is not None:
+        legend_elements.append(Line2D([0], [0], marker='x', color='red', label='Worst error',
+                                      markerfacecolor='red', markersize=10, linestyle='None'))
     ax.legend(handles=handles + legend_elements)
+
+    # Overlay stats
+    if camera_stats is not None:
+        stats_text = "Per-camera errors (px):\n"
+        for cam_name, metrics in camera_stats.items():
+            if np.isfinite(metrics['mean']):
+                stats_text += f"{cam_name:>10}: Mean={metrics['mean']:.2f}, Max={metrics['max']:.2f}\n"
+            else:
+                stats_text += f"{cam_name:>10}: No Data\n"
+
+        ax.text2D(0.02, 0.98, stats_text, transform=ax.transAxes,
+                  fontsize=9, verticalalignment='top', family='monospace',
+                  bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
     ax.set_aspect('equal')
     return ax
