@@ -17,12 +17,12 @@ from mokap.utils.datatypes import CharucoBoard, DetectionPayload
 # ──────────────────────────────────────────────────── Config ──────────────────────────────────────────────────────────
 
 DEFAULT_BOARD = CharucoBoard(rows=6, cols=5, square_length=1.5, markers_size=4)
-DEFAULT_DIST_MODEL = 'rational'
+DEFAULT_DIST_MODEL = 'simple' # or even none? Basler lenses are pretty linear
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
 
-def get_video_files(folder: Path) -> Tuple[List[Path], List[str]]:
+def get_video_files(folder: Path) -> Tuple[List[Path], List[str], Path]:
     """Scans folder for mp4s and returns paths and camera names."""
     if folder.name != "calibration" and (folder / "calibration").is_dir():
         folder = folder / "calibration"
@@ -241,6 +241,7 @@ def run_extrinsics(folder: Path,
 
     caps, sizes_hw = open_cameras(video_paths)
     C = len(caps)
+
 
     # Tools
     mono_tools = []

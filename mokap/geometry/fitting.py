@@ -518,8 +518,16 @@ def compute_bounds(
         Dict with 'x', 'y', 'z' bounds
     """
 
+    # Check for columns where all values are NaN (points never seen or invalid depth)
+    is_valid_obs = xp.isfinite(all_errors)
+    counts = xp.sum(is_valid_obs, axis=0)
+    sums = xp.nansum(all_errors, axis=0)
+
+    # Avoid division by zero
+    safe_counts = xp.maximum(counts, 1.0)
+
     # Reliability masking
-    mean_error = xp.nanmean(all_errors, axis=0)  # (P, N) or (N,)
+    mean_error = xp.where(counts > 0, sums / safe_counts, xp.inf) # (P, N) or (N,)
     reliable_mask = mean_error < error_threshold_px
 
     # Check if enough points (threshold of 4 for IQR)

@@ -425,8 +425,8 @@ class MultiviewCalibrationTool:
                 #
                 logger.debug(f"[BA] >>> STAGE 1: Consolidating cameras position with {current_P} frames...")
                 success_s1, results_s1 = bundle_adjustment.run_bundle_adjustment(
-                    camera_matrices_initial=K_online,
-                    distortion_coeffs_initial=D_online,
+                    K_initial=K_online,
+                    D_initial=D_online,
                     cam_poses_initial=cam_T_online,
 
                     images_sizes_hw=self._images_sizes_hw,
@@ -468,8 +468,8 @@ class MultiviewCalibrationTool:
                 poses_T_s2_init = results_s1['object_poses_opt']
 
                 success_s2, results_s2 = bundle_adjustment.run_bundle_adjustment(
-                    camera_matrices_initial=K_s2_init,
-                    distortion_coeffs_initial=D_s2_init,
+                    K_initial=K_s2_init,
+                    D_initial=D_s2_init,
                     cam_poses_initial=cam_T_s2_init,
 
                     images_sizes_hw=self._images_sizes_hw,
@@ -511,8 +511,8 @@ class MultiviewCalibrationTool:
                 poses_T_s3_init = results_s2['object_poses_opt']
 
                 success_s3, final_results_attempt = bundle_adjustment.run_bundle_adjustment(
-                    camera_matrices_initial=K_s3_init,
-                    distortion_coeffs_initial=D_s3_init,
+                    K_initial=K_s3_init,
+                    D_initial=D_s3_init,
                     cam_poses_initial=cam_T_s3_init,
 
                     images_sizes_hw=self._images_sizes_hw,

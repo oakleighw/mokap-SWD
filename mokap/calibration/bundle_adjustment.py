@@ -150,19 +150,33 @@ def _get_parameter_scales(
 
     # Cameras intrinsics scales
     if 'cam_mat' in spec['blocks']:
+
         info = spec['blocks']['cam_mat']
         size_per_set = info['size'] // nb_intr_sets
+
+        K_init = initial_params.get('K', None)
+
         for i in range(nb_intr_sets):
             cam_idx = 0 if is_shared else i
             h, w = images_sizes_hw[cam_idx]
             offset = info['offset'] + i * size_per_set
 
+            # Get initial focal length if available otherwise default to 1000
+            if K_init is not None:
+                # Average fx and fy for scaling purposes
+                f_val = (K_init[cam_idx, 0, 0] + K_init[cam_idx, 1, 1]) / 2.0
+            else:
+                f_val = 1000.0
+
+            # Ensure scale is not too small (sanity check)
+            f_scale = max(100.0, float(f_val))
+
             if cfg['fix_aspect_ratio']:
                 # params are [f, cx, cy]
-                scales[offset:offset + 3] = [1000.0, w, h]
+                scales[offset:offset + 3] = [f_scale, w, h]
             else:
                 # params are [fx, fy, cx, cy]
-                scales[offset:offset + 4] = [1000.0, 1000.0, w, h]
+                scales[offset:offset + 4] = [f_scale, f_scale, w, h]
 
     if 'distortion' in spec['blocks']:
         info = spec['blocks']['distortion']
@@ -174,8 +188,8 @@ def _get_parameter_scales(
         info = spec['blocks']['extrinsics']
         nb_optim_cams = C - 1
 
-        # Scale for rotation vectors (radians)
-        r_scales = np.full(3 * nb_optim_cams, 1.0)
+        # Rotation: 0.1 rad (~5.7 degrees) should be good
+        r_scales = np.full(3 * nb_optim_cams, 0.1)
 
         # For translation vectors, the std of their initial values is a good heuristic
         origin_idx = cfg.get('origin_idx', 0)
@@ -191,8 +205,8 @@ def _get_parameter_scales(
     if 'poses' in spec['blocks']:
         info = spec['blocks']['poses']
 
-        # Scale for rotation vectors
-        r_scales = np.full(3 * P, 1.0)
+        # Scale for rotation vectors: 0.1 rad (~5.7 degrees) should be good
+        r_scales = np.full(3 * P, 0.1)
 
         # Scale for translation vectors
         tvecs_to_optim = np.asarray(initial_params['poses_tvecs'])
@@ -246,8 +260,10 @@ def _get_bounds(
 
                 f_lo, f_hi = 100.0, 100000.0
 
-                cx_lo, cx_hi = 0.0, w
-                cy_lo, cy_hi = 0.0, h
+                # Allow principal point to be outside image during optimisation
+                # to prevent hitting hard bounds when geometry is unstable.
+                cx_lo, cx_hi = -w, 2 * w
+                cy_lo, cy_hi = -h, 2 * h
 
                 if cfg['fix_aspect_ratio']:
                     # params are [f, cx, cy]
@@ -294,15 +310,15 @@ def _get_bounds(
 
 
 def _pack_params(
-        camera_matrices:    jnp.ndarray,
-        dist_coeffs:        jnp.ndarray,
-        cam_rvecs:          jnp.ndarray,
-        cam_tvecs:          jnp.ndarray,
-        object_points:      Optional[jnp.ndarray],
-        poses_rvecs:        Optional[jnp.ndarray],
-        poses_tvecs:        Optional[jnp.ndarray],
-        spec:               Dict
-) -> Tuple[jnp.ndarray,     Dict[str, jnp.ndarray]]:
+        K:              jnp.ndarray,
+        D:              jnp.ndarray,
+        cam_rvecs:      jnp.ndarray,
+        cam_tvecs:      jnp.ndarray,
+        object_points:  Optional[jnp.ndarray],
+        poses_rvecs:    Optional[jnp.ndarray],
+        poses_tvecs:    Optional[jnp.ndarray],
+        spec:           Dict
+) -> Tuple[jnp.ndarray, Dict[str, jnp.ndarray]]:
     """ Packs parameters into an optimization vector X and a fixed_params dict """
 
     optim_parts = []
@@ -311,24 +327,24 @@ def _pack_params(
     is_shared = cfg['shared_intrinsics'] and cfg['nb_cams'] > 1
 
     # Cameras intrinsics
-    fixed_params['K_init'] = camera_matrices
-    fixed_params['D_init'] = dist_coeffs
+    fixed_params['K_init'] = K
+    fixed_params['D_init'] = D
     if not cfg['fix_cameras_intrinsics']:
         if cfg['fix_aspect_ratio']:
-            f = (camera_matrices[:, 0, 0] + camera_matrices[:, 1, 1]) * 0.5
-            fp_block = jnp.column_stack([f, camera_matrices[:, 0, 2], camera_matrices[:, 1, 2]])
+            f = (K[:, 0, 0] + K[:, 1, 1]) * 0.5
+            fp_block = jnp.column_stack([f, K[:, 0, 2], K[:, 1, 2]])
         else:
-            fp_block = jnp.column_stack([camera_matrices[:, 0, 0], camera_matrices[:, 1, 1], camera_matrices[:, 0, 2],
-                                         camera_matrices[:, 1, 2]])
+            fp_block = jnp.column_stack([K[:, 0, 0], K[:, 1, 1], K[:, 0, 2],
+                                         K[:, 1, 2]])
         optim_parts.append(jnp.mean(fp_block, axis=0) if is_shared else fp_block.ravel())
 
         if 'distortion' in spec['blocks']:
             n_d = cfg['n_d']
-            d_block = dist_coeffs[:, :n_d]
+            d_block = D[:, :n_d]
             optim_parts.append(jnp.mean(d_block, axis=0) if is_shared else d_block.ravel())
     else:
-        fixed_params['K'] = camera_matrices
-        fixed_params['D'] = dist_coeffs
+        fixed_params['K'] = K
+        fixed_params['D'] = D
 
     # Cameras extrinsics
     # Store initial extrinsics for priors
@@ -467,7 +483,7 @@ def _unpack_params(
 def residual_weights(
         points2d:                jnp.ndarray,  # (C, P, N, 2)
         visibility_mask:         jnp.ndarray,  # (C, P, N)
-        camera_matrices:         jnp.ndarray,  # (C, 3, 3)
+        K:         jnp.ndarray,  # (C, 3, 3)
         reproj_error:            Optional[jnp.ndarray] = None,  # (C, P, N) or None
         distance_falloff_gamma:  float = 2.0
 ) -> jnp.ndarray:
@@ -480,8 +496,8 @@ def residual_weights(
     """
 
     # Distance to center
-    cx = camera_matrices[:, 0, 2][:, None, None]  # (C, 1, 1)
-    cy = camera_matrices[:, 1, 2][:, None, None]
+    cx = K[:, 0, 2][:, None, None]  # (C, 1, 1)
+    cy = K[:, 1, 2][:, None, None]
 
     center = jnp.stack([cx, cy], axis=-1)
 
@@ -769,19 +785,19 @@ def _validate_inputs(**kwargs):
         raise ValueError(
             f"Shape mismatch: visibility_mask should be ({C}, {P}, {N}), but got {visibility_mask.shape}.")
 
-    if camera_matrices_initial.shape != (C, 3, 3):
+    if K_initial.shape != (C, 3, 3):
         raise ValueError(
-            f"Shape mismatch: camera_matrices_initial should be ({C}, 3, 3), but got {camera_matrices_initial.shape}.")
+            f"Shape mismatch: K_initial should be ({C}, 3, 3), but got {K_initial.shape}.")
 
     # Validating Camera Poses (Matrices)
     if cam_poses_initial.shape != (C, 4, 4):
         raise ValueError(
             f"Shape mismatch: cam_poses_initial should be ({C}, 4, 4) T matrices, but got {cam_poses_initial.shape}.")
 
-    if distortion_coeffs_initial.ndim != 2 or distortion_coeffs_initial.shape[0] != C:
+    if D_initial.ndim != 2 or D_initial.shape[0] != C:
         raise ValueError(
-            f"Shape mismatch: distortion_coeffs_initial should be a 2D array of shape (C, nb_coeffs), i.e., ({C}, k), "
-            f"but got shape {distortion_coeffs_initial.shape}."
+            f"Shape mismatch: D_initial should be a 2D array of shape (C, nb_coeffs), i.e., ({C}, k), "
+            f"but got shape {D_initial.shape}."
         )
 
     if not 0 <= origin_idx < C:
@@ -822,8 +838,8 @@ def _validate_inputs(**kwargs):
 
 
 def run_bundle_adjustment(
-        camera_matrices_initial:    jnp.ndarray,
-        distortion_coeffs_initial:  jnp.ndarray,
+        K_initial:                  jnp.ndarray,
+        D_initial:                  jnp.ndarray,
         cam_poses_initial:          jnp.ndarray,
         images_sizes_hw:            ArrayLike,
         image_points:               jnp.ndarray,
@@ -848,8 +864,8 @@ def run_bundle_adjustment(
         Runs Bundle Adjustment optimisation.
 
         Args:
-            camera_matrices_initial: (C, 3, 3)
-            distortion_coeffs_initial: (C, k)
+            K_initial: (C, 3, 3)
+            D_initial: (C, k)
             cam_poses_initial: Camera-to-world transforms (C, 4, 4)
             images_sizes_hw: (C, 2)
             image_points: Observations (C, P, N, 2)
@@ -869,11 +885,13 @@ def run_bundle_adjustment(
         cam_rvecs_initial, cam_tvecs_initial = geom_transforms.decompose_transform_matrix(cam_poses_initial)
 
         poses_rvecs_initial, poses_tvecs_initial = None, None
+
         if object_poses_initial is not None:
             poses_rvecs_initial, poses_tvecs_initial = geom_transforms.decompose_transform_matrix(object_poses_initial)
 
         C, P, N, _ = image_points.shape
         images_sizes_hw = np.atleast_2d(images_sizes_hw)
+
         nb_points_to_optim = 0
         if not fix_object_points and object_points_initial is not None:
             nb_points_to_optim = object_points_initial.shape[0]
@@ -913,13 +931,14 @@ def run_bundle_adjustment(
         # Prepare and pad distortion coefficients if necessary
         if not fix_cameras_intrinsics:
             n_d = spec['config']['n_d']
-            current_d = distortion_coeffs_initial.shape[1]
+            current_d = D_initial.shape[1]
+
             if current_d < n_d:
                 padding = ((0, 0), (0, n_d - current_d))
-                distortion_coeffs_initial = jnp.pad(distortion_coeffs_initial, padding, mode='constant')
+                D_initial = jnp.pad(D_initial, padding, mode='constant')
 
         x0, fixed_params = _pack_params(
-            camera_matrices_initial, distortion_coeffs_initial,
+            K_initial, D_initial,
             cam_rvecs_initial, cam_tvecs_initial,
             object_points_initial, poses_rvecs_initial, poses_tvecs_initial,
             spec
@@ -931,6 +950,7 @@ def run_bundle_adjustment(
 
         # Generate per-parameter scales for the optimizer
         initial_params_for_scaling = {
+            'K': K_initial,
             'cam_tvecs': cam_tvecs_initial,
             'poses_tvecs': poses_tvecs_initial,
             'object_points': object_points_initial
@@ -941,7 +961,7 @@ def run_bundle_adjustment(
         weights = residual_weights(
             points2d=image_points,
             visibility_mask=visibility_mask,
-            camera_matrices=camera_matrices_initial,
+            K=K_initial,
             distance_falloff_gamma=radial_penalty
         )
 
