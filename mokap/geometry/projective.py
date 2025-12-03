@@ -83,10 +83,11 @@ def distort(
 
     # Handle polynomial models (Simple, Standard (RadTan), Rational, Thin prism)
     req_len = {
-        'simple': 4,    # [k1, k2, p1, p2]
-        'standard': 5,  # [k1, k2, p1, p2, k3]
-        'rational': 8,  # [k1, k2, p1, p2, k3, k4, k5, k6]
-        'thinprism': 12 # [k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4]
+        'simple': 4,        # k1, k2, p1, p2
+        'standard': 5,      # k1, k2, p1, p2, k3
+        'rational': 8,      # k1, k2, p1, p2, k3, k4, k5, k6
+        'thinprism': 12,    # k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4
+        # 'tilted': 14        # k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4, tauX, tauY  # TODO: Tilted
     }.get(distortion_model, 5)
 
     if D.shape[-1] < req_len:

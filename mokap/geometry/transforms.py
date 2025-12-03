@@ -279,12 +279,22 @@ def transform_points(
     Handles the homogeneous coordinate conversion internally.
 
     Args:
-        points3d: (..., N, 3)
+        points3d: (..., N, 3) or (3,) for single point
         transform: (..., 4, 4)
     """
+
+    # Handle single point input case explicitly
+    is_1d = (points3d.ndim == 1)
+    if is_1d:
+        points3d = points3d[None, :]
+
     points_h = homogenize(points3d)
+
+    # '...ij,...nj->...ni' expects points to have dimension N (n)
+    # With is_1d fix above, points_h is guaranteed to have at least 2 dims here
     transformed_h = xp.einsum('...ij,...nj->...ni', transform, points_h)
-    return transformed_h[..., :3]
+
+    return transformed_h[..., :3].squeeze(0) if is_1d else transformed_h[..., :3]
 
 
 @jit
@@ -303,11 +313,16 @@ def transform_vectors(
     Returns:
         Rotated vectors (..., N, 3)
     """
+    is_1d = (vectors.ndim == 1)
+    if is_1d:
+        vectors = vectors[None, :]
+
     # We slice only the Rotation block (top-left 3x3)
     R = transform[..., :3, :3]
 
-    # We do NOT add the translation vector (transform[..., :3, 3])
-    return xp.einsum('...ij,...nj->...ni', R, vectors)
+    # We do *not* add the translation vector
+    rotated = xp.einsum('...ij,...nj->...ni', R, vectors)
+    return rotated.squeeze(0) if is_1d else rotated
 
 
 @jit
