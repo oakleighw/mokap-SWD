@@ -83,7 +83,7 @@ def align_rigid(
     H = xp.matmul(xp.swapaxes(A_centered, -1, -2), B_centered)
 
     # Find the rotation using SVD
-    U, S, Vt = xp.linalg.svd(H)
+    U, S, Vt = xp.linalg.svd(H, full_matrices=False)
 
     # Compute Rotation R = Vt.T @ U.T
     # Note: V from svd is V^T (Vt), so we need Vt.T @ U.T

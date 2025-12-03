@@ -416,14 +416,15 @@ def fundamental_matrix(
     F = invK2_T @ E_mat @ invK1
 
     # Enforce rank-2
-    U, S, Vt = xp.linalg.svd(F)
+    U, S, Vt = xp.linalg.svd(F, full_matrices=False)
     mask = xp.array([1.0, 1.0, 0.0], dtype=S.dtype)
     S_new = S * mask
 
     F_corrected = (U * S_new[..., None, :]) @ Vt
 
     norm = xp.linalg.norm(F_corrected, axis=(-1, -2), keepdims=True)
-    F_normalized = F_corrected / (norm + _tiny)
+    safe_norm = xp.where(norm < _tiny, 1.0, norm)   # safety if F is degenerate
+    F_normalized = F_corrected / safe_norm
 
     return F_normalized
 
