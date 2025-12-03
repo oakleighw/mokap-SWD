@@ -3,7 +3,7 @@ from typing import List, Optional, Union, Dict
 from PySide6.QtCore import QTimer, Slot, Signal
 
 import numpy as np
-from mokap.geometry import xp, ArrayLike
+from mokap.geometry.backend import xp, ArrayLike
 
 from mokap.calibration.multiview import MultiviewCalibrationTool
 from mokap.gui.workers.workers_base import CalibrationProcessingWorker
@@ -28,7 +28,7 @@ class MultiviewWorker(CalibrationProcessingWorker):
     def __init__(self,
                  cameras_names:     List[str],
                  origin_camera:     str,
-                 sources_shapes_wh: Dict[str, ArrayLike],
+                 sources_shapes_hw: Dict[str, ArrayLike],
                  calibration_board: Union[ChessBoard, CharucoBoard]):
         super().__init__(name='multiview')
 
@@ -39,7 +39,7 @@ class MultiviewWorker(CalibrationProcessingWorker):
 
         self._C = len(cameras_names)
 
-        self._sources_shapes_wh = sources_shapes_wh  # Expects {cam_name: (w, h)}
+        self._sources_shapes_hw = sources_shapes_hw  # Expects {cam_name: (h, w)}
         self.calibration_board = calibration_board
 
         # Store board object points in homogenous coordinates for transforms
@@ -69,7 +69,7 @@ class MultiviewWorker(CalibrationProcessingWorker):
              [w, 0],            # Top-right corner
              [w, h],            # Bottom-right corner
              [0, h]             # Bottom-left corner
-             ] for w, h in sources_shapes_wh.values()], dtype=np.float32)
+             ] for h, w in sources_shapes_hw.values()], dtype=np.float32)
 
         self._img_points_2d = xp.asarray(img_points_2d)  # (C, 5, 2)
 
@@ -102,11 +102,11 @@ class MultiviewWorker(CalibrationProcessingWorker):
                 f"[{self.name.title()}] All intrinsics received for Stage {self._current_stage}. Creating Multiview tool.")
 
             # Convert dict to ordered list for the tool
-            image_sizes_wh_list = [self._sources_shapes_wh[name] for name in self._cameras_names]
+            image_sizes_hw_list = [self._sources_shapes_hw[name] for name in self._cameras_names]
 
             self.multiview_tool = MultiviewCalibrationTool(
                 nb_cameras=self._C,
-                images_sizes_wh=np.array(image_sizes_wh_list),
+                images_sizes_hw=np.array(image_sizes_hw_list),
                 origin_idx=self._orig_cam_idx,
                 K_init=self._cameras_matrices,
                 D_init=self._dist_coeffs,

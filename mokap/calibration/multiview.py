@@ -10,7 +10,7 @@ from mokap.geometry.backend import xp, ArrayLike, set_at
 from mokap.calibration import bundle_adjustment
 from mokap.calibration.common import solve_pnp_robust
 
-from mokap.utils.datatypes import DetectionPayload
+from mokap.utils.datatypes import DetectionPayload, DistortionModel
 from mokap.geometry import (project_to_cameras, reprojection_errors, project_to_cameras_multi,
                             quaternion_average, average_qtposes, compute_bounds, flip_transform_180,
                             compose_transform_matrix, decompose_transform_matrix,
@@ -23,7 +23,7 @@ logger = logging.getLogger(__name__)
 class MultiviewCalibrationTool:
     def __init__(self,
                  nb_cameras:            int,
-                 images_sizes_wh:       ArrayLike,
+                 images_sizes_hw:       ArrayLike,
                  origin_idx:            int,
                  K_init:                ArrayLike,
                  D_init:                ArrayLike,
@@ -32,17 +32,21 @@ class MultiviewCalibrationTool:
                  max_detections:        int = 100,
                  angular_thresh:        float = 10.0,  # in degrees
                  translational_thresh:  float = 10.0,  # in object_points' units
+                 distortion_model: DistortionModel = 'standard'
                  ):
 
         self.nb_cameras = nb_cameras
         self.origin_idx = origin_idx
+        self._distortion_model = distortion_model
 
-        images_sizes_wh = np.asarray(images_sizes_wh)
-        if images_sizes_wh.ndim == 2 and images_sizes_wh.shape[0] == self.nb_cameras:
-            self._images_sizes_wh = images_sizes_wh[:, :2]
-        elif images_sizes_wh.ndim == 1 and 2 <= images_sizes_wh.shape[0] <= 3:
+        images_sizes_hw = np.asarray(images_sizes_hw)
+        if images_sizes_hw.ndim == 2 and images_sizes_hw.shape[0] == self.nb_cameras:
+            self._images_sizes_hw = images_sizes_hw[:, :2]
+
+        elif images_sizes_hw.ndim == 1 and 2 <= images_sizes_hw.shape[0] <= 3:
             logger.debug('Only one size passed, assuming identical image size for all cameras.')
-            self._images_sizes_wh = np.asarray([images_sizes_wh[:2]] * self.nb_cameras)
+
+            self._images_sizes_hw = np.asarray([images_sizes_hw[:2]] * self.nb_cameras)
         else:
             raise AttributeError("Can't understand image size.")
 
@@ -232,7 +236,7 @@ class MultiviewCalibrationTool:
             T_w2c_new,
             K_batch,
             D_batch,
-            distortion_model='full'
+            distortion_model=self._distortion_model
         )
 
         effective_visibility = visibility_mask * reproj_mask
@@ -302,39 +306,6 @@ class MultiviewCalibrationTool:
         - Stage 2: Refines per-camera intrinsics (still no distortion)
         - Stage 3: Performs a full refinement with all parameters (including distortion)
         """
-
-        # def _log_params(stage_name, results_dict, initial_K, initial_D):
-        #     """ Helper to log key parameters and their deviation from initial values """
-        #     K_opt, D_opt = results_dict['K_opt'], results_dict['D_opt']
-        #
-        #     # Calculate average focal length and principal point
-        #     fx_avg = xp.mean(K_opt[:, 0, 0])
-        #     fy_avg = xp.mean(K_opt[:, 1, 1])
-        #     cx_avg = xp.mean(K_opt[:, 0, 2])
-        #     cy_avg = xp.mean(K_opt[:, 1, 2])
-        #
-        #     # Calculate max absolute distortion coefficients across all cameras
-        #     # Only check the coeffs relevant to the current model to avoid noise from unused params
-        #     # This assumes your BA stages correctly zero-out or handle unused coeffs
-        #     n_d = D_opt.shape[1]  # Let's just check all available
-        #     max_dist_coeffs = xp.max(xp.abs(D_opt[:, :n_d]), axis=0)
-        #
-        #     # Calculate deviation from initial parameters
-        #     K_init_avg_f = (xp.mean(initial_K[:, 0, 0]) + xp.mean(initial_K[:, 1, 1])) / 2.0
-        #     K_opt_avg_f = (fx_avg + fy_avg) / 2.0
-        #     f_drift_percent = 100 * (K_opt_avg_f - K_init_avg_f) / K_init_avg_f
-        #
-        #     D_init_max_abs = xp.max(xp.abs(initial_D), axis=0)
-        #     D_drift = max_dist_coeffs - D_init_max_abs
-        #
-        #     # Using logger.info for high visibility during debugging
-        #     logger.info(f"--- [BA] End of {stage_name} ---")
-        #     logger.info(f"  Avg Focal Length (fx, fy): ({fx_avg:.2f}, {fy_avg:.2f}) px")
-        #     logger.info(f"  Focal Length Drift: {f_drift_percent:+.2f}% from initial guess")
-        #     logger.info(f"  Avg Principal Point (cx, cy): ({cx_avg:.2f}, {cy_avg:.2f}) px")
-        #     logger.info(f"  Max Distortion Coeffs (abs): {np.array2string(np.asarray(max_dist_coeffs), precision=4)}")
-        #     logger.info(
-        #         f"  Distortion Drift (max abs):   {np.array2string(np.asarray(D_drift), precision=4, sign='+')}")
 
         if not all(self._has_extrinsics):
             logger.error("[BA] Initial extrinsics have not been estimated yet.")
@@ -458,7 +429,7 @@ class MultiviewCalibrationTool:
                     distortion_coeffs_initial=D_online,
                     cam_poses_initial=cam_T_online,
 
-                    images_sizes_wh=self._images_sizes_wh,
+                    images_sizes_hw=self._images_sizes_hw,
 
                     image_points=pts2d_buf,
                     visibility_mask=vis_buf,
@@ -473,9 +444,9 @@ class MultiviewCalibrationTool:
                     time_independent_points=False,  # It's the same board over time
 
                     # Stage 1 specific flags
-                    shared_intrinsics=True,  # Forces a single camera model for all views
-                    fix_aspect_ratio=True,  # Assume fx = fy
-                    distortion_model='none',
+                    shared_intrinsics=True,     # Forces a single camera model for all views
+                    fix_aspect_ratio=True,      # Assume fx = fy
+                    distortion_model='none',    # No distortion in stage 1
                     priors=priors_stage1,
 
                     origin_idx=self.origin_idx,
@@ -483,8 +454,6 @@ class MultiviewCalibrationTool:
                 )
                 if not success_s1:
                     raise RuntimeError("BA Stage 1 failed.")
-
-                # _log_params("Stage 1 (Shared Pinhole)", results_s1, K_online, D_online)
 
                 # STAGE 2: Per-camera pinhole world (shared intrinsics, simple distortion)
                 # ------------------------------------------------------------------------
@@ -503,7 +472,7 @@ class MultiviewCalibrationTool:
                     distortion_coeffs_initial=D_s2_init,
                     cam_poses_initial=cam_T_s2_init,
 
-                    images_sizes_wh=self._images_sizes_wh,
+                    images_sizes_hw=self._images_sizes_hw,
 
                     image_points=pts2d_buf,
                     visibility_mask=vis_buf,
@@ -519,17 +488,15 @@ class MultiviewCalibrationTool:
                     time_independent_points=False,
 
                     # Stage 2 specific flags
-                    shared_intrinsics=False,  # We now optimize per-camera intrinsics
-                    fix_aspect_ratio=False,  # We relax the aspect ratio constraint
-                    distortion_model='simple',  # And start optimising distortion
+                    shared_intrinsics=False,    # We now optimize per-camera intrinsics
+                    fix_aspect_ratio=False,     # We relax the aspect ratio constraint
+                    distortion_model='simple',  # start optimising distortion
 
                     priors=priors_stage2,
                     radial_penalty=2.0 # for second stage we want to start penalising points too far from the working volume
                 )
                 if not success_s2:
                     raise RuntimeError("BA Stage 2 failed.")
-
-                # _log_params("Stage 2 (Per-Cam Pinhole)", results_s2, K_online, D_online)
 
                 # STAGE 3: Real world (Full extrinsics + intrinsics refinement with distortion)
                 # -----------------------------------------------------------------------------
@@ -548,7 +515,7 @@ class MultiviewCalibrationTool:
                     distortion_coeffs_initial=D_s3_init,
                     cam_poses_initial=cam_T_s3_init,
 
-                    images_sizes_wh=self._images_sizes_wh,
+                    images_sizes_hw=self._images_sizes_hw,
 
                     image_points=pts2d_buf,
                     visibility_mask=vis_buf,
@@ -566,7 +533,7 @@ class MultiviewCalibrationTool:
                     # Stage 3 specific flags
                     shared_intrinsics=False,
                     fix_aspect_ratio=False,
-                    distortion_model='full',  # Full distortion model
+                    distortion_model=self._distortion_model,    # Use the desired model
 
                     priors=priors_stage3,  # Priors are mega important at this stage
 
@@ -574,8 +541,6 @@ class MultiviewCalibrationTool:
                 )
                 if not success_s3:
                     raise RuntimeError("BA Stage 3 failed.")
-
-                # _log_params("Stage 3 (Full Model)", final_results_attempt, K_online, D_online)
 
                 # If we reach here, all stages were successful
                 ba_succeeded = True
@@ -674,7 +639,7 @@ class MultiviewCalibrationTool:
                 world_pts_all_instances,
                 T_w2c,
                 *self._refined_intrinsics,
-                distortion_model='full'
+                distortion_model=self._distortion_model
             )
 
             effective_visibility = visibility_mask * valid_depth_mask

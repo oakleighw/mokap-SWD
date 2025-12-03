@@ -21,7 +21,15 @@ import jax.numpy as jnp
 from jax.typing import ArrayLike
 from mokap.utils.datatypes import DistortionModel
 
-DIST_MODEL_MAP = {'none': 0, 'simple': 4, 'standard': 5, 'full': 8, 'rational': 8}
+DIST_MODEL_MAP = {
+        'none': 0,
+        'simple': 4,        # k1, k2, p1, p2
+        'fisheye': 4,       # k1, k2, k3, k4
+        'standard': 5,      # k1, k2, p1, p2, k3
+        'rational': 8,      # k1, k2, p1, p2, k3, k4, k5, k6
+        'thinprism': 12,    # k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4
+        'tilted': 14        # k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4, tauX, tauY
+    }
 
 
 class JaxGeometryContext:
@@ -128,7 +136,7 @@ def _get_parameter_spec(
 def _get_parameter_scales(
         spec: Dict,
         initial_params: Dict,
-        images_sizes_wh: ArrayLike
+        images_sizes_hw: ArrayLike
 ) -> np.ndarray:
     """ Computes characteristic scales for each optimization variable """
 
@@ -146,7 +154,7 @@ def _get_parameter_scales(
         size_per_set = info['size'] // nb_intr_sets
         for i in range(nb_intr_sets):
             cam_idx = 0 if is_shared else i
-            w, h = images_sizes_wh[cam_idx]
+            h, w = images_sizes_hw[cam_idx]
             offset = info['offset'] + i * size_per_set
 
             if cfg['fix_aspect_ratio']:
@@ -210,7 +218,7 @@ def _get_parameter_scales(
 
 def _get_bounds(
         spec: Dict,
-        images_sizes_wh: ArrayLike
+        images_sizes_hw: ArrayLike
 ) -> Tuple[np.ndarray, np.ndarray]:
     """
     Computes lower and upper bounds for the optimization variables based on the spec
@@ -228,7 +236,7 @@ def _get_bounds(
     if not cfg['fix_cameras_intrinsics']:
         for i in range(nb_intr_sets):
             cam_idx = 0 if is_shared else i
-            w, h = images_sizes_wh[cam_idx]
+            h, w = images_sizes_hw[cam_idx]
 
             # Focal Length and Principal Point
             if 'cam_mat' in spec['blocks']:
@@ -817,7 +825,7 @@ def run_bundle_adjustment(
         camera_matrices_initial:    jnp.ndarray,
         distortion_coeffs_initial:  jnp.ndarray,
         cam_poses_initial:          jnp.ndarray,
-        images_sizes_wh:            ArrayLike,
+        images_sizes_hw:            ArrayLike,
         image_points:               jnp.ndarray,
         visibility_mask:            jnp.ndarray,
         object_points_initial:      Optional[jnp.ndarray] = None,
@@ -843,7 +851,7 @@ def run_bundle_adjustment(
             camera_matrices_initial: (C, 3, 3)
             distortion_coeffs_initial: (C, k)
             cam_poses_initial: Camera-to-world transforms (C, 4, 4)
-            images_sizes_wh: (C, 2)
+            images_sizes_hw: (C, 2)
             image_points: Observations (C, P, N, 2)
             visibility_mask: (C, P, N)
             object_points_initial: 3D points
@@ -865,7 +873,7 @@ def run_bundle_adjustment(
             poses_rvecs_initial, poses_tvecs_initial = geom_transforms.decompose_transform_matrix(object_poses_initial)
 
         C, P, N, _ = image_points.shape
-        images_sizes_wh = np.atleast_2d(images_sizes_wh)
+        images_sizes_hw = np.atleast_2d(images_sizes_hw)
         nb_points_to_optim = 0
         if not fix_object_points and object_points_initial is not None:
             nb_points_to_optim = object_points_initial.shape[0]
@@ -918,7 +926,7 @@ def run_bundle_adjustment(
         )
 
         # Bounds and scaling
-        lb, ub = _get_bounds(spec, images_sizes_wh)
+        lb, ub = _get_bounds(spec, images_sizes_hw)
         x0 = np.clip(x0, lb, ub)
 
         # Generate per-parameter scales for the optimizer
@@ -927,7 +935,7 @@ def run_bundle_adjustment(
             'poses_tvecs': poses_tvecs_initial,
             'object_points': object_points_initial
         }
-        x_scales_np = _get_parameter_scales(spec, initial_params_for_scaling, images_sizes_wh)
+        x_scales_np = _get_parameter_scales(spec, initial_params_for_scaling, images_sizes_hw)
 
         # Setup weights for residual function
         weights = residual_weights(

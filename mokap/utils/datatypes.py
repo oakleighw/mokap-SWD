@@ -8,7 +8,7 @@ from pathlib import Path
 from mokap.utils.fileio import generate_board_svg
 from mokap.utils import fileio
 
-DistortionModel = Literal['none', 'simple', 'standard', 'full', 'rational']
+DistortionModel = Literal['none', 'simple', 'standard', 'rational', 'thinprism', 'tilted', 'fisheye']
 
 
 class ChessBoard:

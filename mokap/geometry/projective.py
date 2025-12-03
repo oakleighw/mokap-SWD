@@ -32,7 +32,7 @@ def distort(
         points2d_normalised: xp.ndarray,
         D: xp.ndarray,
         distortion_model: str = 'standard'
-) -> Tuple[xp.ndarray, xp.ndarray]:
+) -> xp.ndarray:
     """
     Computes radial and tangential distortion terms for normalised coordinates.
     Follows OpenCV conventions.
@@ -47,47 +47,16 @@ def distort(
         tangential: Tangential (and prism) offset vector (..., 2)
     """
 
-    # Handle Fisheye (Kannala-Brandt) separately as it uses a completely different model (theta-based)
-    if distortion_model == 'fisheye':
-        D_req = 4   # (k1, k2, k3, k4)
-        if D.shape[-1] < D_req:
-            D = xp.pad(D, [(0, 0)] * (D.ndim - 1) + [(0, D_req - D.shape[-1])])
-
-        D = align_batch_dims(points2d_normalised.ndim - 1, D, data_dims=1)
-
-        k1, k2, k3, k4 = D[..., 0:1], D[..., 1:2], D[..., 2:3], D[..., 3:4]
-
-        r2 = xp.sum(xp.square(points2d_normalised), axis=-1, keepdims=True)
-        r = xp.sqrt(r2)
-        theta = xp.arctan(r)
-
-        theta2 = theta * theta
-        theta4 = theta2 * theta2
-        theta6 = theta4 * theta2
-        theta8 = theta4 * theta4
-
-        # theta_d = theta * (1 + k1*th^2 + k2*th^4 + k3*th^6 + k4*th^8)
-        scale_factor = 1.0 + k1 * theta2 + k2 * theta4 + k3 * theta6 + k4 * theta8
-        theta_dist = theta * scale_factor
-
-        # We need the scaling factor for x and y: x_dist = x * (theta_dist / r)
-        # Handle r -> 0 to avoid division by zero
-        safe_r = xp.where(r < _tiny, 1.0, r)
-        radial = xp.where(r < _tiny, 1.0, theta_dist / safe_r)
-
-        tangential = xp.zeros_like(points2d_normalised)
-        return radial, tangential
-
     if distortion_model == 'none':
-        return xp.ones_like(points2d_normalised[..., :1]), xp.zeros_like(points2d_normalised)
+        return points2d_normalised
 
-    # Handle polynomial models (Simple, Standard (RadTan), Rational, Thin prism)
     req_len = {
         'simple': 4,        # k1, k2, p1, p2
+        'fisheye': 4,       # k1, k2, k3, k4
         'standard': 5,      # k1, k2, p1, p2, k3
         'rational': 8,      # k1, k2, p1, p2, k3, k4, k5, k6
         'thinprism': 12,    # k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4
-        # 'tilted': 14        # k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4, tauX, tauY  # TODO: Tilted
+        'tilted': 14        # k1, k2, p1, p2, k3, k4, k5, k6, s1, s2, s3, s4, tauX, tauY
     }.get(distortion_model, 5)
 
     if D.shape[-1] < req_len:
@@ -95,13 +64,65 @@ def distort(
 
     D = align_batch_dims(points2d_normalised.ndim - 1, D, data_dims=1)
 
-    # Base params (common to all)
+    # Handle Fisheye (Kannala-Brandt) separately as it uses a completely different model (theta-based)
+    if distortion_model == 'fisheye':
+
+        k1 = D[..., 0:1]
+        k2 = D[..., 1:2]
+        k3 = D[..., 2:3]
+        k4 = D[..., 3:4]
+
+        r2 = xp.sum(xp.square(points2d_normalised), axis=-1, keepdims=True)
+        r = xp.sqrt(r2)
+        theta = xp.arctan(r)
+        theta2 = theta * theta
+        theta4 = theta2 * theta2
+        theta6 = theta4 * theta2
+        theta8 = theta4 * theta4
+
+        scale = 1.0 + k1 * theta2 + k2 * theta4 + k3 * theta6 + k4 * theta8
+        theta_dist = theta * scale
+
+        # Safe division for r -> 0
+        safe_r = xp.where(r < _tiny, 1.0, r)
+        factor = xp.where(r < _tiny, 1.0, theta_dist / safe_r)
+
+        return points2d_normalised * factor
+
+    # Coordinate transformation (Tilted model)
+    # Tilted rotates the sensor plane coordinates *before* applying radial distortion
+    coords = points2d_normalised
+
+    if distortion_model == 'tilted':
+
+        tauX = D[..., 12:13]
+        tauY = D[..., 13:14]
+
+        cx, sx = xp.cos(tauX), xp.sin(tauX)
+        cy, sy = xp.cos(tauY), xp.sin(tauY)
+
+        x = coords[..., 0:1]
+        y = coords[..., 1:2]
+
+        # Rotate around X
+        y1 = y * cx - sx
+        z1 = y * sx + cx
+        # Rotate around Y
+        x2 = x * cy + z1 * sy
+        y2 = y1
+        z2 = -x * sy + z1 * cy
+
+        # Re-normalise
+        safe_z2 = xp.where(xp.abs(z2) < _tiny, 1.0, z2)
+        coords = xp.concatenate([x2 / safe_z2, y2 / safe_z2], axis=-1)
+
+    # Standard coefficients
     k1 = D[..., 0:1]
     k2 = D[..., 1:2]
     p1 = D[..., 2:3]
     p2 = D[..., 3:4]
 
-    # Precompute radii
+    # Precompute radii (using potentially tilted coordinates)
     r2 = xp.sum(xp.square(points2d_normalised), axis=-1, keepdims=True)
     r4 = r2 * r2
     r6 = r4 * r2
@@ -110,11 +131,7 @@ def distort(
     if distortion_model == 'simple':
         radial = 1.0 + k1 * r2 + k2 * r4
 
-    elif distortion_model == 'standard':
-        k3 = D[..., 4:5]
-        radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
-
-    elif distortion_model in ('rational', 'thinprism'):
+    elif distortion_model in ('rational', 'thinprism', 'tilted'):
         k3 = D[..., 4:5]
         k4 = D[..., 5:6]
         k5 = D[..., 6:7]
@@ -125,26 +142,25 @@ def distort(
 
         safe_den = xp.where(xp.abs(den) < _tiny, 1.0, den)
         radial = num / safe_den
-    else:
-        radial = xp.ones_like(r2)
 
-    # Tangential component
-    # Brown-Conrady tangential
-    x = points2d_normalised[..., 0:1]
-    y = points2d_normalised[..., 1:2]
+    else: # standard
+        k3 = D[..., 4:5]
+        radial = 1.0 + k1 * r2 + k2 * r4 + k3 * r6
+
+    # Tangential
+    x = coords[..., 0:1]
+    y = coords[..., 1:2]
 
     xy = x * y
     x2 = x * x
     y2 = y * y
 
-    # 2xy*p1 + p2(r^2 + 2x^2)
-    # 2xy*p2 + p1(r^2 + 2y^2)
     dx = 2.0 * p1 * xy + p2 * (r2 + 2.0 * x2)
     dy = 2.0 * p2 * xy + p1 * (r2 + 2.0 * y2)
 
-    tangential_offset = xp.concatenate([dx, dy], axis=-1)
+    tangential = xp.concatenate([dx, dy], axis=-1)
 
-    # Thin prism omponent
+    # Thin prism component
     if distortion_model == 'thinprism':
         s1 = D[..., 8:9]
         s2 = D[..., 9:10]
@@ -157,9 +173,9 @@ def distort(
         prism_x = s1 * r2 + s2 * r4
         prism_y = s3 * r2 + s4 * r4
 
-        tangential_offset = tangential_offset + xp.concatenate([prism_x, prism_y], axis=-1)
+        tangential = tangential + xp.concatenate([prism_x, prism_y], axis=-1)
 
-    return radial, tangential_offset
+    return coords * radial + tangential
 
 
 @partial(jit, static_argnames=['distortion_model', 'iters'])
@@ -170,7 +186,7 @@ def undistort(
         R: Optional[xp.ndarray] = None,
         P: Optional[xp.ndarray] = None,
         distortion_model: str = 'standard',
-        iters: int = 5
+        iters: int = 10
 ) -> xp.ndarray:
     """
     Invert distortion & reprojection using Newton-Raphson iteration.
@@ -190,16 +206,22 @@ def undistort(
 
     target_ndim = points2d.ndim - 1
 
-    # Normalise: (uv - c) / f
+    # Normalise to get target distorted points on the image plane: (uv - c) / f
     uv_distorted = normalize_pixel_coordinates(points2d, K)
 
-    # Newton-Raphson iteration
-    def newton_raphson(i, uv_current):
-        radial, tangential = distort(uv_current, D, distortion_model)
-        safe_radial = xp.where(xp.abs(radial) < _tiny, _tiny, radial)
-        return (uv_distorted - tangential) / safe_radial
+    # Iterative solver
+    # We want to find uv such that distort(uv) == uv_distorted
+    # Guess: start with the distorted point (identity assumption)
 
-    uv_undistorted = lax.fori_loop(0, iters, newton_raphson, uv_distorted)
+    def loop_body(i, uv_guess):
+        # Forward pass
+        uv_pred = distort(uv_guess, D, distortion_model)
+        # Error
+        error = uv_distorted - uv_pred
+        # Update (Simple residual addition works because slope ~ 1)
+        return uv_guess + error
+
+    uv_undistorted = lax.fori_loop(0, iters, loop_body, uv_distorted)
 
     # Rectification (rotation)
     pts_h = homogenize(uv_undistorted)  # (..., 3)
@@ -298,8 +320,7 @@ def project(
 
     # Apply Distortion
     # dist_coeffs alignment happens inside here based on x.ndim
-    radial, tangential = distort(x_norm, D, distortion_model)
-    points_distorted = x_norm * radial + tangential
+    points_distorted = distort(x_norm, D, distortion_model)
 
     # Apply intrinsics (denormalise)
     target_batch_dim = points3d.ndim - 1

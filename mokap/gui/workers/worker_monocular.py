@@ -62,7 +62,8 @@ class MonocularWorker(CalibrationProcessingWorker):
             imsize_hw=(self.img_h, self.img_w),
             min_stack=self._min_stack_for_calib,
             focal_mm=self._cam_th_focal,
-            sensor_size=self._sensor_size
+            sensor_size=self._sensor_size,
+            distortion_model=self._distortion_model
         )
 
     @Slot(object)

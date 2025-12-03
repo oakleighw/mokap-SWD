@@ -10,7 +10,7 @@ from PySide6.QtWidgets import QHBoxLayout, QFrame, QVBoxLayout, QGroupBox, QGrid
 from pyqtgraph.opengl import GLGridItem, GLViewWidget, GLScatterPlotItem, GLLinePlotItem, GLMeshItem
 
 import numpy as np
-from mokap.geometry import xp
+from mokap.geometry.backend import xp
 
 from mokap.gui.style.commons import *
 from mokap.gui.widgets import BOARD_TYPES

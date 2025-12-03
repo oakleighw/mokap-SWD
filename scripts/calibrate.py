@@ -17,6 +17,7 @@ from mokap.utils.datatypes import CharucoBoard, DetectionPayload
 # ──────────────────────────────────────────────────── Config ──────────────────────────────────────────────────────────
 
 DEFAULT_BOARD = CharucoBoard(rows=6, cols=5, square_length=1.5, markers_size=4)
+DEFAULT_DIST_MODEL = 'rational'
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
@@ -44,11 +45,11 @@ def get_video_files(folder: Path) -> Tuple[List[Path], List[str]]:
 def open_cameras(video_paths: List[Path]) -> Tuple[List[cv2.VideoCapture], np.ndarray]:
     """Opens video captures and returns handles + (Height, Width) array."""
     caps = [cv2.VideoCapture(str(vp)) for vp in video_paths]
-    sizes = []
+    sizes_hw = []
     for vp in video_paths:
         meta = fileio.probe_video(vp)
-        sizes.append((meta['height'], meta['width']))
-    return caps, np.array(sizes)
+        sizes_hw.append((meta['height'], meta['width']))
+    return caps, np.array(sizes_hw)
 
 
 def print_report(errors: Dict[str, float], title: str = "Report"):
@@ -82,11 +83,14 @@ def run_intrinsics(folder: Path,
     """
     print(f"\n[INTRINSICS] Starting calibration in: {folder}")
     video_paths, cam_names, work_dir = get_video_files(folder)
-    caps, sizes = open_cameras(video_paths)
+    caps, sizes_hw = open_cameras(video_paths)
     C = len(caps)
 
     tools = [
-        MonocularCalibrationTool(calibration_board=DEFAULT_BOARD, imsize_hw=sizes[i])
+        MonocularCalibrationTool(
+            calibration_board=DEFAULT_BOARD,
+            imsize_hw=sizes_hw[i],
+            distortion_model=DEFAULT_DIST_MODEL)
         for i in range(C)
     ]
 
@@ -235,25 +239,29 @@ def run_extrinsics(folder: Path,
     Ks = np.stack(Ks)
     Ds = np.stack(Ds)
 
-    caps, sizes = open_cameras(video_paths)
+    caps, sizes_hw = open_cameras(video_paths)
     C = len(caps)
 
     # Tools
     mono_tools = []
     for i in range(C):
-        m = MonocularCalibrationTool(calibration_board=DEFAULT_BOARD)
+        m = MonocularCalibrationTool(
+            calibration_board=DEFAULT_BOARD,
+            imsize_hw=sizes_hw[i],
+            distortion_model=DEFAULT_DIST_MODEL)
         m.set_intrinsics(Ks[i], Ds[i])
         mono_tools.append(m)
 
     mv_tool = MultiviewCalibrationTool(
         nb_cameras=C,
-        images_sizes_wh=np.flip(sizes[:, :2], axis=1),  # tool expects w, h
+        images_sizes_hw=sizes_hw[:, :2],
         object_points=DEFAULT_BOARD.object_points,
         K_init=Ks,
         D_init=Ds,
         origin_idx=origin_idx,
         min_detections=ba_frames,
-        max_detections=ba_frames * 2
+        max_detections=ba_frames * 2,
+        distortion_model=DEFAULT_DIST_MODEL
     )
 
     frame_idx = 0

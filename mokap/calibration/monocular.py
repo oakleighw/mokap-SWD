@@ -28,7 +28,8 @@ class MonocularCalibrationTool:
                  min_stack: int = 15,
                  max_stack: int = 100,
                  focal_mm: Optional[int] = None,
-                 sensor_size: Optional[Union[Tuple[float], str]] = None
+                 sensor_size: Optional[Union[Tuple[float], str]] = None,
+                 distortion_model: Optional[DistortionModel] = 'standard',
                  ):
 
         if calibration_board.type == 'chessboard':
@@ -37,6 +38,8 @@ class MonocularCalibrationTool:
             self.detector: CharucoDetector = CharucoDetector(calibration_board)
 
         self.calibration_board = calibration_board
+
+        self._distortion_model = distortion_model if distortion_model else 'standard'
 
         # TODO: grid parameters should be configurable from the config file
         self._nb_grid_cells: int = 15
@@ -347,7 +350,7 @@ class MonocularCalibrationTool:
 
     def compute_intrinsics(self,
                            fix_aspect_ratio:    bool = True,
-                           distortion_model:    DistortionModel = 'standard',
+                           distortion_model:    Optional[DistortionModel] = 'standard',   # Optional override
                            keep_stacks:         bool = False
         ) -> bool:
         """ Compute the camera intrinsics using the accumulated samples """
@@ -362,7 +365,7 @@ class MonocularCalibrationTool:
             image_size_wh=(self._img_w, self._img_h),
             initial_K=self._K,
             initial_D=self._D,
-            distortion_model=distortion_model,
+            distortion_model=distortion_model if distortion_model else self._distortion_model,
             fix_aspect_ratio=fix_aspect_ratio and (self._K is not None)
         )
 
