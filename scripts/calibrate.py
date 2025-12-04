@@ -427,6 +427,11 @@ if __name__ == "__main__":
     parser.add_argument("--coverage", type=float, default=70.0, help="Min coverage %")
     parser.add_argument("--samples", type=int, default=30, help="Min samples")
 
+    parser.add_argument("--coverage_intrinsics", type=float, required=False, default=None, help="Min coverage % (intrinsics only)")
+    parser.add_argument("--coverage_extrinsics", type=float, required=False, default=None, help="Min coverage % (extrinsics only)")
+    parser.add_argument("--samples_intrinsics", type=int, required=False, default=None, help="Min samples (intrinsics only)")
+    parser.add_argument("--samples_extrinsics", type=int, required=False, default=None, help="Min samples (extrinsics only)")
+
     args = parser.parse_args()
 
     target_folder = Path(args.folder)
@@ -438,8 +443,8 @@ if __name__ == "__main__":
         success = run_intrinsics(
             target_folder,
             step=args.step,
-            min_coverage=args.coverage,
-            min_samples=args.samples
+            min_coverage=args.coverage_intrinsics if args.coverage_intrinsics else args.coverage,
+            min_samples=args.samples_intrinsics if args.samples_intrinsics else args.samples
         )
         if not success and args.mode == "both":
             print("Intrinsics failed or were not saved. Aborting Extrinsics.")
@@ -450,6 +455,6 @@ if __name__ == "__main__":
             target_folder,
             step=args.step,
             origin_cam=args.origin,
-            min_coverage=args.coverage,
-            min_samples=args.samples
+            min_coverage=args.coverage_extrinsics if args.coverage_extrinsics else args.coverage,
+            min_samples=args.samples_extrinsics if args.samples_extrinsics else args.samples
         )
