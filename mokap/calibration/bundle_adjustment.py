@@ -73,12 +73,11 @@ def _get_parameter_spec(
         nb_points:                int,
         nb_points_to_optim:       int,
         origin_idx:               int,
-        fix_cameras_intrinsics:   bool,
-        fix_cameras_extrinsics:   bool,
+        fix_intrinsics:   bool,
+        fix_extrinsics:   bool,
         fix_object_points:        bool,
         fix_poses:                bool,
         fix_aspect_ratio:         bool,
-        time_independent_points:  bool,
         shared_intrinsics:        bool,
         distortion_model:         DistortionModel
 ) -> Dict:
@@ -94,7 +93,7 @@ def _get_parameter_spec(
     nb_intr_sets = 1 if is_shared else nb_cams
 
     # Cameras intrinsics
-    if not fix_cameras_intrinsics:
+    if not fix_intrinsics:
         # Camera matrix params (f, cx, cy) or (fx, fy, cx, cy)
         size_per_set = 3 if fix_aspect_ratio else 4
         size_cam_mat = size_per_set * nb_intr_sets
@@ -110,7 +109,7 @@ def _get_parameter_spec(
             current_offset += size_dist
 
     # Camera extrinsics
-    if not fix_cameras_extrinsics:
+    if not fix_extrinsics:
         # We optimize for all cameras except the origin camera
         nb_optim_cams = nb_cams - 1
         size = 6 * nb_optim_cams  # 6 params (3 rvec, 3 tvec) per camera
@@ -247,7 +246,7 @@ def _get_bounds(
     upper_bounds = np.full(spec['total_size'], np.inf, dtype=np.float64)
 
     # Set bounds for camera intrinsics
-    if not cfg['fix_cameras_intrinsics']:
+    if not cfg['fix_intrinsics']:
         for i in range(nb_intr_sets):
             cam_idx = 0 if is_shared else i
             h, w = images_sizes_hw[cam_idx]
@@ -329,7 +328,7 @@ def _pack_params(
     # Cameras intrinsics
     fixed_params['K_init'] = K
     fixed_params['D_init'] = D
-    if not cfg['fix_cameras_intrinsics']:
+    if not cfg['fix_intrinsics']:
         if cfg['fix_aspect_ratio']:
             f = (K[:, 0, 0] + K[:, 1, 1]) * 0.5
             fp_block = jnp.column_stack([f, K[:, 0, 2], K[:, 1, 2]])
@@ -402,7 +401,7 @@ def _unpack_params(
     K_out = fixed_params.get('K', jnp.zeros((C, 3, 3), dtype=x.dtype))
     D_out = fixed_params.get('D', jnp.zeros((C, 8), dtype=x.dtype))
 
-    if not cfg['fix_cameras_intrinsics']:
+    if not cfg['fix_intrinsics']:
         info_mat = spec['blocks']['cam_mat']
         fp_flat = x[info_mat['offset']: info_mat['offset'] + info_mat['size']]
 
@@ -721,7 +720,7 @@ def cost_function(
         all_residuals.extend([rvec_resid, tvec_resid])
 
     # Cameras intrinsics priors
-    if not cfg['fix_cameras_intrinsics']:
+    if not cfg['fix_intrinsics']:
         is_shared = cfg['shared_intrinsics'] and cfg['nb_cams'] > 1
         if is_shared:
             # When shared, we optimized a single set - compare to mean of initial values
@@ -846,12 +845,11 @@ def run_bundle_adjustment(
         visibility_mask:            jnp.ndarray,
         object_points_initial:      Optional[jnp.ndarray] = None,
         object_poses_initial:       Optional[jnp.ndarray] = None,
-        fix_cameras_intrinsics:     bool = False,
-        fix_cameras_extrinsics:     bool = False,
+        fix_intrinsics:     bool = False,
+        fix_extrinsics:     bool = False,
         fix_object_points:          bool = False,
         fix_poses:                  bool = True,
         fix_aspect_ratio:           bool = False,
-        time_independent_points:    bool = False,
         origin_idx:                 int = 0,
         priors:                     Optional[Dict] = None,
         radial_penalty:             float = 2.0,
@@ -902,12 +900,11 @@ def run_bundle_adjustment(
             nb_points=N,  # N is the number of points *per frame*
             nb_points_to_optim=nb_points_to_optim,  # This is the total number of 3D variables
             origin_idx=origin_idx,
-            fix_cameras_intrinsics=fix_cameras_intrinsics,
-            fix_cameras_extrinsics=fix_cameras_extrinsics,
+            fix_intrinsics=fix_intrinsics,
+            fix_extrinsics=fix_extrinsics,
             fix_object_points=fix_object_points,
             fix_poses=fix_poses,
             fix_aspect_ratio=fix_aspect_ratio,
-            time_independent_points=time_independent_points,
             shared_intrinsics=shared_intrinsics,
             distortion_model=distortion_model
         )
@@ -929,7 +926,7 @@ def run_bundle_adjustment(
         use_intrinsics_prior = prior_weight_f > 0.0 or prior_weight_c > 0.0 or prior_weight_d > 0.0
 
         # Prepare and pad distortion coefficients if necessary
-        if not fix_cameras_intrinsics:
+        if not fix_intrinsics:
             n_d = spec['config']['n_d']
             current_d = D_initial.shape[1]
 

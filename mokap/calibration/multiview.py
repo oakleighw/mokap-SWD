@@ -439,11 +439,10 @@ class MultiviewCalibrationTool:
                     object_points_initial=self._object_points,
                     object_poses_initial=poses_T_initial,
 
-                    fix_cameras_intrinsics=False,
-                    fix_cameras_extrinsics=False,
+                    fix_intrinsics=False,
+                    fix_extrinsics=False,
                     fix_object_points=True,  # The board's shape is known and rigid
                     fix_poses=False,  # The board's pose is being optimized
-                    time_independent_points=False,  # It's the same board over time
 
                     # Stage 1 specific flags
                     shared_intrinsics=True,     # Forces a single camera model for all views
@@ -483,11 +482,10 @@ class MultiviewCalibrationTool:
                     object_poses_initial=poses_T_s2_init,
 
                     # BA logic control flags
-                    fix_cameras_intrinsics=False,
-                    fix_cameras_extrinsics=False,
+                    fix_intrinsics=False,
+                    fix_extrinsics=False,
                     fix_object_points=True,
                     fix_poses=False,
-                    time_independent_points=False,
 
                     # Stage 2 specific flags
                     shared_intrinsics=False,    # We now optimize per-camera intrinsics
@@ -526,11 +524,10 @@ class MultiviewCalibrationTool:
                     object_poses_initial=poses_T_s3_init,
 
                     # BA logic control flags
-                    fix_cameras_intrinsics=False,
-                    fix_cameras_extrinsics=False,
+                    fix_intrinsics=False,
+                    fix_extrinsics=False,
                     fix_object_points=True,
                     fix_poses=False,
-                    time_independent_points=False,
 
                     # Stage 3 specific flags
                     shared_intrinsics=False,
@@ -654,13 +651,13 @@ class MultiviewCalibrationTool:
                 per_point_errors=True   # to get the distances for volume of trust calculation
             )
             # Extract per-point Euclidean distances
-            points_errors = errors_dict['per_point']
+            points_errors = errors_dict['mre_per_point']
 
             # And compute the reliable bounding box using the world points and their errors
             volume_of_trust = compute_bounds(
                 world_pts_all_instances,
                 points_errors,
-                error_threshold_px=threshold,
+                error_threshold=threshold,
                 iqr_factor=iqr_factor
             )
 
