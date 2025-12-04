@@ -21,19 +21,20 @@ logger = logging.getLogger(__name__)
 
 
 class MultiviewCalibrationTool:
-    def __init__(self,
-                 nb_cameras:            int,
-                 images_sizes_hw:       ArrayLike,
-                 origin_idx:            int,
-                 K_init:                ArrayLike,
-                 D_init:                ArrayLike,
-                 object_points:         ArrayLike,
-                 min_detections:        int = 100,
-                 max_detections:        int = 100,
-                 angular_thresh:        float = 10.0,  # in degrees
-                 translational_thresh:  float = 10.0,  # in object_points' units
-                 distortion_model: DistortionModel = 'standard'
-                 ):
+    def __init__(
+            self,
+            nb_cameras:            int,
+            images_sizes_hw:       ArrayLike,
+            origin_idx:            int,
+            K_init:                ArrayLike,
+            D_init:                ArrayLike,
+            object_points:         ArrayLike,
+            min_detections:        int = 100,
+            max_detections:        int = 100,
+            angular_thresh:        float = 10.0,  # in degrees
+            translational_thresh:  float = 10.0,  # in object_points' units
+            distortion_model: DistortionModel = 'standard'
+        ):
 
         self.nb_cameras = nb_cameras
         self.origin_idx = origin_idx
@@ -330,8 +331,8 @@ class MultiviewCalibrationTool:
         # Priors weights to prevent the BA from overfittign
         priors_stage1 = {
             'intrinsics': {
-                'focal_length': 0.1,    # weak, just to prevent the *average* focal length from drifting into nonsense
-                'principal_point': 5.0, # This can be quite strong, most modern lenses have it very close to the centre
+                'focal_length': 0.1,  # weak, just to prevent the *average* focal length from drifting into nonsense
+                'principal_point': 5.0,  # This can be quite strong, most modern lenses have it very close to the centre
                 'distortion': 0.0
             },
             'extrinsics': {
@@ -345,7 +346,7 @@ class MultiviewCalibrationTool:
                 'principal_point': 0.1, # weak, but still here to keep the principal point near the image center
                 'distortion': 0.5       # medium, keeps the initial distortion terms small and well-behaved
             },
-            'extrinsics': {             # extrinsics priors off
+            'extrinsics': {  # extrinsics priors off
                 'rotation': 0.0,
                 'translation': 0.0
             }
@@ -375,8 +376,6 @@ class MultiviewCalibrationTool:
                 logger.info(f"[BA] Attempting Bundle Adjustment with {current_P} samples.")
 
                 current_samples = list(self.ba_samples)[-current_P:]
-
-                # --------Prepare the data-----------
 
                 pts2d_buf = np.zeros((C, current_P, N, 2), dtype=np.float32)
                 vis_buf = np.zeros((C, current_P, N), dtype=bool)
@@ -618,10 +617,11 @@ class MultiviewCalibrationTool:
     def image_points(self):
         return self._points2d, self._visibility_mask
 
-    def volume_of_trust(self,
-            threshold:  float = 1.0,
+    def volume_of_trust(
+            self,
+            threshold: float = 1.0,
             iqr_factor: float = 1.5
-    ) -> Optional[Dict[str, Tuple[float, float]]]:
+        ) -> Optional[Dict[str, Tuple[float, float]]]:
 
         if self._refined:
             # calculate the 3D world coordinates of all point instances using the refined poses
@@ -647,14 +647,19 @@ class MultiviewCalibrationTool:
 
             effective_visibility = visibility_mask * valid_depth_mask
 
-            # Compute the raw per-point Euclidean distance errors
-            raw_errors = xp.linalg.norm(observed_pts2d - reprojected_pts, axis=-1)
-            all_errors = xp.where(effective_visibility, raw_errors, xp.nan)    # and mark non-observed points as nan
+            errors_dict = reprojection_errors(
+                observed_pts2d,
+                reprojected_pts,
+                effective_visibility,
+                per_point_errors=True   # to get the distances for volume of trust calculation
+            )
+            # Extract per-point Euclidean distances
+            points_errors = errors_dict['per_point']
 
             # And compute the reliable bounding box using the world points and their errors
             volume_of_trust = compute_bounds(
                 world_pts_all_instances,
-                all_errors,
+                points_errors,
                 error_threshold_px=threshold,
                 iqr_factor=iqr_factor
             )

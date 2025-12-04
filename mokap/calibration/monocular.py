@@ -12,7 +12,7 @@ from mokap.calibration.detectors import ChessboardDetector, CharucoDetector
 from mokap.utils.datatypes import ChessBoard, CharucoBoard, DistortionModel
 from mokap.utils import SENSOR_SIZES, estimate_camera_matrix
 
-from mokap.geometry import project, compose_transform_matrix, decompose_transform_matrix
+from mokap.geometry import project, decompose_transform_matrix
 
 logger = logging.getLogger(__name__)
 
@@ -46,7 +46,7 @@ class MonocularCalibrationTool:
         self._cells_gamma: float = 2.0
         self._min_cells_weight: float = 0.25  # cells at centre get ~ min weight and cells at the edge get ~ 1.0
 
-        self._min_pts = 6   # DLT algorithm in calibrateCamera fails if less than 6 points
+        self._min_pts = 6  # DLT algorithm in calibrateCamera fails if less than 6 points
         self._min_stack: int = min_stack
         self._max_stack: int = max_stack
 
@@ -71,10 +71,11 @@ class MonocularCalibrationTool:
         self.stack_points2d: deque = deque(maxlen=self._max_stack)
         self.stack_pointsIDs: deque = deque(maxlen=self._max_stack)
 
-        # Error metrics
-        # The raw OpenCV errors for comparing future calibrations
-        self._intrinsics_errors_opencv: np.ndarray = np.array([np.inf])
-        # Also store the true RMS for comparison with other parts of the app
+        # Error metrics:
+
+        # Component RMS as returned directly by OpenCV
+        self._component_rmse: np.ndarray = np.array([np.inf])
+        # The true Euclidean RMS
         self._intrinsics_errors_rms: np.ndarray = np.array([np.inf])
 
         # Euclidean RMS error (PnP pose error)
@@ -108,7 +109,7 @@ class MonocularCalibrationTool:
                 f_mm=focal_mm,
                 image_wh_px=(self._img_w, self._img_h),
                 sensor_wh_mm=self._cam_sensor_size,
-                pixel_pitch_um=None             # TODO: probably better to use this instead of sensor size
+                pixel_pitch_um=None  # TODO: probably better to use this instead of sensor size
             )
 
             self._K_est = np.asarray(K_est)
@@ -120,8 +121,10 @@ class MonocularCalibrationTool:
 
         self._img_h, self._img_w = imsize_hw[:2]
 
-        self._grid_shape = np.array([self._nb_grid_cells, int(np.round((self._img_w / self._img_h) * self._nb_grid_cells))],
-                                    dtype=np.uint32)
+        self._grid_shape = np.array(
+            [self._nb_grid_cells, int(np.round((self._img_w / self._img_h) * self._nb_grid_cells))],
+            dtype=np.uint32)
+
         self._cumul_grid = np.zeros(self._grid_shape, dtype=bool)  # Keeps the total covered area
         self._temp_grid = np.zeros(self._grid_shape, dtype=bool)  # buffer reset at each new sample
 
@@ -219,12 +222,14 @@ class MonocularCalibrationTool:
         self._D = np.asarray(np.pad(D, (0, max(0, 8 - len(D))), 'constant', constant_values=0.0))
 
         if errors is not None:
-            # Store the raw OpenCV errors for internal comparison
-            self._intrinsics_errors_opencv = np.asarray(errors)
-            # Store the standardized RMS error for external reporting
-            self._intrinsics_errors_rms = self._intrinsics_errors_opencv / np.sqrt(2)
+            # Errors coming from calibrate_camera_robust are Euclidean RMS
+            self._intrinsics_errors_rms = np.asarray(errors)
+
+            # Store the raw OpenCV (Component) errors by reversing the factor
+            # (only if we need them for direct comparison with other opencv tools)
+            self._component_rmse = self._intrinsics_errors_rms / np.sqrt(2.0)
         else:
-            self._intrinsics_errors_opencv = np.array([np.inf])
+            self._component_rmse = np.array([np.inf])
             self._intrinsics_errors_rms = np.array([np.inf])
 
     def clear_intrinsics(self):
@@ -237,7 +242,7 @@ class MonocularCalibrationTool:
             self._K = None
             self._D = None
 
-        self._intrinsics_errors_opencv = np.array([np.inf])
+        self._component_rmse = np.array([np.inf])
         self._intrinsics_errors_rms = np.array([np.inf])
 
     @staticmethod
@@ -349,10 +354,11 @@ class MonocularCalibrationTool:
 
         return False
 
-    def compute_intrinsics(self,
-                           fix_aspect_ratio:    bool = True,
-                           distortion_model:    Optional[DistortionModel] = 'standard',   # Optional override
-                           keep_stacks:         bool = False
+    def compute_intrinsics(
+            self,
+            fix_aspect_ratio: bool = True,
+            distortion_model: Optional[Union[DistortionModel, str]] = 'standard',  # Optional override
+            keep_stacks: bool = False
         ) -> bool:
         """ Compute the camera intrinsics using the accumulated samples """
 
@@ -373,24 +379,28 @@ class MonocularCalibrationTool:
         if not calib_results.success:
             return False
 
-        # Get the raw per-view errors from OpenCV
-        pve_opencv = calib_results.per_view_errors
-
         # We don't have intrinsics yet
-        if not self.has_intrinsics or np.inf in self._intrinsics_errors_opencv:
-            self.set_intrinsics(calib_results.K_new, calib_results.D_new, pve_opencv)
+        if not self.has_intrinsics or np.inf in self._intrinsics_errors_rms:
+
+            self.set_intrinsics(calib_results.K_new,
+                                calib_results.D_new,
+                                calib_results.rms_per_view)
+
             logger.info(f"[MonocularCalibrationTool] Computed intrinsics.")
 
-        # Decide whether to accept the new intrinsics or not by comparing the raw OpenCV errors
-        elif self._check_new_errors(pve_opencv, self._intrinsics_errors_opencv):
-            self.set_intrinsics(calib_results.K_new, calib_results.D_new, pve_opencv)
+        # Decide whether to accept the new intrinsics or not by comparing errors
+        elif self._check_new_errors(calib_results.rms_per_view, self._intrinsics_errors_rms):
+
+            self.set_intrinsics(calib_results.K_new,
+                                calib_results.D_new,
+                                calib_results.rms_per_view)
+
             logger.info(f"[MonocularCalibrationTool] Updated intrinsics.")
 
-        # Default to clear on success only, unless asked not to
         if calib_results.success and not keep_stacks:
             self.clear_stacks()
 
-        # if failure, keep stacks by default
+        # if failure, keep stacks
         return True
 
     def compute_extrinsics(self, refine: bool = True) -> bool:
@@ -432,7 +442,7 @@ class MonocularCalibrationTool:
         return True
 
     def reproject(self) -> Optional[ArrayLike]:
-        """ Reprojects board points to the image plane for visualisation or error computation """
+        """ Reprojects board points to the image plane for visualisation """
 
         if not self.has_intrinsics or not self.has_extrinsics:
             return None

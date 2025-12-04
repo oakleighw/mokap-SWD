@@ -702,6 +702,7 @@ def reprojection_errors(
         points2d_observed: xp.ndarray,
         points2d_reprojected: xp.ndarray,
         visibility_mask: Optional[xp.ndarray] = None,
+        per_view_errors: bool = False,
         per_point_errors: bool = False
 ) -> Dict[str, Union[float, xp.ndarray]]:
     """
@@ -711,44 +712,47 @@ def reprojection_errors(
         points2d_observed: Observed 2D image points (..., N, 2)
         points2d_reprojected: Reprojected 2D image points (..., N, 2)
         visibility_mask: Boolean mask of visible points (..., N)
+        per_point_errors: If True, include 'rms_per_view' and 'mre_per_view' in output
         per_point_errors: If True, include 'mre_per_point' in output
 
     Returns:
-        Dictionary with 'rms_euclidean' (also aliased to 'rms'), 'rms_component', 'mre', and optionally 'mre_per_point'
+        Dictionary with 'rms' (also aliased to 'rms_euclidean'), 'rms_component', 'mre',
+        and optional per-point ('mre_per_point') and per-view errors ('rms_per_view', 'mre_per_view').
     """
 
     sq_diff = xp.square(points2d_observed - points2d_reprojected)
 
     if visibility_mask is not None:
+        # Mask out invalid points in the sum
         sq_diff_masked = xp.where(visibility_mask[..., None], sq_diff, 0.0)
-        nb_visible_points = xp.sum(visibility_mask.astype(xp.float32))
+        count_per_view = xp.sum(visibility_mask.astype(xp.float32), axis=-1)
     else:
         sq_diff_masked = sq_diff
-        nb_visible_points = points2d_observed.size // 2  # last dimension is 2, so number of points is total size / 2
+        # All points are valid
+        N = points2d_observed.shape[-2]
+        batch_shape = points2d_observed.shape[:-2]
+        count_per_view = xp.full(batch_shape, N, dtype=xp.float32)
 
-    # Metric calculations:
+    # Global metrics (aggregated over all dimensions)
+    total_sse = xp.sum(sq_diff_masked)
+    total_count = xp.sum(count_per_view)
+    safe_total_count = xp.maximum(total_count, 1.0)
 
     # Component RMS error: x and y treated as two independent observations.
     # Divisor is 2*N
     # This matches what cv2.CalibrateCamera() returns as the global RMS
-    total_sum_sq_err = xp.sum(sq_diff_masked)
-    rms_component = xp.sqrt(total_sum_sq_err / xp.maximum(2 * nb_visible_points, 1))
-
-    # Mean Reprojection Error (MRE): Average pixel distance
-    # This is the human-friendly one
-    dists = xp.sqrt(xp.sum(sq_diff, axis=-1))  # unmasked distances for per-point analysis
-
-    if visibility_mask is not None:
-        dists_masked = xp.where(visibility_mask, dists, 0.0)
-    else:
-        dists_masked = dists
-    mre = xp.sum(dists_masked) / xp.maximum(nb_visible_points, 1)
+    rms_component = xp.sqrt(total_sse / (2.0 * safe_total_count))
 
     # Euclidean RMS error: Standard RMS. Strictly related to MRE but penalizes outliers more.
     # Divisor is N
     # This is the one used in PnP
-    mean_sq_per_coord = xp.sum(sq_diff_masked, axis=-2) / xp.maximum(nb_visible_points, 1)
-    rms_euclidean = xp.sqrt(xp.sum(mean_sq_per_coord))
+    rms_euclidean = xp.sqrt(total_sse / safe_total_count)
+
+    # Mean Reprojection Error (MRE): Average pixel distance
+    # This is the human-friendly one
+    dist_per_point = xp.sqrt(xp.sum(sq_diff, axis=-1))  # (..., N)
+    dist_masked = xp.where(visibility_mask, dist_per_point, 0.0) if visibility_mask is not None else dist_per_point
+    mre = xp.sum(dist_masked) / safe_total_count
 
     results = {
         'rms_component': rms_component, # Matches calibrateCamera() return value
@@ -756,6 +760,31 @@ def reprojection_errors(
         'mre': mre,                     # Best for humans-readable report
         'rms': rms_euclidean            # just an alias
     }
+
+    # Per-point errors (optional)
     if per_point_errors:
-        results['mre_per_point'] = xp.where(visibility_mask, dists, xp.nan) if visibility_mask is not None else dists
+        # For a single point, Euclidean RMS and MRE are the same thing
+        if visibility_mask is not None:
+            results['mre_per_point'] = xp.where(visibility_mask, dist_per_point, xp.nan)
+        else:
+            results['mre_per_point'] = dist_per_point
+
+    # Per-view errors (optional)
+    if per_view_errors:
+        # Aggregating over the points axis (-2)
+        safe_view_count = xp.maximum(count_per_view, 1.0) # to handle views with 0 valid points to avoid div/0
+        # Sum of squared errors per view
+        sse_per_view = xp.sum(xp.sum(sq_diff_masked, axis=-1), axis=-1)  # (...,)
+
+        # Euclidean RMS per view
+        rms_per_view = xp.sqrt(sse_per_view / safe_view_count)
+
+        valid_view_mask = count_per_view > 0  # mask out views that had 0 points
+        results['rms_per_view'] = xp.where(valid_view_mask, rms_per_view, xp.nan)
+
+        # MRE per view
+        sum_dist_per_view = xp.sum(dist_masked, axis=-1)
+        mre_per_view = sum_dist_per_view / safe_view_count
+        results['mre_per_view'] = xp.where(valid_view_mask, mre_per_view, xp.nan)
+
     return results
