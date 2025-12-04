@@ -52,9 +52,6 @@ from .projective import (
     unproject,
     pixels_to_rays,
 
-    # Metrics
-    reprojection_errors,
-
     # Triangulation
     triangulate,
     triangulate_from_projections,
@@ -87,5 +84,6 @@ from .fitting import (
 
     # Others
     flip_transform_180,
-    flip_rotation_180
+    flip_rotation_180,
+    reprojection_errors
 )

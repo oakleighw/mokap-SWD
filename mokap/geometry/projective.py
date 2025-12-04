@@ -1,7 +1,7 @@
 from functools import partial
-from typing import Tuple, Union, Optional, Dict
+from typing import Tuple, Union, Optional
 
-from mokap.geometry.backend import xp, jit, lax, _eps, _tiny, align_batch_dims
+from mokap.geometry.backend import xp, jit, lax, _tiny, align_batch_dims
 from mokap.geometry import projection_matrix, invert_intrinsics, homogenize, dehomogenize
 
 @jit
@@ -534,62 +534,6 @@ def unproject(
     world_pts = xp.einsum('...ij,...j->...i', T_c2w[..., :3, :], hom_cam)
 
     return world_pts
-
-
-@partial(jit, static_argnames=['per_point_errors'])
-def reprojection_errors(
-        points2d_observed: xp.ndarray,
-        points2d_reprojected: xp.ndarray,
-        visibility_mask: Optional[xp.ndarray] = None,
-        per_point_errors: bool = False
-) -> Dict[str, Union[float, xp.ndarray]]:
-    """
-    Calculates various reprojection error metrics.
-
-    Args:
-        points2d_observed: Observed 2D image points (..., N, 2)
-        points2d_reprojected: Reprojected 2D image points (..., N, 2)
-        visibility_mask: Boolean mask of visible points (..., N)
-        per_point_errors: If True, include 'mre_per_point' in output
-
-    Returns:
-        Dictionary with 'rms', 'mre', 'opencv_rms', and optionally 'mre_per_point'
-    """
-
-    sq_diff = xp.square(points2d_observed - points2d_reprojected)
-
-    if visibility_mask is not None:
-        # Use where to avoid nans in gradients if they were to be used
-        sq_diff_masked = xp.where(visibility_mask[..., None], sq_diff, 0.0)
-        num_visible_points = xp.sum(visibility_mask.astype(xp.float32))
-    else:
-        sq_diff_masked = sq_diff
-        num_visible_points = points2d_observed.size // 2  # last dimension is 2, so number of points is total size / 2
-
-    # Metric calculations
-    # True RMS Error (of all 2*N coordinates)
-    total_sum_sq_err = xp.sum(sq_diff_masked)
-    rms_error = xp.sqrt(total_sum_sq_err / xp.maximum(2 * num_visible_points, 1))
-
-    # Mean Reprojection Error (MRE - mean of per-point distances)
-    distances = xp.sqrt(xp.sum(sq_diff, axis=-1))  # unmasked distances for per-point analysis
-
-    if visibility_mask is not None:
-        dist_masked = xp.where(visibility_mask, distances, 0.0)
-    else:
-        dist_masked = distances
-    mre_error = xp.sum(dist_masked) / xp.maximum(num_visible_points, 1)
-
-    # OpenCV 'calibrateCamera'-style RMS
-    mean_sq_per_coord = xp.sum(sq_diff_masked, axis=-2) / xp.maximum(num_visible_points, 1)
-    opencv_rms_error = xp.sqrt(xp.sum(mean_sq_per_coord))
-
-    results = {'rms': rms_error, 'mre': mre_error, 'opencv_rms': opencv_rms_error}
-
-    if per_point_errors:
-        results['mre_per_point'] = xp.where(visibility_mask, distances,
-                                            xp.nan) if visibility_mask is not None else distances
-    return results
 
 
 @partial(jit, static_argnames=['lambda_reg'])

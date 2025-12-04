@@ -128,7 +128,7 @@ if __name__ == "__main__":
         points3d, T_w2c, K, D, distortion_model='standard'
     )
 
-    err_metrics = reprojection_errors(
+    error_dict = reprojection_errors(
         points2d_observed=points2d_frame,
         points2d_reprojected=reproj_points,
         visibility_mask=vis_mask_frame,
@@ -136,7 +136,7 @@ if __name__ == "__main__":
     )
 
     # (C, N) array of Euclidean distances
-    per_point_dists = err_metrics['mre_per_point']
+    per_point_dists = error_dict['mre_per_point']
 
     # Per-camera stats
     camera_stats = {}

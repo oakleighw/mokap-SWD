@@ -77,7 +77,8 @@ class MonocularCalibrationTool:
         # Also store the true RMS for comparison with other parts of the app
         self._intrinsics_errors_rms: np.ndarray = np.array([np.inf])
 
-        self._pose_error: float = np.nan
+        # Euclidean RMS error (PnP pose error)
+        self._euclidean_rmse: float = np.nan
 
         self._K: Optional[np.ndarray] = None
         self._D: Optional[np.ndarray] = None
@@ -197,7 +198,7 @@ class MonocularCalibrationTool:
 
     @property
     def pose_error(self):
-        return self._pose_error
+        return self._euclidean_rmse
 
     @property
     def intrinsics_errors(self) -> np.ndarray:
@@ -398,7 +399,7 @@ class MonocularCalibrationTool:
         # we need a detection and to have intrinsics to be able to compute extrinsics
         if not self.has_detection or not self.has_intrinsics:
             self._curr_T_b2c = None
-            self._pose_error = np.nan
+            self._euclidean_rmse = np.nan
             return False
 
         if self.calibration_board.type == 'charuco':
@@ -407,12 +408,12 @@ class MonocularCalibrationTool:
             # if the points are collinear, extrinsics estimation is garbage, so abort
             if cv2.aruco.testCharucoCornersCollinear(self.calibration_board.to_opencv(), self._pointsIDs):
                 self._curr_T_b2c = None
-                self._pose_error = np.nan
+                self._euclidean_rmse = np.nan
                 return False
 
         object_points_subset = self.calibration_board.object_points[self._pointsIDs]
 
-        success, T_b2c, pose_errors = solve_pnp_robust(
+        success, T_b2c, errors_dict = solve_pnp_robust(
             points3d=object_points_subset,
             points2d=self._points2d,
             K=self._K,
@@ -422,11 +423,11 @@ class MonocularCalibrationTool:
 
         if not success:
             self._curr_T_b2c = None
-            self._pose_error = np.nan
+            self._euclidean_rmse = np.nan
             return False
 
         self._curr_T_b2c = T_b2c
-        self._pose_error = pose_errors['rms']
+        self._euclidean_rmse = errors_dict['rms_euclidean']
 
         return True
 

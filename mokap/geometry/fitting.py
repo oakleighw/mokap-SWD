@@ -1,5 +1,6 @@
 from functools import partial
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, Union
+
 try:
     from .backend import USE_JAX, xp, jit, lax, vmap, _tiny, align_batch_dims
     from .transforms import quaternion_distance, rotation_matrix, rotation_vector, homogenize
@@ -694,3 +695,67 @@ def fit_plane(
     normal = Vh[..., -1, :]
 
     return centroid, normal
+
+
+@partial(jit, static_argnames=['per_point_errors'])
+def reprojection_errors(
+        points2d_observed: xp.ndarray,
+        points2d_reprojected: xp.ndarray,
+        visibility_mask: Optional[xp.ndarray] = None,
+        per_point_errors: bool = False
+) -> Dict[str, Union[float, xp.ndarray]]:
+    """
+    Calculates various reprojection error metrics.
+
+    Args:
+        points2d_observed: Observed 2D image points (..., N, 2)
+        points2d_reprojected: Reprojected 2D image points (..., N, 2)
+        visibility_mask: Boolean mask of visible points (..., N)
+        per_point_errors: If True, include 'mre_per_point' in output
+
+    Returns:
+        Dictionary with 'rms_euclidean' (also aliased to 'rms'), 'rms_component', 'mre', and optionally 'mre_per_point'
+    """
+
+    sq_diff = xp.square(points2d_observed - points2d_reprojected)
+
+    if visibility_mask is not None:
+        sq_diff_masked = xp.where(visibility_mask[..., None], sq_diff, 0.0)
+        nb_visible_points = xp.sum(visibility_mask.astype(xp.float32))
+    else:
+        sq_diff_masked = sq_diff
+        nb_visible_points = points2d_observed.size // 2  # last dimension is 2, so number of points is total size / 2
+
+    # Metric calculations:
+
+    # Component RMS error: x and y treated as two independent observations.
+    # Divisor is 2*N
+    # This matches what cv2.CalibrateCamera() returns as the global RMS
+    total_sum_sq_err = xp.sum(sq_diff_masked)
+    rms_component = xp.sqrt(total_sum_sq_err / xp.maximum(2 * nb_visible_points, 1))
+
+    # Mean Reprojection Error (MRE): Average pixel distance
+    # This is the human-friendly one
+    dists = xp.sqrt(xp.sum(sq_diff, axis=-1))  # unmasked distances for per-point analysis
+
+    if visibility_mask is not None:
+        dists_masked = xp.where(visibility_mask, dists, 0.0)
+    else:
+        dists_masked = dists
+    mre = xp.sum(dists_masked) / xp.maximum(nb_visible_points, 1)
+
+    # Euclidean RMS error: Standard RMS. Strictly related to MRE but penalizes outliers more.
+    # Divisor is N
+    # This is the one used in PnP
+    mean_sq_per_coord = xp.sum(sq_diff_masked, axis=-2) / xp.maximum(nb_visible_points, 1)
+    rms_euclidean = xp.sqrt(xp.sum(mean_sq_per_coord))
+
+    results = {
+        'rms_component': rms_component, # Matches calibrateCamera() return value
+        'rms_euclidean': rms_euclidean, # Matches typical PnP expectation
+        'mre': mre,                     # Best for humans-readable report
+        'rms': rms_euclidean            # just an alias
+    }
+    if per_point_errors:
+        results['mre_per_point'] = xp.where(visibility_mask, dists, xp.nan) if visibility_mask is not None else dists
+    return results

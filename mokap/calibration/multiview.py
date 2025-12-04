@@ -242,18 +242,21 @@ class MultiviewCalibrationTool:
         effective_visibility = visibility_mask * reproj_mask
 
         errors_dict = reprojection_errors(gt_points_padded, reproj_pts, effective_visibility)
-        mean_frame_error = errors_dict['rms']
+        frame_rms_euclidean = errors_dict['rms_euclidean']
 
         FRAME_ERROR_THRESHOLD = 5.0
-        if mean_frame_error > FRAME_ERROR_THRESHOLD:
-            logger.debug(f"[QUALITY_REJECT] Frame rejected. High reproj error: {mean_frame_error:.2f}px")
+        if frame_rms_euclidean > FRAME_ERROR_THRESHOLD:
+            logger.debug(f"[QUALITY_REJECT] Frame rejected. High Euclidean RMS Error: {frame_rms_euclidean:.2f}px")
+
             # if the frame is bad, we should not have added it to the history. So we dump it. TODO: that's a bit suboptimal but that'll do for now
             if len(self._board_pose_history) > 0 and xp.all(self._board_pose_history[-1] == T_b2w):
                 self._board_pose_history.pop()
+
             self._latest_board_pose_w = None
+
             return
 
-        logger.debug(f"[ACCEPTED] Frame mean: {mean_frame_error:.2f} px.")
+        logger.debug(f"[ACCEPTED] Frame Euclidean RMS: {frame_rms_euclidean:.2f} px.")
 
         # Commit the new extrinsics to the main state for all cameras in this frame
         for i, cam_idx in enumerate(cam_indices):
@@ -273,7 +276,7 @@ class MultiviewCalibrationTool:
             return
 
         # Reestimate the board-to-camera pose and validate it
-        success, T_b2c, pose_errors = solve_pnp_robust(
+        success, T_b2c, errors_dict = solve_pnp_robust(
             points3d=self._object_points[detection.pointsIDs],
             points2d=detection.points2D,
             K=self._K[cam_idx],

@@ -154,14 +154,14 @@ def solve_pnp_robust(
     reproj, _ = project(points3d_xp, T, K_xp, D_xp)
     reproj_flip, _ = project(points3d_xp, T_flip, K_xp, D_xp)
 
-    reproj_err = reprojection_errors(points2d_xp, reproj)
-    reproj_err_flip = reprojection_errors(points2d_xp, reproj_flip)
+    errors_dict = reprojection_errors(points2d_xp, reproj)
+    errors_dict_flip = reprojection_errors(points2d_xp, reproj_flip)
 
-    if reproj_err['rms'] <= reproj_err_flip['rms']:
-        best_error = reproj_err
+    if errors_dict['rms_euclidean'] <= errors_dict_flip['rms_euclidean']:
+        best_error = errors_dict
     else:
         best_rvec = np.asarray(rvec_flip_xp)
-        best_error = reproj_err_flip
+        best_error = errors_dict_flip
 
     if refine_method and refine_method.lower() != 'none':
         try:
@@ -188,18 +188,18 @@ def solve_pnp_robust(
 
     if best_error is None:
         if points2d_xp is None or points3d_xp is None or K is None or D is None:
-            # TODO: is this possible here?
+            # TODO: can these still be None at this point?
             points2d_xp = xp.asarray(points2d)
             points3d_xp = xp.asarray(points3d)
             K_xp = xp.asarray(K)
             D_xp = xp.asarray(D)
         final_reproj, _ = project(points3d_xp, T_final, K_xp, D_xp)
-        final_errors = reprojection_errors(points2d_xp, final_reproj)
+        errors_dict_final = reprojection_errors(points2d_xp, final_reproj)
     else:
         # otherwise, the one we stored is the correct one
-        final_errors = best_error
+        errors_dict_final = best_error
 
-    return True, T_final, final_errors
+    return True, T_final, errors_dict_final
 
 
 def calibrate_camera_robust(
