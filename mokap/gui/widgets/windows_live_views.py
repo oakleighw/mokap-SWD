@@ -14,7 +14,7 @@ from mokap.gui.widgets.widgets_base import LiveViewBase, FastImageItem
 from mokap.gui.workers.worker_monocular import MonocularWorker
 from mokap.gui.workers.worker_movement import MovementWorker
 from mokap.utils import pretty_microseconds
-from mokap.utils.datatypes import (ErrorsPayload, CalibrationData, IntrinsicsPayload, ExtrinsicsPayload,
+from mokap.utils.datatypes import (PerViewErrorsPayload, CalibrationData, IntrinsicsPayload, ExtrinsicsPayload,
                                    DetectionPayload, ReprojectionPayload, CoveragePayload)
 
 
@@ -777,9 +777,10 @@ class CalibrationLiveView(LiveViewBase):
 
             return
 
-        if isinstance(payload, ErrorsPayload):
+        if isinstance(payload, PerViewErrorsPayload):
+
             # this is a historical calibration result
-            errors = np.asarray(payload.errors)
+            errors = np.asarray(payload.per_view_rmse)
             if not np.all(np.isfinite(errors)):
                 return
 
@@ -802,7 +803,7 @@ class CalibrationLiveView(LiveViewBase):
         elif isinstance(payload, ExtrinsicsPayload):
             # This is a live, per-frame error update
             # pyqtgraph handles nans (with gaps) just fine when pose estimation fails
-            error_value = payload.error if payload.error is not None else np.nan
+            error_value = payload.pose_error if payload.pose_error is not None else np.nan
             self.live_error_deque.append(error_value)
             self.live_error_curve.setData(list(self.live_error_deque))
 

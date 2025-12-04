@@ -205,7 +205,7 @@ def solve_pnp_robust(
 def calibrate_camera_robust(
         board: Union[ChessBoard, CharucoBoard],
         image_points_stack: Sequence[np.ndarray],
-        image_ids_stack: Sequence[np.ndarray],
+        pointsIDs_stack: Sequence[np.ndarray],
         image_size_wh: Sequence[int],
         initial_K: Optional[ArrayLike] = None,
         initial_D: Optional[ArrayLike] = None,
@@ -240,7 +240,7 @@ def calibrate_camera_robust(
             (rms, K_new, D_new, rvecs, tvecs,
              std_intr, _, pve_opencv) = cv2.aruco.calibrateCameraCharucoExtended(
                 charucoCorners=image_points_stack,
-                charucoIds=image_ids_stack,
+                charucoIds=pointsIDs_stack,
                 board=board.to_opencv(),
                 imageSize=image_size_wh,
                 cameraMatrix=initial_K.copy() if initial_K is not None else None,

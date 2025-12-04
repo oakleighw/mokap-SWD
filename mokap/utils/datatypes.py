@@ -134,8 +134,8 @@ class CoveragePayload:
     total_points: int
 
 @dataclass
-class ErrorsPayload:
-    errors: Optional[ArrayLike] = None
+class PerViewErrorsPayload:
+    per_view_rmse: Optional[ArrayLike] = None  # Per-view Euclidean RMS Errors
 
 @dataclass
 class DetectionPayload:
@@ -151,19 +151,20 @@ class IntrinsicsPayload:
 
     camera_matrix: ArrayLike
     dist_coeffs: ArrayLike
-    errors: Optional[ArrayLike] = None
+    per_view_rmse: Optional[ArrayLike] = None  # Per-view Euclidean RMS Errors
 
     @classmethod
     def from_file(cls, filepath, camera_name: Optional[str] = None):
         params = fileio.read_parameters(filepath, camera_name)
-        return cls(camera_matrix=params['camera_matrix'], dist_coeffs=params['dist_coeffs'], errors=params.get('errors'))
+        per_view_rmse = params.get('errors')   # TODO: this key should be renamed in the toml
+        return cls(camera_matrix=params['camera_matrix'], dist_coeffs=params['dist_coeffs'], per_view_rmse=per_view_rmse)
 
 @dataclass
 class ExtrinsicsPayload:
 
     rvec: ArrayLike
     tvec: ArrayLike
-    error: Optional[float] = None
+    pose_error: Optional[float] = None  # Euclidean RMS Error for a single pose
 
     @classmethod
     def from_file(cls, filepath, camera_name: Optional[str] = None):
@@ -176,10 +177,11 @@ class CalibrationData:
     Encapsulation of a payload with the camera name
     """
     camera_name: str
-    payload: IntrinsicsPayload | ExtrinsicsPayload | DetectionPayload | ErrorsPayload | ReprojectionPayload | CoveragePayload
+    payload: IntrinsicsPayload | ExtrinsicsPayload | DetectionPayload | PerViewErrorsPayload | ReprojectionPayload | CoveragePayload
 
     def to_file(self, filepath):
         if isinstance(self.payload, IntrinsicsPayload):
-            fileio.write_intrinsics(filepath, self.camera_name, self.payload.camera_matrix, self.payload.dist_coeffs, self.payload.errors)
+            fileio.write_intrinsics(filepath, self.camera_name, self.payload.camera_matrix, self.payload.dist_coeffs, self.payload.per_view_rmse)
+
         elif isinstance(self.payload, ExtrinsicsPayload):
             fileio.write_extrinsics(filepath, self.camera_name, self.payload.rvec, self.payload.tvec)

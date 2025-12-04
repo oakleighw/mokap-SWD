@@ -161,7 +161,7 @@ def run_intrinsics(folder: Path,
                     if (frame_idx // step) % 25 == 0:
 
                         m.compute_intrinsics(keep_stacks=True, fix_aspect_ratio=True, distortion_model='simple')
-                        curr_err = np.nanmean(m.intrinsics_errors)
+                        curr_err = np.nanmean(m.calibration_rmse_perview)
 
                         if curr_err < best_errors[i]:
                             frames_no_imp[i] = 0
@@ -204,7 +204,7 @@ def run_intrinsics(folder: Path,
         if m.curr_nb_samples > min_samples:
             print(f"Computing final calibration for camera '{name}' ({m.curr_nb_samples} samples)...")
             m.compute_intrinsics(keep_stacks=False, fix_aspect_ratio=False, distortion_model='standard')
-            err = np.nanmean(m.intrinsics_errors)
+            err = np.nanmean(m.calibration_rmse_perview)
             results[name] = err
         else:
             results[name] = np.inf
