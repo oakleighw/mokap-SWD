@@ -7,7 +7,7 @@ from mokap.geometry.backend import xp
 
 import matplotlib.pyplot as plt
 
-from mokap.utils.visualisation import plot_cameras_3d, plot_triangulation_scene
+from mokap.utils.visualisation import visualise_calibration_scene
 from mokap.geometry import (triangulate, compose_transform_matrix, invert_transform,
                             project_to_cameras, reprojection_errors)
 
@@ -80,14 +80,15 @@ if __name__ == "__main__":
     if not has_points:
         print("No debug points found (points2d_stacked.npz). Plotting cameras only.")
 
-        plot_cameras_3d(
+        visualise_calibration_scene(
             T_c2w=T_c2w,
             K=K,
             D=D,
-            cameras_names=cam_names,
             trust_volume=volume,
-            depth_ratio=0.5
+            camera_names=cam_names,
+            orientation='upright'
         )
+
         plt.title(f"Calibration Setup: {folder.name}")
         plt.show()
 
@@ -164,20 +165,20 @@ if __name__ == "__main__":
         print(f"Worst 3D point (idx={worst_idx}): Max Error = {worst_val:.4f} px)")
 
     # Plot
-    plot_triangulation_scene(
-        points3d=points3d,
-        points2d=points2d_frame,
+    visualise_calibration_scene(
         T_c2w=T_c2w,
         K=K,
         D=D,
+        points3d=points3d,
+        points2d=points2d_frame,
         visibility_mask=vis_mask_frame,
-        cameras_names=cam_names,
-        imsizes=(1440, 1080),
-        frustums_depth=0.5,
-        detections_depth=1.0,
         trust_volume=volume,
+
+        point_errors=per_point_dists,
         worst_point_idx=worst_idx,
-        camera_stats=camera_stats
+        camera_names=cam_names,
+        frustum_scale=0.5,
+        orientation='upright'
     )
 
     plt.suptitle(f"Calibration Scene (frame {frame_idx})")

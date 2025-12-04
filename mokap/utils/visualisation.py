@@ -1,506 +1,409 @@
-from typing import Optional, Any, Dict, Iterable, Sequence, Union
-import matplotlib
-
+from typing import Optional, Any, Dict, Sequence, Tuple, List
 import numpy as np
-np.set_printoptions(precision=3, suppress=True, threshold=150)
-
-from mokap.geometry.backend import xp, ArrayLike
-
+import matplotlib
 import matplotlib.pyplot as plt
 from mpl_toolkits.mplot3d import Axes3D
-from matplotlib.lines import Line2D
-from mpl_toolkits.mplot3d.art3d import Poly3DCollection
+from mpl_toolkits.mplot3d.art3d import Poly3DCollection, Line3DCollection
 
-from mokap.geometry import intersect_rays, unproject
+from mokap.geometry.backend import xp, ArrayLike
+from mokap.geometry.projective import unproject
+from mokap.geometry import intersect_rays, transform_points
+
 
 CUSTOM_COLORS = ['#9B5DE5', '#EF476F', '#FFD166', '#00BBF9', '#00F5D4', '#118ab2', '#073b4c', '#ee6c4d']
 
 
 def truncate_colormap(cmap, minval: float = 0.0, maxval: float = 1.0, n: int = 100):
-    # From https://stackoverflow.com/a/18926541
     import matplotlib.colors as colors
-    return colors.LinearSegmentedColormap.from_list(f'trunc({cmap.name},{minval:.2f},{maxval:.2f})',
-                                                    cmap(np.linspace(minval, maxval, n)))
+    return colors.LinearSegmentedColormap.from_list(
+        f'trunc({cmap.name},{minval:.2f},{maxval:.2f})',
+        cmap(np.linspace(minval, maxval, n))
+    )
 
 
-def plot_box_3d(
-        centre: ArrayLike,
-        size: ArrayLike,
-        color: str = 'k',
-        alpha: float = 0.1,
-        ax: Optional[Axes3D] = None,
-) -> Axes3D:
-
+def init_3d_plot(ax: Optional[Axes3D] = None, figsize: Tuple[int, int] = (12, 12)) -> Axes3D:
     if ax is None:
-        fig = plt.figure(figsize=(12, 12))
+        fig = plt.figure(figsize=figsize)
         ax = fig.add_subplot(111, projection='3d')
-
-    coords = np.indices((2, 2, 2)).reshape(3, -1).T
-    v = (coords - 0.5) * np.array(size) + np.array(centre)
-
-    faces_idx = np.array([
-        [0, 1, 3, 2],  # bottom
-        [4, 5, 7, 6],  # top
-        [0, 1, 5, 4],  # back
-        [2, 3, 7, 6],  # front
-        [0, 2, 6, 4],  # left
-        [1, 3, 7, 5],  # right
-    ])
-    faces = v[faces_idx]
-
-    ax.add_collection3d(Poly3DCollection(faces, facecolors=color, linewidths=0.1, edgecolors=color, alpha=alpha))
-
     return ax
 
 
-def plot_ellipsoid_3d(
-        centre: ArrayLike,
-        size:   ArrayLike,
-        color:  str = 'k',
-        alpha:  float = 0.1,
-        resolution: int = 30,
-        ax:     Optional[Axes3D] = None,
+def _set_axes_equal(ax):
+    limits = np.array([ax.get_xlim3d(), ax.get_ylim3d(), ax.get_zlim3d()])
+    origin = np.mean(limits, axis=1)
+    radius = 0.5 * np.max(np.abs(limits[:, 1] - limits[:, 0]))
+    ax.set_xlim3d([origin[0] - radius, origin[0] + radius])
+    ax.set_ylim3d([origin[1] - radius, origin[1] + radius])
+    ax.set_zlim3d([origin[2] - radius, origin[2] + radius])
+
+
+# Two tiny geometry helpers
+
+def scene_focal_point(T_c2w: ArrayLike) -> np.ndarray:
+    T = xp.asarray(T_c2w)
+    centers = T[:, :3, 3]
+    axes = T[:, :3, 2]  # +Z axis
+    return np.asarray(intersect_rays(centers, axes))
+
+
+def calculate_depths(T_c2w: ArrayLike, focal_point: np.ndarray, scale: float = 0.5) -> np.ndarray:
+    """
+    Calculates the depth for each camera frustum relative to the focal point.
+    """
+    centers = xp.asarray(T_c2w)[:, :3, 3]
+    # (C, 3) - (3,) -> (C, 3)
+    diffs = centers - xp.asarray(focal_point)
+    dists = xp.linalg.norm(diffs, axis=1)
+
+    depths = dists * scale
+    depths = xp.where(depths < 1e-3, 1.0, depths)
+    return np.asarray(depths)
+
+
+# Plotting functions
+
+def draw_trust_volume(
+        trust_volume: Dict[str, Any],
+        ax: Axes3D,
+        center_point: Optional[np.ndarray] = None,
+        view_transform: Optional[np.ndarray] = None,
+        color: str = '#96d895',
+        alpha: float = 0.05
 ) -> Axes3D:
 
-    if ax is None:
-        fig = plt.figure(figsize=(12, 12))
-        ax = fig.add_subplot(111, projection='3d')
-
-    centre = np.asarray(centre)
-    radii = np.asarray(size) / 2.0
-
-    # Generate the surface points of a unit sphere
-    u = np.linspace(0, 2 * np.pi, resolution)
-    v = np.linspace(0, np.pi, resolution)
-    x = np.outer(np.cos(u), np.sin(v))
-    y = np.outer(np.sin(u), np.sin(v))
-    z = np.outer(np.ones(np.size(u)), np.cos(v))
-
-    # Scale and translate to create the ellipsoid
-    x = radii[0] * x + centre[0]
-    y = radii[1] * y + centre[1]
-    z = radii[2] * z + centre[2]
-
-    # Plot the surface
-    ax.plot_surface(x, y, z, color=color, alpha=alpha, rstride=4, cstride=4, linewidth=0)
-
-    return ax
-
-
-def plot_cameras_3d(
-        T_c2w:              ArrayLike,
-        K:                  ArrayLike,
-        D:                  ArrayLike,
-        imsizes:            ArrayLike = np.array([1440, 1080]),
-        cameras_names:      Optional[Sequence[Any]] = None,
-        depth:              Optional[Union[float, ArrayLike]] = None,
-        depth_ratio:        float = 0.75,
-        colors:             Optional[Sequence[str]] = None,
-        trust_volume:       Optional[Dict[str, ArrayLike]] = None,
-        ax:                 Optional[Axes3D] = None,
-) -> Axes3D:
-    """ Matplotlib 3D plot for viewing C cameras, with their frustums, and the global focal point """
-
-    T_c2w = xp.asarray(T_c2w)
-    K = xp.asarray(K)
-    D = xp.asarray(D)
-
-    if K.ndim != 3 or D.ndim != 2:
-        raise ValueError('This function should be called for C cameras!')
-
-    if ax is None:
-        fig = plt.figure(figsize=(12, 12))
-        ax = fig.add_subplot(111, projection='3d')
-
-    if colors is None:
-        colors = CUSTOM_COLORS
-
-    C = K.shape[0]
-
-    if cameras_names is None:
-        cameras_names = [f'Cam #{c}' for c in range(C)]
-
-    images_sizes = np.asarray(imsizes)
-    if images_sizes.ndim == 1:
-        images_sizes = np.vstack([images_sizes] * C)
-
-    unit_coords = np.array([
-        [0, 0],
-        [1, 0],
-        [1, 1],
-        [0, 1],
-        [0, 0],         # need to repeat the first one for Poly3DCollection
-        [0.5, 0.5],     # centre point
-    ], dtype=np.float32)
-    frustums_2d = (images_sizes[:, None, :] * unit_coords[None, :, :]).astype(np.float32)
-
-    # Plot the axes arrows
-    axes_length = 10
-    ax.quiver(*[0, 0, 0], *[axes_length, 0, 0], color='r', alpha=0.5)
-    ax.quiver(*[0, 0, 0], *[0, axes_length, 0], color='g', alpha=0.5)
-    ax.quiver(*[0, 0, 0], *[0, 0, axes_length], color='b', alpha=0.5)
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-
-    # First, find the shared focal point. The calculation is independent of the initial depth
-    # used for back-projection, we only need the normalized direction vectors
-    # so we use a dummy depth of 1.0 to get the directions
-    frustums_for_direction = unproject(
-        frustums_2d, xp.ones(C), K, T_c2w, D, distortion_model='full'
-    )
-    # TODO: Use new raycasting function
-
-    tvecs_c2w = T_c2w[..., :3, 3]
-    directions = frustums_for_direction[:, -1] - tvecs_c2w
-    directions_normalised = directions / np.linalg.norm(directions, axis=1)[:, None]
-    focal_point = intersect_rays(tvecs_c2w, directions_normalised)
-
-    # Determine the plotting depths
-    if depth is None:
-        # Automatic mode: depth is 3/4 the distance from each camera to the focal point
-        distances_to_focal = xp.linalg.norm(tvecs_c2w - focal_point, axis=1)
-        plot_depths = distances_to_focal * depth_ratio
-    else:
-        # Manual override: use the fixed depth for all cameras
-        plot_depths = xp.array([depth] * C)
-
-    # Calculate the final frustums for plotting using the determined depths
-    frustums_3d = unproject(
-        frustums_2d,
-        plot_depths,
-        K,
-        T_c2w,
-        D,
-        distortion_model='full'
-    )
-
-    for n in range(C):
-        col = colors[n]
-
-        # Cameras positions (optical centres)
-        ax.scatter(*tvecs_c2w[n], color=col, label=cameras_names[n], alpha=1.0)
-
-        # Frustum plans
-        ax.add_collection3d(
-            Poly3DCollection([frustums_3d[n, :-1]], facecolors=col, edgecolors=col, linewidths=1, linestyles='-',
-                             alpha=0.05))
-
-        # Frustum lines
-        for corner in frustums_3d[n, :-2]:
-            ax.plot(*np.stack([tvecs_c2w[n], corner]).T, color=col, linestyle='-', linewidth=0.25, alpha=0.5)
-
-        # Optical axis
-        ax.plot(*np.stack([tvecs_c2w[n], frustums_3d[n, -1]]).T, color=col, linestyle='--', linewidth=1.0, alpha=0.5)
-
-    ax.scatter(*focal_point, marker='*', color='k', s=25)
-
-    if trust_volume is not None:
-        # Check the format of the trust_volume dict to determine behavior
-        first_value = next(iter(trust_volume.values()))
-
-        if np.isscalar(first_value):
-            # Values are extents (sizes) so we center the box on the shared focal point
-            volume_centre = focal_point
-            volume_size = [trust_volume['x'], trust_volume['y'], trust_volume['z']]
+    if np.isscalar(list(trust_volume.values())[0]):
+        # Extents provided: Center around the provided center_point (focal point)
+        if center_point is not None:
+            cx, cy, cz = center_point
         else:
-            # Values are ranges (min, max). Calculate the box's own center and size
-            x_min, x_max = trust_volume['x']
-            y_min, y_max = trust_volume['y']
-            z_min, z_max = trust_volume['z']
-            volume_centre = [(x_min + x_max) / 2, (y_min + y_max) / 2, (z_min + z_max) / 2]
-            volume_size = [x_max - x_min, y_max - y_min, z_max - z_min]
+            cx, cy, cz = 0, 0, 0
 
-        ax = plot_box_3d(centre=volume_centre, size=volume_size, ax=ax, color='#96d895', alpha=0.05)
-        ax.scatter(*volume_centre, marker='s', color='#96d895', s=25)
-
-    ax.legend()
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-    ax.set_aspect('equal')
-
-    return ax
-
-
-def plot_points_3d(
-        points3d:       ArrayLike,
-        points_names:   Optional[Sequence[Any]] = None,
-        errors:         Optional[ArrayLike] = None,
-        color:          str = 'k',
-        label:          str = '3D points',
-        ax:             Optional[Axes3D] = None,
-) -> Axes3D:
-    """ Matplotlib 3D plot for points, their names and the associated errors """
-
-    points3d = np.asarray(points3d)
-
-    if points3d.ndim != 2:
-        raise ValueError('This function should be called for N 3D points!')
-
-    if errors is not None:
-        errors = np.asarray(errors)
-        assert points3d.shape[0] == errors.shape[0]
-
-    if ax is None:
-        fig = plt.figure(figsize=(12, 12))
-        ax = fig.add_subplot(111, projection='3d')
-
-    xs, ys, zs = points3d.T
-
-    if errors is not None:
-        colormap = truncate_colormap(plt.cm.brg, 0.45, 1.0).reversed()
-        normalize = matplotlib.colors.Normalize(vmin=0, vmax=5)
-        pts_scatter = ax.scatter(xs, ys, zs,
-                                 c=errors, cmap=colormap, norm=normalize,
-                                 marker='o', label=label, alpha=0.5)
+        sx, sy, sz = trust_volume['x'], trust_volume['y'], trust_volume['z']
+        min_x, max_x = cx - sx / 2, cx + sx / 2
+        min_y, max_y = cy - sy / 2, cy + sy / 2
+        min_z, max_z = cz - sz / 2, cz + sz / 2
     else:
-        pts_scatter = ax.scatter(xs, ys, zs,
-                                 color=color,
-                                 marker='o', label=label, alpha=0.5)
+        # Min/max tuples provided: absolute coordinates
+        min_x, max_x = trust_volume['x']
+        min_y, max_y = trust_volume['y']
+        min_z, max_z = trust_volume['z']
 
-    if points_names is not None:
-        for p, name in enumerate(points_names):
-            if errors is not None:
-                c = pts_scatter.to_rgba(errors[p]) if np.isfinite(errors[p]) else color
-            else:
-                c = color
-            ax.text(xs[p], ys[p], zs[p], f"  {name}", c=c, alpha=0.8, fontweight='bold')
-
-    ax.legend()
-
-    ax.set_aspect('equal')
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
-
-    return ax
-
-
-def plot_object_3d(
-        object_points:  ArrayLike,
-        object_pose:    ArrayLike,
-        color:          str = 'blue',
-        label:          str = 'Object Ground Truth',
-        ax:             Optional[Axes3D] = None,
-) -> Axes3D:
-    """
-    Plots a 3D object (like a calibration pattern) given its local points and its pose in the world
-
-    Args:
-        object_points: The (N, 3) points of the board in its own local coordinate system (often with z=0)
-        object_pose: The b2w object pose as a T matrix
-        color: The color for the board points
-        label: The legend label for the board points
-        ax: Optional existing Matplotlib Axes3D object
-    """
-
-    if ax is None:
-        fig = plt.figure(figsize=(12, 12))
-        ax = fig.add_subplot(111, projection='3d')
-
-    # Convert local points to homogeneous coordinates
-    local_points_hom = np.hstack([
-        np.asarray(object_points),
-        np.ones((np.asarray(object_points).shape[0], 1))
+    corners = np.array([
+        [min_x, min_y, min_z], [max_x, min_y, min_z], [max_x, max_y, min_z], [min_x, max_y, min_z],
+        [min_x, min_y, max_z], [max_x, min_y, max_z], [max_x, max_y, max_z], [min_x, max_y, max_z],
     ])
 
-    # Apply the transformation to get the points in world coordinates
-    world_points_hom = (object_pose @ local_points_hom.T).T
-    world_points_3d = world_points_hom[:, :3]
+    corners = transform_points(corners, view_transform)
 
-    ax = plot_points_3d(
-        points3d=world_points_3d,
-        color=color,
-        label=label,
-        ax=ax
-    )
+    faces_idx = [[0, 1, 2, 3], [4, 5, 6, 7], [0, 1, 5, 4], [2, 3, 7, 6], [1, 2, 6, 5], [4, 7, 3, 0]]
+    verts = [[corners[i] for i in face] for face in faces_idx]
+
+    poly = Poly3DCollection(verts, facecolors=color, linewidths=1, edgecolors=color, alpha=alpha)
+    ax.add_collection3d(poly)
+
+    # Draw center marker
+    center = np.mean(corners, axis=0)
+    ax.scatter(*center, color=color, marker='+', s=50, alpha=0.5)
 
     return ax
 
 
-def plot_points2d_3d(
-        points2d:     ArrayLike,
-        T_c2w:        ArrayLike,
-        K:            ArrayLike,
-        D:            ArrayLike,
-        depth:        float = 10.0,
-        points_names: Optional[Iterable[Any]] = None,
-        errors:       Optional[ArrayLike] = None,
-        colors:       Optional[str] = None,
-        ax:           Optional[Axes3D] = None,
+def draw_cameras(
+        T_c2w: ArrayLike,
+        K: ArrayLike,
+        D: ArrayLike,
+        depths: ArrayLike,
+        ax: Axes3D,
+        view_transform: Optional[np.ndarray] = None,
+        cameras_names: Optional[Sequence[str]] = None,
+        colors: Optional[Sequence[str]] = None,
+        image_size: Tuple[int, int] = (1440, 1080)
+) -> Axes3D:
+
+    T_c2w = np.asarray(T_c2w)
+    K = np.asarray(K)
+    D = np.asarray(D)
+    depths = np.asarray(depths)
+
+    T_c2w_viz = view_transform @ T_c2w if view_transform is not None else T_c2w
+
+    C = T_c2w.shape[0]
+    if colors is None:
+        colors = CUSTOM_COLORS * (C // len(CUSTOM_COLORS) + 1)
+    if cameras_names is None:
+        cameras_names = [f"Cam {i}" for i in range(C)]
+
+    w, h = image_size
+    corners_2d = np.array([[0, 0], [w, 0], [w, h], [0, h], [0, 0]], dtype=np.float32)
+    corners_2d_batch = np.tile(corners_2d[None, ...], (C, 1, 1))
+
+    # Unproject to camera's *local* frame
+    T_identity = np.eye(4)[None, ...].repeat(C, axis=0)
+
+    frustum_pts_local = unproject(
+        corners_2d_batch, depths, K, T_identity, D, distortion_model='standard'
+    )
+
+    for i in range(C):
+        col = colors[i]
+        cam_center = T_c2w_viz[i, :3, 3]
+
+        R = T_c2w_viz[i, :3, :3]
+        pts_local = frustum_pts_local[i]
+        pts_world = (R @ pts_local.T).T + cam_center
+
+        ax.scatter(*cam_center, color=col, s=20)
+        ax.text(*cam_center, s=f" {cameras_names[i]}", color=col, fontsize=8)
+
+        face = Poly3DCollection([pts_world], facecolors=col, alpha=0.1, linewidths=1.2, edgecolors=col)
+        ax.add_collection3d(face)
+
+        for p in pts_world[:-1]:
+            ax.plot(*zip(cam_center, p), color=col, linestyle='-', linewidth=1.0, alpha=0.3)
+
+    return ax
+
+
+def draw_observations(
+        points2d: ArrayLike,
+        T_c2w: ArrayLike,
+        K: ArrayLike,
+        D: ArrayLike,
+        depths: ArrayLike,
+        ax: Axes3D,
+        view_transform: Optional[np.ndarray] = None,
+        visibility_mask: Optional[ArrayLike] = None,
+        colors: Optional[Sequence[str]] = None
 ) -> Axes3D:
 
     points2d = np.asarray(points2d)
-    T_c2w = xp.asarray(T_c2w)
-    K = xp.asarray(K)
-    D = xp.asarray(D)
+    T_c2w = np.asarray(T_c2w)
+    K = np.asarray(K)
+    D = np.asarray(D)
+    depths = np.asarray(depths)
 
-    if points2d.ndim != 3 or K.ndim != 3 or D.ndim != 2:
-        raise ValueError('This function should be called for CxN 2D points!')
+    C, N = points2d.shape[:2]
+    T_c2w_viz = view_transform @ T_c2w if view_transform is not None else T_c2w
 
-    if ax is None:
-        fig = plt.figure(figsize=(12, 12))
-        ax = fig.add_subplot(111, projection='3d')
-
-    C = points2d.shape[0]
+    T_identity = np.eye(4)[None, ...].repeat(C, axis=0)
+    pts_local = unproject(points2d, depths, K, T_identity, D, distortion_model='standard')
 
     if colors is None:
         colors = CUSTOM_COLORS
 
-    points2d_3d = unproject(points2d, xp.asarray([depth] * C), K, T_c2w, D, distortion_model='full')
+    for c in range(C):
+        col = colors[c % len(colors)]
+        R_viz = T_c2w_viz[c, :3, :3]
+        t_viz = T_c2w_viz[c, :3, 3]
+        cam_pts = pts_local[c]
 
-    for n in range(C):
+        mask = np.isfinite(points2d[c, :, 0])
+        if visibility_mask is not None:
+            mask = mask & visibility_mask[c]
 
-        xs, ys, zs = points2d_3d[n].T
+        valid_pts = cam_pts[mask]
 
-        if errors is not None:
-            colormap = truncate_colormap(plt.cm.brg, 0.45, 1.0).reversed()
-            normalize = matplotlib.colors.Normalize(vmin=0, vmax=5)
+        if len(valid_pts) > 0:
+            pts_world = (R_viz @ valid_pts.T).T + t_viz
+            ax.scatter(pts_world[:, 0], pts_world[:, 1], pts_world[:, 2],
+                       color=col, marker='x', s=10, alpha=0.9, depthshade=False)
+    return ax
 
-            pts_scatter = ax.scatter(xs, ys, zs, s=10,
-                                     c=errors[n], cmap=colormap, norm=normalize,
-                                     marker='.', label='3D points', alpha=0.5)
-        else:
-            pts_scatter = ax.scatter(xs, ys, zs, s=10,
-                                     c=colors[n],
-                                     marker='.', label='3D points', alpha=0.5)
 
-        if points_names is not None:
-            for p, name in enumerate(points_names):
-                if errors is not None:
-                    c = pts_scatter.to_rgba(errors[p]) if np.isfinite(errors[p]) else colors[n]
-                else:
-                    c = colors[n]
-                ax.text(xs[p], ys[p], zs[p], f"  {name}", c=c, alpha=0.8, fontweight='bold')
+def draw_points(
+        points3d: ArrayLike,
+        ax: Axes3D,
+        view_transform: Optional[np.ndarray] = None,
+        errors: Optional[ArrayLike] = None,
+        default_color: str = 'k',
+        worst_point_idx: Optional[int] = None
+) -> Axes3D:
+    
+    points3d = np.asarray(points3d)
+    if errors is not None:
+        errors = np.asarray(errors)
 
-    ax.set_aspect('equal')
-    ax.set_xlabel('X')
-    ax.set_ylabel('Y')
-    ax.set_zlabel('Z')
+    pts_viz = transform_points(points3d, view_transform)
+    xs, ys, zs = pts_viz.T
+
+    if errors is not None:
+        if errors.ndim == 2:
+            errors = np.nanmean(errors, axis=0)
+
+        cmap = truncate_colormap(plt.cm.brg, 0.45, 1.0).reversed()
+        norm = matplotlib.colors.Normalize(vmin=0, vmax=5.0)
+        ax.scatter(xs, ys, zs, c=errors, cmap=cmap, norm=norm, s=10, alpha=1.0, label='3D points')
+    else:
+        ax.scatter(xs, ys, zs, c=default_color, s=10, alpha=0.8, label='3D points')
+
+    if worst_point_idx is not None and 0 <= worst_point_idx < len(pts_viz):
+        wx, wy, wz = pts_viz[worst_point_idx]
+        ax.scatter(wx, wy, wz, c='red', marker='x', s=25, linewidth=2, zorder=100, label='Worst error')
 
     return ax
 
 
-def plot_triangulation_scene(
-        points3d:           ArrayLike,
-        points2d:           ArrayLike,
-        T_c2w:              ArrayLike,
-        K:                  ArrayLike,
-        D:                  ArrayLike,
-        visibility_mask:    Optional[ArrayLike] = None,
-        points_names:       Optional[Sequence[Any]] = None,
-        errors:             Optional[ArrayLike] = None,
-        cameras_names:      Optional[Sequence[Any]] = None,
-        imsizes:            ArrayLike = np.array([1440, 1080]),
-        frustums_depth:     float = 0.9,
-        detections_depth:   float = 0.95,
-        colors:             Optional[Sequence[str]] = None,
-        trust_volume:       Optional[Dict[str, ArrayLike]] = None,
-        object_pose:        Optional[ArrayLike] = None,
-        object_points:      Optional[ArrayLike] = None,
-        ax:                 Optional[Axes3D] = None,
-        worst_point_idx:    Optional[int] = None,
-        camera_stats:       Optional[Dict[str, Dict[str, float]]] = None,
+def draw_rays(
+        points2d: ArrayLike,
+        points3d: ArrayLike,
+        T_c2w: ArrayLike,
+        K: ArrayLike,
+        D: ArrayLike,
+        depths: ArrayLike,
+        ax: Axes3D,
+        view_transform: Optional[np.ndarray] = None,
+        visibility_mask: Optional[ArrayLike] = None,
+        colors: Optional[Sequence[str]] = None,
+        worst_point_idx: Optional[int] = None
 ) -> Axes3D:
     """
-    Comprehensive 3D plot of a triangulation scene
+    Draws the camera rays extending to the depth of the 3D point.
+    Visualizes alignment errors by drawing a circle where the ray ends vs where the point is.
     """
 
-    points3d = xp.asarray(points3d)
-    points2d = xp.asarray(points2d)
-    T_c2w = xp.asarray(T_c2w)
-    K = xp.asarray(K)
-    D = xp.asarray(D)
+    points3d = np.asarray(points3d)
+    points2d = np.asarray(points2d)
+    T_c2w = np.asarray(T_c2w)
+    depths = np.asarray(depths)
 
-    if ax is None:
-        fig = plt.figure(figsize=(16, 16))
-        ax = fig.add_subplot(111, projection='3d')
+    C, N = points2d.shape[:2]
+
+    # Transform geometry to plot reference
+    pts_3d_viz = transform_points(points3d, view_transform)
+    T_c2w_viz = view_transform @ T_c2w if view_transform is not None else T_c2w
+
+    # Observation points on frustum
+    T_identity = np.eye(4)[None, ...].repeat(C, axis=0)
+    # Note: we use the frustum depths here to get the 'start' of the ray (on the image plane)
+    pts_obs_local = unproject(points2d, depths, K, T_identity, D, distortion_model='standard')
 
     if colors is None:
         colors = CUSTOM_COLORS
 
-    points2d_plot = points2d.copy()
-    if visibility_mask is not None:
-        points2d_plot[~xp.asarray(visibility_mask)] = xp.nan
-
-    # Plot cameras and frustums
-    ax = plot_cameras_3d(
-        T_c2w, K, D,
-        cameras_names=cameras_names,
-        imsizes=imsizes,
-        depth_ratio=frustums_depth,
-        trust_volume=trust_volume,
-        colors=colors,
-        ax=ax
-    )
-
-    # Plot final triangulated 3D points
-    ax = plot_points_3d(
-        points3d,
-        points_names=points_names,
-        errors=errors,
-        color='black',
-        label='Triangulated points',
-        ax=ax
-    )
-
-    # Optional ground truth object
-    if all(arg is not None for arg in [object_pose, object_points]):
-        ax = plot_object_3d(
-            object_points=object_points,
-            object_pose=object_pose,
-            color='blue',
-            label='Ground truth',
-            ax=ax
-        )
-
-    # Back-projected rays
-    tvecs_c2w = T_c2w[..., :3, 3]
-    cam_to_point_vectors = points3d[None, :, :] - tvecs_c2w[:, None, :]
-    depths_to_3d_points = xp.linalg.norm(cam_to_point_vectors, axis=2)
-    plot_depths = depths_to_3d_points * detections_depth
-
-    points2d_in_3d = unproject(points2d_plot, plot_depths, K, T_c2w, D, distortion_model='simple')
-    points2d_in_3d = np.asarray(points2d_in_3d)
-
-    C, N, _ = points2d_in_3d.shape
     for c in range(C):
+        col = colors[c % len(colors)]
+
+        R_viz = T_c2w_viz[c, :3, :3]
+        t_viz = T_c2w_viz[c, :3, 3]
+
+        # Observations on frustum
+        pts_obs_viz = (R_viz @ pts_obs_local[c].T).T + t_viz
+
+        segments = []
+        ray_ends = []
+
         for n in range(N):
-            if np.all(np.isfinite(points2d_in_3d[c, n, :])):
-                start_point = tvecs_c2w[c]
-                end_point = points2d_in_3d[c, n, :]
+            if visibility_mask is not None and not visibility_mask[c, n]:
+                continue
 
-                # Highlight worst point
-                is_worst = (worst_point_idx is not None) and (n == worst_point_idx)
-                if is_worst:
-                    ax.scatter(*end_point, c='red', marker='x', s=25, linewidth=2, zorder=10)
-                    ax.plot(*np.stack([start_point, end_point]).T, color='red', linestyle='--', linewidth=0.9, alpha=0.8)
-                else:
-                    ax.scatter(*end_point, c=colors[c], marker='.', alpha=0.7, s=20)
-                    ax.plot(*np.stack([start_point, end_point]).T, color=colors[c], linestyle=':', linewidth=0.7, alpha=0.6)
+            p_cam = t_viz
+            p_obs = pts_obs_viz[n]  # point on frustum
+            p_tri = pts_3d_viz[n]   # triangulated result
 
-    # Legend
-    handles, labels = ax.get_legend_handles_labels()
-    legend_elements = [Line2D([0], [0], marker='.', color='gray', label='Back-projected rays',
-                              markerfacecolor='gray', markersize=8, linestyle='None')]
-    if worst_point_idx is not None:
-        legend_elements.append(Line2D([0], [0], marker='x', color='red', label='Worst error',
-                                      markerfacecolor='red', markersize=10, linestyle='None'))
-    ax.legend(handles=handles + legend_elements)
+            if not np.isfinite(p_obs).all() or not np.isfinite(p_tri).all():
+                continue
+
+            # Distance to triangulated point
+            dist_to_tri = np.linalg.norm(p_tri - p_cam)
+
+            # Extend the ray from camera through observed point to that distance
+            # vector cam->obs
+            vec_ray = p_obs - p_cam
+            vec_ray_norm = vec_ray / (np.linalg.norm(vec_ray) + 1e-9)
+
+            p_ray_end = p_cam + vec_ray_norm * dist_to_tri
+
+            if worst_point_idx is not None and n == worst_point_idx:
+                ax.plot(*zip(p_obs, p_ray_end), color='red', alpha=0.3, linestyle=(0, (5, 5)), linewidth=0.7)
+                ax.scatter(*p_ray_end, marker='.', s=100, alpha=0.5, edgecolors='none', facecolors='red')
+            else:
+                segments.append([p_obs, p_ray_end])
+                ray_ends.append(p_ray_end)
+
+        if segments:
+            lc = Line3DCollection(segments, colors=col,  alpha=0.15, linestyle='-', linewidths=0.5)
+            ax.add_collection3d(lc)
+
+        if ray_ends:
+            re = np.array(ray_ends)
+            ax.scatter(re[:, 0], re[:, 1], re[:, 2], marker='.', s=100, alpha=0.5, edgecolors='none', facecolors=col)
+
+    return ax
+
+
+def visualise_calibration_scene(
+        T_c2w: ArrayLike,
+        K: ArrayLike,
+        D: ArrayLike,
+        points3d: Optional[ArrayLike] = None,
+        points2d: Optional[ArrayLike] = None,
+        visibility_mask: Optional[ArrayLike] = None,
+        trust_volume: Optional[Dict] = None,
+        camera_names: Optional[List[str]] = None,
+        point_errors: Optional[ArrayLike] = None,
+        worst_point_idx: Optional[int] = None,
+        orientation: str = 'upright',
+        frustum_scale: float = 0.5,
+        ax: Optional[Axes3D] = None
+) -> Axes3D:
+
+    ax = init_3d_plot(ax)
+
+    # View transform
+    T_view = None
+    if orientation == 'upright':
+        T_view = np.eye(4)
+        T_view[1, 1] = -1
+        T_view[2, 2] = -1
+
+    # Scene geom
+    focal_point = scene_focal_point(T_c2w)
+    depths = calculate_depths(T_c2w, focal_point, scale=frustum_scale)
+
+    if trust_volume is not None:
+        draw_trust_volume(trust_volume, ax, center_point=focal_point, view_transform=T_view)
+
+    draw_cameras(T_c2w, K, D, depths, ax,
+                 view_transform=T_view,
+                 cameras_names=camera_names)
+
+    if points2d is not None:
+        draw_observations(points2d, T_c2w, K, D, depths, ax,
+                          view_transform=T_view,
+                          visibility_mask=visibility_mask)
+
+    if points3d is not None:
+        draw_points(points3d, ax,
+                    view_transform=T_view,
+                    errors=point_errors,
+                    worst_point_idx=worst_point_idx)
+
+    if points3d is not None and points2d is not None:
+        draw_rays(points2d, points3d, T_c2w, K, D, depths, ax,
+                  view_transform=T_view,
+                  visibility_mask=visibility_mask,
+                  worst_point_idx=worst_point_idx)
 
     # Overlay stats
-    if camera_stats is not None:
+    if point_errors is not None and camera_names is not None:
         stats_text = "Per-camera errors (px):\n"
-        for cam_name, metrics in camera_stats.items():
-            if np.isfinite(metrics['mean']):
-                stats_text += f"{cam_name:>10}: Mean={metrics['mean']:.2f}, Max={metrics['max']:.2f}\n"
-            else:
-                stats_text += f"{cam_name:>10}: No Data\n"
+        for i, cam_name in enumerate(camera_names):
+            mean_err = np.nanmean(point_errors[i])
+            max_err = np.nanmean(point_errors[i])
 
-        ax.text2D(0.02, 0.98, stats_text, transform=ax.transAxes,
-                  fontsize=9, verticalalignment='top', family='monospace',
-                  bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
+            stats_text += (f"{cam_name:>10}: Mean={mean_err if np.isfinite(mean_err) else '-':.2f}, "
+                           f"Max={max_err if np.isfinite(max_err) else '-':.2f}\n")
+        ax.text2D(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9, verticalalignment='top',
+                  family='monospace', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 
-    ax.set_aspect('equal')
+    ax.set_xlabel('X')
+    ax.set_ylabel('Y')
+    ax.set_zlabel('Z')
+
+    _set_axes_equal(ax)
+
+    ax.grid(False)
+    ax.legend(loc='upper right', fontsize='small')
+    plt.tight_layout()
+
     return ax
