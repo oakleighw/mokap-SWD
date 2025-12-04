@@ -42,12 +42,12 @@ class ChessBoard:
 
     @property
     def object_points(self) -> np.ndarray:
-        """ Returns the theoretical 3D locations (X, Y, Z=0) of the inner points """
+        """Returns the 3D locations in object-local space (X, Y, Z=0) of the inner points."""
         return self._object_points
 
     @property
     def corner_points(self) -> np.ndarray:
-        """ Returns the theoretical 3D locations (X, Y, Z=0) of the outer corners """
+        """Returns the 3D locations in object-local space (X, Y, Z=0) of the outer corners."""
         return self._corners
 
     @property
@@ -110,7 +110,9 @@ class CharucoBoard(ChessBoard):
         w = self.cols * side_pixels + 2 * self.margin
         h = self.rows * side_pixels + 2 * self.margin
         f = square_size_px if square_size_px else 1
-        return self.to_opencv().generateImage((w * f, h * f), marginSize=self.margin, borderBits=self.padding)
+        return self.to_opencv().generateImage((w * f, h * f),
+                                              marginSize=self.margin,
+                                              borderBits=self.padding)
 
 
 ##

@@ -7,8 +7,7 @@ from mpl_toolkits.mplot3d.art3d import Poly3DCollection, Line3DCollection
 
 from mokap.geometry.backend import xp, ArrayLike
 from mokap.geometry.projective import unproject
-from mokap.geometry import intersect_rays, transform_points
-
+from mokap.geometry import intersect_rays, transform_points, homogenize
 
 CUSTOM_COLORS = ['#9B5DE5', '#EF476F', '#FFD166', '#00BBF9', '#00F5D4', '#118ab2', '#073b4c', '#ee6c4d']
 
@@ -218,7 +217,7 @@ def draw_points(
         default_color: str = 'k',
         worst_point_idx: Optional[int] = None
 ) -> Axes3D:
-    
+
     points3d = np.asarray(points3d)
     if errors is not None:
         errors = np.asarray(errors)
@@ -321,12 +320,67 @@ def draw_rays(
                 ray_ends.append(p_ray_end)
 
         if segments:
-            lc = Line3DCollection(segments, colors=col,  alpha=0.15, linestyle='-', linewidths=0.5)
+            lc = Line3DCollection(segments, colors=col, alpha=0.15, linestyle='-', linewidths=0.5)
             ax.add_collection3d(lc)
 
         if ray_ends:
             re = np.array(ray_ends)
             ax.scatter(re[:, 0], re[:, 1], re[:, 2], marker='.', s=100, alpha=0.5, edgecolors='none', facecolors=col)
+
+    return ax
+
+
+def draw_object(
+        object_points: ArrayLike,
+        object_pose: ArrayLike,
+        ax: Axes3D,
+        view_transform: Optional[np.ndarray] = None,
+        color: str = '#0000ff',
+        label: str = 'Ground truth board'
+) -> Axes3D:
+    """
+    Draws a rigid object (e.g. calibration pattern) based on local points and a pose T.
+    Also draws a small RGB coordinate frame at the object's origin.
+    """
+    pts_local = np.asarray(object_points)
+    T_obj = np.asarray(object_pose)
+
+    # Transform points: object local -> world
+    pts_local_h = homogenize(pts_local)
+    pts_world_h = pts_local_h @ T_obj.T
+    pts_world = pts_world_h[:, :3]
+
+    # Transform world -> visualisation
+    pts_viz = transform_points(pts_world, view_transform)
+
+    ax.scatter(pts_viz[:, 0], pts_viz[:, 1], pts_viz[:, 2],
+               c=color, s=20, marker='+', label=label, alpha=0.8)
+
+    # Draw object gizmo (RGB)
+    axis_len = np.max(np.ptp(pts_local, axis=0)) * 0.2  # 20% of object size
+    if axis_len < 1e-3:
+        axis_len = 0.1
+
+    # Origin X, Y, Z in *object local* frame
+    axes_local = np.array([
+        [0, 0, 0],
+        [axis_len, 0, 0],
+        [0, axis_len, 0],
+        [0, 0, axis_len]
+    ])
+
+    # Transform axes: object local -> world
+    axes_h = homogenize(axes_local)
+    axes_world_h = axes_h @ T_obj.T[:, :3]
+    axes_world = axes_world_h[:, :3]
+
+    # Transform world -> visualisation
+    axes_viz = transform_points(axes_world, view_transform)
+
+    origin = axes_viz[0]
+    ax.plot(*zip(origin, axes_viz[1]), color='r', linewidth=2)  # X
+    ax.plot(*zip(origin, axes_viz[2]), color='g', linewidth=2)  # Y
+    ax.plot(*zip(origin, axes_viz[3]), color='b', linewidth=2)  # Z
 
     return ax
 
@@ -342,6 +396,8 @@ def visualise_calibration_scene(
         camera_names: Optional[List[str]] = None,
         point_errors: Optional[ArrayLike] = None,
         worst_point_idx: Optional[int] = None,
+        object_points: Optional[ArrayLike] = None,
+        object_pose: Optional[ArrayLike] = None,
         orientation: str = 'upright',
         frustum_scale: float = 0.5,
         ax: Optional[Axes3D] = None
@@ -366,6 +422,12 @@ def visualise_calibration_scene(
     draw_cameras(T_c2w, K, D, depths, ax,
                  view_transform=T_view,
                  cameras_names=camera_names)
+
+    if object_points is not None and object_pose is not None:
+        draw_object(object_points, object_pose, ax,
+                    view_transform=T_view,
+                    color='blue',
+                    label='Calibration board')
 
     if points2d is not None:
         draw_observations(points2d, T_c2w, K, D, depths, ax,

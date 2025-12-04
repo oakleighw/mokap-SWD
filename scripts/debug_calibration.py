@@ -173,7 +173,6 @@ if __name__ == "__main__":
         points2d=points2d_frame,
         visibility_mask=vis_mask_frame,
         trust_volume=volume,
-
         point_errors=per_point_dists,
         worst_point_idx=worst_idx,
         camera_names=cam_names,
