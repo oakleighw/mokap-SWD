@@ -497,8 +497,8 @@ def intersect_aabb(
 @partial(jit, static_argnames=['method'])
 def compute_bounds(
         points3d: xp.ndarray,
-        all_errors: xp.ndarray,
-        error_threshold_px: float = 1.0,
+        errors: xp.ndarray,
+        error_threshold: float = 1.0,
         method: str = 'iqr',  # 'iqr' or 'percentile'
         percentile: float = 1.0,
         iqr_factor: float = 1.5
@@ -509,8 +509,8 @@ def compute_bounds(
 
     Args:
         points3d: Cloud of 3D points (P, N, 3)
-        all_errors: Error values (C, P, N)
-        error_threshold_px: Max mean error
+        errors: Error values (C, P, N)
+        error_threshold: Max mean error
         method: Which method to use, IQR or percentile
         percentile: Percentile to clip outliers when computing bounds
         iqr_factor: Multiplier for IQR (default 1.5)
@@ -520,16 +520,16 @@ def compute_bounds(
     """
 
     # Check for columns where all values are NaN (points never seen or invalid depth)
-    is_valid_obs = xp.isfinite(all_errors)
+    is_valid_obs = xp.isfinite(errors)
     counts = xp.sum(is_valid_obs, axis=0)
-    sums = xp.nansum(all_errors, axis=0)
+    sums = xp.nansum(errors, axis=0)
 
     # Avoid division by zero
     safe_counts = xp.maximum(counts, 1.0)
 
     # Reliability masking
     mean_error = xp.where(counts > 0, sums / safe_counts, xp.inf) # (P, N) or (N,)
-    reliable_mask = mean_error < error_threshold_px
+    reliable_mask = mean_error < error_threshold
 
     # Check if enough points (threshold of 4 for IQR)
     count = xp.sum(reliable_mask.astype(xp.float32))
