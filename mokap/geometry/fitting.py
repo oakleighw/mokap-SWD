@@ -717,7 +717,7 @@ def reprojection_errors(
 
     Returns:
         Dictionary with 'rms' (also aliased to 'rms_euclidean'), 'rms_component', 'mre',
-        and optional per-point ('mre_per_point') and per-view errors ('rms_per_view', 'mre_per_view').
+        and optional per-point ('mre_per_point') and per-view ('rms_per_view', 'mre_per_view') errors.
     """
 
     sq_diff = xp.square(points2d_observed - points2d_reprojected)
