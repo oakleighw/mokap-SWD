@@ -228,7 +228,8 @@ def run_intrinsics(folder: Path,
 def run_extrinsics(folder: Path,
                    step: int = 1,
                    origin_cam: str = "",
-                   ba_frames: int = 100) -> bool:
+                   min_coverage: float = 60.0,
+                   min_samples: int = 100) -> bool:
     """
     Runs the multi-view extrinsic calibration loop.
     Requires intrinsics to exist on disk (or be recently written).
@@ -281,13 +282,12 @@ def run_extrinsics(folder: Path,
         K_init=Ks,
         D_init=Ds,
         origin_idx=origin_idx,
-        min_detections=ba_frames,
-        max_detections=ba_frames * 2,
+        min_detections=min_samples,
+        max_detections=min_samples * 2,
         distortion_model=DEFAULT_DIST_MODEL
     )
 
     frame_idx = 0
-    target_coverage = 60.0
 
     try:
         while True:
@@ -315,16 +315,16 @@ def run_extrinsics(folder: Path,
             should_add = False
 
             # Are all cameras covered enough?
-            all_covered = all(m.pct_coverage >= target_coverage for m in mono_tools)
+            all_covered = all(m.pct_coverage >= min_coverage for m in mono_tools)
 
             if not all_covered:
                 # Add if it helps a camera that needs coverage
                 for i, m in enumerate(mono_tools):
-                    if m.pct_coverage < target_coverage and detections[i]:
+                    if m.pct_coverage < min_coverage and detections[i]:
                         if m.register_sample(min_new_area=0.1):
                             should_add = True
                             break
-            elif mv_tool.ba_sample_count < ba_frames:
+            elif mv_tool.ba_sample_count < min_samples:
                 # Coverage done, just filling the BA buffer
                 should_add = True
 
@@ -343,7 +343,7 @@ def run_extrinsics(folder: Path,
                             mv_tool.register(i, payload)
 
             # Check termination
-            if all_covered and mv_tool.ba_sample_count >= ba_frames:
+            if all_covered and mv_tool.ba_sample_count >= min_samples:
                 print("\n[Ready] Sufficient coverage and BA samples collected.")
                 break
 
@@ -415,19 +415,17 @@ def run_extrinsics(folder: Path,
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Unified Calibration Tool")
     parser.add_argument("folder", type=str, help="Path to folder containing video files")
-    parser.add_argument("--mode", choices=["intrinsics", "extrinsics", "both"], default="both",
-                        help="Calibration mode.")
+    parser.add_argument("--mode", choices=["intrinsics", "extrinsics", "both"],
+                        default="both", help="Calibration mode.")
 
     # Tuning params
-    parser.add_argument("--step", type=int, default=1,
-                        help="Process every Nth frame (speed up processing).")
+    parser.add_argument("--step", type=int, default=1, help="Process every n-th frame.")
     parser.add_argument("--origin", type=str, default="",
                         help="Name of camera to be world origin (extrinsics only).")
 
     # Advanced thresholds
-    parser.add_argument("--coverage", type=float, default=75.0, help="Min coverage % (intrinsics)")
-    parser.add_argument("--samples", type=int, default=30, help="Min samples (intrinsics)")
-    parser.add_argument("--ba_frames", type=int, default=100, help="Min frames for Bundle Adj (extrinsics)")
+    parser.add_argument("--coverage", type=float, default=70.0, help="Min coverage %")
+    parser.add_argument("--samples", type=int, default=30, help="Min samples")
 
     args = parser.parse_args()
 
@@ -452,5 +450,6 @@ if __name__ == "__main__":
             target_folder,
             step=args.step,
             origin_cam=args.origin,
-            ba_frames=args.ba_frames
+            min_coverage=args.coverage,
+            min_samples=args.samples
         )
