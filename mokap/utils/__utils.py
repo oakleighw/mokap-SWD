@@ -2,9 +2,10 @@ import errno
 import platform
 import sys
 import os
+import re
 import colorsys
 from pathlib import Path
-from typing import Union, Sequence, Tuple, Optional
+from typing import Union, Sequence, Tuple, Optional, Callable
 
 import numpy as np
 from numpy.typing import ArrayLike
@@ -14,33 +15,72 @@ from numpy.typing import ArrayLike
 
 class CallbackOutputStream:
     """
-    Simple class to capture stdout and use it with alive_progress
+    Captures stdout and updates an alive_bar based on a regex pattern.
+    Suppresses all other stdout output (like Scipy verbosity).
     """
-    def __init__(self, callback, keep_stdout=False, keep_stderr=False):
-        self.callback = callback
+
+    def __init__(
+            self,
+            bar,
+            pattern: Union[str, re.Pattern],
+            refresh_rate: int = 1,
+            silence_errors: bool = False,
+            formatter: Optional[Callable[[re.Match], str]] = None
+         ):
+        """
+        Args:
+            bar: The alive_bar instance.
+            pattern: Regex string or compiled object to capture data from stdout.
+            refresh_rate: Update the bar text only every N matches (default 1).
+                          The bar progress (tick) is updated on every match.
+            formatter: Optional function that takes the re.Match object and returns
+                       the string to display on the bar.
+        """
+        self.bar = bar
+        self.pattern = re.compile(pattern) if isinstance(pattern, str) else pattern
+        self.refresh_rate = refresh_rate
+        self.formatter = formatter
+
+        self.silence_errors = silence_errors
         self.original_stdout = sys.stdout
         self.original_stderr = sys.stderr
-        self.keep_stdout = keep_stdout
-        self.keep_stderr = keep_stderr
+        self.buffer = ""
+        self.match_count = 0
 
     def __enter__(self):
         sys.stdout = self
-        if not self.keep_stderr:
-            sys.stderr = self
-            sys.stderr = open(os.devnull, 'w')  # Redirect stderr to null device
+        if self.silence_errors:
+            sys.stderr = open(os.devnull, 'w')
         return self
 
     def __exit__(self, exc_type, exc_value, traceback):
         sys.stdout = self.original_stdout
-        if not self.keep_stderr:
-            sys.stderr.close()  # Close the null device
+        if sys.stderr != self.original_stderr:
+            sys.stderr.close()
             sys.stderr = self.original_stderr
 
     def write(self, data):
-        if '\n' in data:
-            self.callback()
-        if self.keep_stdout:
-            self.original_stdout.write(data)
+        self.buffer += data
+        while '\n' in self.buffer:
+            line, self.buffer = self.buffer.split('\n', 1)
+
+            match = self.pattern.search(line)
+            if match:
+                self.match_count += 1
+
+                # Always tick the bar to track progress
+                self.bar()
+
+                # Only update the text on the refresh interval
+                if self.match_count % self.refresh_rate == 0:
+                    if self.formatter:
+                        text = self.formatter(match)
+                    else:
+                        # Default: join all captured groups with a pipe
+                        text = " | ".join(match.groups())
+
+                    if text:
+                        self.bar.text(text)
 
     def flush(self):
         self.original_stdout.flush()

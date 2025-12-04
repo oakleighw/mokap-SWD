@@ -320,7 +320,7 @@ class MultiviewCalibrationTool:
             logger.error(f"[BA] Not enough samples for bundle adjustment. Have {P}, need {self._min_detections}.")
             return False
 
-        logger.debug(f"[BA] Starting 3-Stage Bundle Adjustment with {P} samples.")
+        logger.debug(f"[BA] Starting 3-stage Bundle Adjustment with {P} samples.")
 
         C = self.nb_cameras
         N = self._object_points.shape[0]
@@ -451,7 +451,9 @@ class MultiviewCalibrationTool:
                     priors=priors_stage1,
 
                     origin_idx=self.origin_idx,
-                    radial_penalty=0.0  # for fisrst stage we want to consider all points, even at the edge
+                    radial_penalty=0.0,  # for fisrst stage we want to consider all points, even at the edge
+
+                    stage=1
                 )
                 if not success_s1:
                     raise RuntimeError("BA Stage 1 failed.")
@@ -493,7 +495,9 @@ class MultiviewCalibrationTool:
                     distortion_model='simple',  # start optimising distortion
 
                     priors=priors_stage2,
-                    radial_penalty=2.0 # for second stage we want to start penalising points too far from the working volume
+                    radial_penalty=2.0, # for second stage we want to start penalising points too far from the working volume
+
+                    stage=2
                 )
                 if not success_s2:
                     raise RuntimeError("BA Stage 2 failed.")
@@ -536,7 +540,9 @@ class MultiviewCalibrationTool:
 
                     priors=priors_stage3,  # Priors are mega important at this stage
 
-                    radial_penalty=4.0  # now we kinda want to ignore the points far from the working volume
+                    radial_penalty=4.0,  # now we kinda want to ignore the points far from the working volume
+
+                    stage=1
                 )
                 if not success_s3:
                     raise RuntimeError("BA Stage 3 failed.")

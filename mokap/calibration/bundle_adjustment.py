@@ -1,9 +1,10 @@
 import numpy as np
 from scipy.optimize import least_squares
 from scipy.sparse import lil_matrix, csr_matrix
-from typing import Tuple, Dict, Optional
+from typing import Tuple, Dict, Optional, Any
 from functools import partial
 
+from mokap.utils import CallbackOutputStream
 from mokap.utils.datatypes import DistortionModel
 from mokap.geometry.backend import USE_JAX
 import mokap.geometry as geom
@@ -183,7 +184,7 @@ def _jax_residual_weights(points2d, visibility_mask, K, gamma=2.0):
 
     # Broadcast back to (C, P, N)
     # (nb_views / (1 + nb_views)) scales from ~0.5 (2 views) to ~1.0 (all views)
-    if visibility_mask.ndim == 3: # need to handle the shapes depending on if P exists
+    if visibility_mask.ndim == 3:  # need to handle the shapes depending on if P exists
         view_weight = nb_views[None, :, :]
     else:
         view_weight = nb_views[None, :]
@@ -360,11 +361,11 @@ def _get_bounds(spec, images_sizes_hw):
         # k_higher_order_lim = 0.05
 
         dist_bounds_map = [
-            (-k_lim, k_lim),    # k1
-            (-k_lim, k_lim),    # k2
-            (-p_lim, p_lim),    # p1
-            (-p_lim, p_lim),    # p2
-            (-k_lim, k_lim),    # k3
+            (-k_lim, k_lim),  # k1
+            (-k_lim, k_lim),  # k2
+            (-p_lim, p_lim),  # p1
+            (-p_lim, p_lim),  # p2
+            (-k_lim, k_lim),  # k3
             (-k_higher_order_lim, k_higher_order_lim),  # k4
             (-k_higher_order_lim, k_higher_order_lim),  # k5
             (-k_higher_order_lim, k_higher_order_lim)   # k6
@@ -630,10 +631,9 @@ def cost_function(params, fixed_params, spec, image_points, points_weights,
     # Note: sqrt(0) is 0, so invalid points add nothing to the sum
     mre = jnp.sum(jnp.sqrt(sq_dist_per_point)) / N
 
-    jax.debug.print("Component RMS: {x:.4f} px, MRE: {y:.4f} px", x=comp_rms, y=mre)
+    jax.debug.print("Component RMS: {x:.3f} px, MRE: {y:.3f} px", x=comp_rms, y=mre)
 
     # ──────────────────────────────────────────────────────────────────────────────
-
 
     # Priors: Extrinsics
     if prior_w_r > 0.0 or prior_w_t > 0.0:
@@ -833,7 +833,8 @@ def run_bundle_adjustment(
         shared_intrinsics: bool = False,
         distortion_model: DistortionModel = 'standard',
         tolerance: float = 1e-8,
-        max_nfev: int = 500
+        max_nfev: int = 500,
+        stage: Optional[Any] = None,
 ) -> Tuple[bool, Dict]:
     # TODO: Maybe get rid of priors and only rely in covariance matrices...?
 
@@ -951,23 +952,32 @@ def run_bundle_adjustment(
         use_intrinsics_prior=prior_f > 0.0 or prior_c > 0.0 or prior_d > 0.0
     )
 
-    # with alive_bar(title='Bundle adjustment...', length=20, force_tty=True) as bar:
-    #     with CallbackOutputStream(bar, keep_stdout=False):
-    res = least_squares(
-        fun_wrapped, np.asarray(x0),
-        jac=jac_wrapped,
-        jac_sparsity=S,
-        bounds=(np.asarray(lb), np.asarray(ub)),
-        x_scale=scales,
-        method='trf',
-        loss='cauchy',
-        f_scale=2.5,
-        ftol=tolerance,
-        xtol=tolerance,
-        gtol=tolerance,
-        max_nfev=max_nfev,
-        verbose=2
-    )
+    def status_formatter(match):
+        rms, mre = match.groups()
+        return f"| Component RMS: {rms} px | MRE: {mre} px"
+
+    title = f'Stage: {stage}' if stage else 'Bundle Adjustment'
+    with alive_bar(title=title, length=20, force_tty=True) as bar:
+        with CallbackOutputStream(bar,
+                pattern=r"Component RMS: ([0-9\.]+) px, MRE: ([0-9\.]+) px",
+                refresh_rate=10,    # update text every 10 evals
+                formatter=status_formatter
+        ):
+            res = least_squares(
+                fun_wrapped, np.asarray(x0),
+                jac=jac_wrapped,
+                jac_sparsity=S,
+                bounds=(np.asarray(lb), np.asarray(ub)),
+                x_scale=scales,
+                method='trf',
+                loss='cauchy',
+                f_scale=2.5,
+                ftol=tolerance,
+                xtol=tolerance,
+                gtol=tolerance,
+                max_nfev=max_nfev,
+                verbose=2
+            )
 
     # Unpack (NumPy)
     # Note: unpacking assumes x is a JAX array so we cast res.x just one time, it's fine
