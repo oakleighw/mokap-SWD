@@ -350,8 +350,7 @@ class MultiviewCalibrationTool:
 
         # Disambiguate using pose history if available, and find a consensus
         T_o2w_votes = self._disambiguate_poses(T_o2w_votes, T_c2w_ank, T_o2c_ank)
-        # T_o2w = self._consensus_poses_strict(T_o2w_votes)   # uses the strict one online estimation
-        T_o2w = self._consensus_poses_lenient(T_o2w_votes)   # uses the strict one online estimation
+        T_o2w = self._consensus_poses_strict(T_o2w_votes)   # uses the strict one online estimation
         if T_o2w is None:
             return
 
