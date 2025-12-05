@@ -681,7 +681,7 @@ class MultiviewCalibrationTool:
 
         for s, config in enumerate(configs):
 
-            logger.debug(f"[BA] >>> STAGE {s}: {stage_names[s]} ({self._ba_num_samples} frames)")
+            logger.debug(f"[BA] >>> STAGE {s + 1}: {stage_names[s]} ({self._ba_num_samples} frames)")
 
             # Create covariance matrices for this stage
             cov_extr, cov_intr = covariance_from_std(
@@ -717,7 +717,7 @@ class MultiviewCalibrationTool:
                 covariance_intrinsics=cov_intr,
                 covariance_extrinsics=cov_extr,
                 radial_penalty=config.radial_penalty,
-                stage=s
+                stage=s+1
             )
 
             if not success:
