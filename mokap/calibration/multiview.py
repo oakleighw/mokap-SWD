@@ -59,9 +59,7 @@ class MultiviewDetection:
 
 @dataclass
 class BundleAdjustmentConfig:
-
-    distortion_model: str
-    n_dist_coeffs: int  # TODO: useless since distortion model is passed
+    distortion_model: DistortionModel
 
     # Flags
     fix_intrinsics: bool
@@ -72,7 +70,7 @@ class BundleAdjustmentConfig:
     shared_intrinsics: bool
 
     radial_penalty: float
-    
+
     # Covariance parameters
     sigma_f: float
     sigma_c: float
@@ -125,7 +123,7 @@ class MultiviewCalibrationTool:
             translational_thresh: Translation threshold for pose consensus (same units as object_points)
             distortion_model: Distortion model to use
         """
-        
+
         self.nb_cameras = nb_cameras
         self.origin_cam_idx = origin_cam_idx
         self._distortion_model = distortion_model
@@ -139,7 +137,7 @@ class MultiviewCalibrationTool:
         # Intrinsics state
         self._K = self._validate_camera_matrices(K_init)
         self._D = self._validate_distortion_coeffs(D_init)
-        
+
         # Extrinsics state
         self._has_extrinsics = np.zeros(nb_cameras, dtype=bool)
         self._has_extrinsics[self.origin_cam_idx] = True  # origin camera is ths origin so it has extrinsics immediately
@@ -149,23 +147,24 @@ class MultiviewCalibrationTool:
 
         # Object pose tracking
         self._current_object_pose: Optional[xp.ndarray] = None  # latest object pose as a T mat, in o2w
-        self._object_poses_stack = deque(maxlen=10)   # stack of object poses over time, as T mats, in o2w  # TODO: why is this limited to 10 ?????
+        # We only keep a short history to disambiguate 180-degree flips using temporal continuity
+        self._object_poses_stack = deque(maxlen=20)
 
         # Detection buffers
         self._detection_buffer: List[Dict[int, SingleviewDetection]] = [{} for _ in range(nb_cameras)]
         self._current_frame_indices = np.full(nb_cameras, -1, dtype=int)  # latest detection per camera
-        
+
         # Bundle adjustment samples buffers
         self._samples = deque(maxlen=max_detections)
         self._min_detections = min_detections
 
         # Refinement results
         self._is_refined = False
-        
+
         self._refined_intrinsics = None
         self._refined_cam_poses_c2w = None      # T matrices (C, 4, 4)
         self._refined_object_poses_o2w = None   # T matrices (P, 4, 4)
-        
+
         self._points2d_final = None
         self._visibility_final = None
         self._volume_of_trust = None
@@ -196,8 +195,7 @@ class MultiviewCalibrationTool:
             K = xp.asarray(K_np, dtype=xp.float32)
 
         if K.shape != (self.nb_cameras, 3, 3):
-            raise ValueError(
-                f"Shape mismatch for init_cam_matrices. Expected ({self.nb_cameras}, 3, 3), got {K.shape}")
+            raise ValueError(f"Shape mismatch for init_cam_matrices. Expected ({self.nb_cameras}, 3, 3), got {K.shape}")
         return K
 
     def _validate_distortion_coeffs(self, D_init: ArrayLike) -> xp.ndarray:
@@ -211,8 +209,7 @@ class MultiviewCalibrationTool:
             D = xp.asarray(D_np, dtype=xp.float32)
 
         if D.shape[0] != self.nb_cameras:
-            raise ValueError(
-                f"Shape mismatch for init_dist_coeffs. Expected ({self.nb_cameras}, D), got {D.shape}")
+            raise ValueError(f"Shape mismatch for init_dist_coeffs. Expected ({self.nb_cameras}, D), got {D.shape}")
         return D
 
     def register(self, cam_idx: int, detection: DetectionPayload):
@@ -226,7 +223,7 @@ class MultiviewCalibrationTool:
             cam_idx: Index of the camera
             detection: Detection payload containing points and frame number
         """
-        
+
         if detection.pointsIDs is None or detection.points2D is None:
             return
 
@@ -245,7 +242,7 @@ class MultiviewCalibrationTool:
             return
 
         self._current_frame_indices[cam_idx] = detection.frame_idx
-        
+
         # Store detection in frame buffer
         cam_detection = SingleviewDetection(
             cam_idx=cam_idx,
@@ -275,12 +272,16 @@ class MultiviewCalibrationTool:
 
     def _find_stale_frames(self) -> List[int]:
         """
-        Find frame numbers that are behind the minimum processed frame across all cameras.
-
-        A frame is considered "stale" if it's less than the minimum frame number that
-        has been seen across all cameras, indicating all cameras have moved past it.
+        Find frame numbers that are behind the minimum processed frame across
+        cameras that have actually seen something.
         """
-        global_min = int(self._current_frame_indices.min())
+        valid_indices = self._current_frame_indices[self._current_frame_indices > -1]
+
+        # If no camera has seen anything, nothing is stale
+        if len(valid_indices) == 0:
+            return []
+
+        global_min = int(valid_indices.min())
 
         # Collect all pending frame numbers
         pending_frames = set()
@@ -446,7 +447,7 @@ class MultiviewCalibrationTool:
         Find consensus object pose from multiple camera views using strict thresholds.
         Uses IRLS-style outlier rejection.
         """
-        
+
         # Decompose transforms for q and t
         r_stack, t_stack = decompose_transform_matrix(T_o2w_votes)
         q_stack = quaternion_from_vector(r_stack)
@@ -461,10 +462,8 @@ class MultiviewCalibrationTool:
         )
 
         if not success:
-            logger.debug(
-                f"[CONSENSUS_FAIL] Frame rejected. Could not find a consistent object pose "
-                f"among {qt_stack.shape[0]} views."
-            )
+            logger.debug(f"[CONSENSUS_FAIL] Frame rejected. Could not find a consistent"
+                         f" object pose among {qt_stack.shape[0]} views.")
             return None
 
         # Re compose final transform
@@ -496,27 +495,26 @@ class MultiviewCalibrationTool:
         D_batch = self._D[frame_data.cam_indices]
 
         reproj_pts, reproj_mask = project_to_cameras(
-            world_pts,
-            T_w2c_new,
-            K_batch,
-            D_batch,
+            points3d=world_pts,
+            T_w2c=T_w2c_new,
+            K=K_batch,
+            D=D_batch,
             distortion_model=self._distortion_model
         )
 
         # Calculate reprojection error
         effective_visibility = frame_data.visibility_mask * reproj_mask
+
         errors_dict = reprojection_errors(
-            frame_data.points2D,
-            reproj_pts,
-            effective_visibility
+            points2d_observed=frame_data.points2D,
+            points2d_reprojected=reproj_pts,
+            visibility_mask=effective_visibility
         )
 
         frame_rms = errors_dict['rms_euclidean']
 
         if frame_rms > self._max_frame_rms_threshold:
-            logger.debug(
-                f"[QUALITY_REJECT] Frame rejected. High Euclidean RMS Error: {frame_rms:.2f}px"
-            )
+            logger.debug(f"[QUALITY_REJECT] Frame rejected. High Euclidean RMS: {frame_rms:.2f}px")
             return False
 
         logger.debug(f"[ACCEPTED] Frame Euclidean RMS: {frame_rms:.2f} px.")
@@ -540,7 +538,7 @@ class MultiviewCalibrationTool:
         if not all(self._has_extrinsics):
             logger.error("[BA] Initial extrinsics have not been estimated yet.")
             return False
-        
+
         P = self.sample_count
         if P < self._min_detections:
             logger.error(f"[BA] Not enough samples. Have {P}, need {self._min_detections}.")
@@ -558,22 +556,19 @@ class MultiviewCalibrationTool:
                 self._prepare_ba_data(current_P)
                 final_results = self._run_multistage_ba(ba_configs)
                 self._store_ba_results(final_results)
-
-                logger.info(f"Bundle adjustment complete using {current_P} samples. Storing refined parameters.")
+                logger.info(f"Bundle adjustment complete using {current_P} samples.")
                 return True
 
             except MemoryError:
-                current_P = self._handle_memory_error(current_P)
+                gc.collect()
+                logger.warning(f"[BA] Memory error with {current_P} samples. Reducing and retrying.")
+                current_P = int(current_P * 0.9)
 
             except RuntimeError as e:
                 logger.error(f"[BA] {e}. Could not converge even with {current_P} samples. Aborting.")
                 return False
 
-        logger.error(
-            f"[BA] Failed to complete bundle adjustment. "
-            f"Minimum sample requirement is {self._min_detections}, but failed even after "
-            f"reducing to {current_P}."
-        )
+        logger.error(f"[BA] Failed to complete bundle adjustment.")
         return False
 
     def _create_ba_stage_configs(self) -> List[BundleAdjustmentConfig]:
@@ -584,13 +579,6 @@ class MultiviewCalibrationTool:
         Stage 2: Per-camera intrinsics with simple distortion
         Stage 3: Full refinement with complete distortion model
         """
-
-        # TODO: Get rid of this. Use DistortionModel datatype
-        #  (DistortionModel = Literal['none', 'simple', 'standard', 'rational', 'thinprism', 'tilted', 'fisheye'])
-        from mokap.calibration.bundle_adjustment import DIST_MODEL_MAP
-        n_d_full = DIST_MODEL_MAP.get(self._distortion_model, 0)
-        if self._distortion_model == 'fisheye':
-            n_d_full = 4
 
         return [
             # Stage 1: Global geometry with shared intrinsics, no distortion
@@ -608,7 +596,6 @@ class MultiviewCalibrationTool:
                 sigma_d=1.0,  # Unused (distortion 'none')
                 sigma_r=10.0,  # Loose extrinsics (finding the pose)
                 sigma_t=1000.0,  # Loose translation
-                n_dist_coeffs=0
             ),
             # Stage 2: Per-camera intrinsics with simple distortion
             BundleAdjustmentConfig(
@@ -625,7 +612,6 @@ class MultiviewCalibrationTool:
                 sigma_d=0.1,  # Allow small distortion (prevent overfitting)
                 sigma_r=1.0,  # Allow extrinsics to adjust
                 sigma_t=50.0,
-                n_dist_coeffs=4
             ),
             # Stage 3: Final polish with full distortion model
             BundleAdjustmentConfig(
@@ -642,7 +628,6 @@ class MultiviewCalibrationTool:
                 sigma_d=0.05,  # Tighten distortion further
                 sigma_r=0.05,  # Approx 2.8 degrees
                 sigma_t=10.0,
-                n_dist_coeffs=n_d_full
             )
         ]
 
@@ -701,7 +686,7 @@ class MultiviewCalibrationTool:
             # Create covariance matrices for this stage
             cov_extr, cov_intr = covariance_from_std(
                 nb_cameras=self.nb_cameras,
-                nb_dist_coeffs=config.n_dist_coeffs,    # TODO: This function should use distortion model datatype, not this
+                distortion_model=config.distortion_model,
                 fix_aspect_ratio=config.fix_aspect_ratio,
                 shared_intrinsics=config.shared_intrinsics,
                 sigma_f=config.sigma_f,
@@ -717,7 +702,7 @@ class MultiviewCalibrationTool:
                 D=current_D,
                 cameras_poses=current_camera_poses,
                 images_sizes_hw=self._images_sizes_hw,
-                points2d_observed=self._ba_points2d,        # TODO: Why is this receiving an attribute and object_poses is receiving current_object_poses?
+                points2d_observed=self._ba_points2d,
                 visibility_mask=self._ba_visibility,
                 object_points=self._object_points,
                 object_poses=current_object_poses,
@@ -763,26 +748,6 @@ class MultiviewCalibrationTool:
         self._ba_points2d = None
         self._ba_visibility = None
         self._ba_object_poses = None
-
-    def _handle_memory_error(self, current_P: int) -> int:
-        """
-        Handle memory error during bundle adjustment.
-
-        Args:
-            current_P: Current number of samples
-
-        Returns:
-            Reduced number of samples for next attempt
-        """
-        gc.collect()
-        mem = psutil.virtual_memory()
-        logger.warning(
-            f"[BA] Memory error encountered with {current_P} samples. "
-            f"RAM usage: {mem.percent}% ({mem.used / 1e9:.2f}/{mem.total / 1e9:.2f} GB). "
-            f"Reducing sample count and retrying."
-        )
-        return int(current_P * 0.9)
-
 
     def volume_of_trust(
             self,
