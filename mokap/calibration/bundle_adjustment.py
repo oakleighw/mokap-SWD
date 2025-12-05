@@ -3,7 +3,7 @@ import numpy as np
 from scipy.optimize import least_squares
 from scipy.sparse import lil_matrix, csr_matrix
 from scipy.linalg import cholesky
-from typing import Tuple, Dict, Optional, Any
+from typing import Tuple, Dict, Optional, Any, Literal
 from functools import partial
 from dataclasses import dataclass
 
@@ -23,6 +23,18 @@ if not USE_JAX:
     except ImportError:
         raise ImportError(f'Bundle Adjustment requires JAX to be installed.')
     print(f'[INFO] Mokap math backend is set to NumPy. JAX will be enabled for Bundle Adjustment only.')
+
+
+
+def dist_coeffs_map(model: DistortionModel) -> int:
+    if model == 'none': return 0
+    if model == 'simple': return 4     # k1, k2, p1, p2
+    if model == 'standard': return 5   # k1, k2, p1, p2, k3
+    if model == 'rational': return 8   # k1-k6, p1, p2
+    if model == 'fisheye': return 4    # k1, k2, k3, k4
+    if model == 'thinprism': return 12
+    if model == 'tilted': return 14
+    return 0
 
 
 # ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
@@ -105,7 +117,7 @@ def _jax_distort(points_norm, D, model_idx):
         out_x = x * radial
         out_y = y * radial
 
-    elif model_idx == 99:  # Fisheye (Equidistant)
+    elif model_idx == 99:  # Fisheye (mapped from string 'fisheye' in spec)
         theta = jnp.arctan(r)
         theta2 = theta * theta
         k1, k2, k3, k4 = D[..., 0], D[..., 1], D[..., 2], D[..., 3]
@@ -226,11 +238,9 @@ class PriorInfo:
     extrinsics_srim: Optional[jnp.ndarray] = None  # (C-1, 6, 6), or None
     extrinsics_mean: Optional[jnp.ndarray] = None  # (C-1, 6), rvec, tvec concatenated
 
-
-# TODO: This function should probably not live in this file
 def covariance_from_std(
         nb_cameras: int,
-        nb_dist_coeffs: int,
+        distortion_model: DistortionModel,
         fix_aspect_ratio: bool,
         shared_intrinsics: bool,
         sigma_f: float = 100.0,     # TODO: tune these for our cameras + lenses combinations
@@ -242,8 +252,6 @@ def covariance_from_std(
     """
     Creates diagonal covariance matrices from scalar standard deviations.
     This is useful for the first BA run when no prior covariance is available.
-
-    TODO: the weights correspond to 1/sigma^2 in the old, scalar priors system: multiview.py needs update
 
     Args:
         nb_cameras: Number of cameras
@@ -272,8 +280,9 @@ def covariance_from_std(
     for i in range(nb_optim_cams):
         extrinsics_cov[i] = np.diag(extr_variances)
 
-    # Intrinsics: (nb_intr_sets, n_K + n_D, n_K + n_D)
-    nb_K = 3 if fix_aspect_ratio else 4  # f or (fx, fy), cx, cy
+    # Intrinsics
+    nb_K = 3 if fix_aspect_ratio else 4
+    nb_dist_coeffs = dist_coeffs_map(distortion_model)
     intrinsics_dim = nb_K + nb_dist_coeffs
 
     # Build variance vector for one intrinsics set
@@ -283,7 +292,8 @@ def covariance_from_std(
         intr_variances = np.array([sigma_f ** 2 + eps, sigma_f ** 2 + eps, sigma_c ** 2 + eps, sigma_c ** 2 + eps])
 
     # Add distortion variances
-    intr_variances = np.concatenate([intr_variances, np.full(nb_dist_coeffs, sigma_d ** 2 + eps)])
+    if nb_dist_coeffs > 0:
+        intr_variances = np.concatenate([intr_variances, np.full(nb_dist_coeffs, sigma_d ** 2 + eps)])
 
     intrinsics_cov = np.zeros((nb_intr_sets, intrinsics_dim, intrinsics_dim))
     for i in range(nb_intr_sets):
@@ -343,7 +353,7 @@ def prepare_prior_info(
         spec: Dict,
         initial_params: Dict[str, np.ndarray],
         covariance_intrinsics: Optional[np.ndarray] = None,
-        covariance_extrinsics: Optional[np.ndarray]= None
+        covariance_extrinsics: Optional[np.ndarray] = None
 ) -> Optional[PriorInfo]:
     """
     Prepares the prior information for use in the cost function.
@@ -390,9 +400,6 @@ def prepare_prior_info(
         has_D = 'D' in spec['blocks']
 
         if has_K or has_D:
-            intr_info = covariance_to_information(covariance_intrinsics)
-            intr_srim = jnp.array(compute_SRIM(intr_info))
-
             # Build mean from initial K and D
             is_shared = cfg['shared_intrinsics'] and cfg['nb_cams'] > 1
             K_init = initial_params['K']
@@ -425,11 +432,7 @@ def prepare_prior_info(
 
             # Check for dimension mismatch
             if expected_dim != prior_dim:
-                warnings.warn(
-                    f"[Bundle Adjustment] Ignoring intrinsics prior: Dimension mismatch. "
-                    f"Current config requires {expected_dim} params (fix_aspect_ratio={cfg['fix_aspect_ratio']}), "
-                    f"but covariance matrix has {prior_dim}."
-                )
+                warnings.warn(f"[BA] Ignoring intrinsics prior: Dimension mismatch {expected_dim} vs {prior_dim}.")
                 intr_srim = None
                 intr_mean = None
             else:
@@ -452,10 +455,6 @@ def prepare_prior_info(
 # Helpers and specs config (NumPy)
 # ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
-# TODO: Get rid of this and the double 'nb_dist_coeffs' and 'n_d_size' keys, it's confusing. Use DistortionModel Literal from datatypes
-DIST_MODEL_MAP = {'none': 0, 'simple': 4, 'standard': 5, 'rational': 8, 'thinprism': 12, 'tilted': 14, 'fisheye': 99}
-
-
 def _get_parameter_spec(
         nb_cams, nb_frames, nb_points,
         nb_points_to_optim, origin_cam_idx, distortion_model,
@@ -471,28 +470,26 @@ def _get_parameter_spec(
     is_shared = shared_intrinsics and nb_cams > 1
     nb_intr_sets = 1 if is_shared else nb_cams
 
+    # Determine size and index for JAX
+    nb_dist_coeffs = dist_coeffs_map(distortion_model)
+    spec['config']['n_d_size'] = nb_dist_coeffs
+
+    # Internal JAX kernel dist_model_idx logic
+    if distortion_model == 'fisheye':
+        spec['config']['dist_model_idx'] = 99
+    else:
+        spec['config']['dist_model_idx'] = nb_dist_coeffs
+
     if not fix_intrinsics:
         size_per_set = 3 if fix_aspect_ratio else 4
         size_cam_mat = size_per_set * nb_intr_sets
         spec['blocks']['K'] = {'offset': current_offset, 'size': size_cam_mat}
         current_offset += size_cam_mat
 
-        nb_dist_coeffs = DIST_MODEL_MAP.get(distortion_model, 0)
-        n_d_size = 4 if distortion_model == 'fisheye' else nb_dist_coeffs
-
-        spec['config']['nb_dist_coeffs'] = nb_dist_coeffs
-        spec['config']['n_d_size'] = n_d_size
-        spec['config']['dist_model_idx'] = nb_dist_coeffs
-
         if nb_dist_coeffs > 0:
-            size_dist = n_d_size * nb_intr_sets
+            size_dist = nb_dist_coeffs * nb_intr_sets
             spec['blocks']['D'] = {'offset': current_offset, 'size': size_dist}
             current_offset += size_dist
-    else:
-        # Fallback for when intrinsics are fixed
-        spec['config']['nb_dist_coeffs'] = DIST_MODEL_MAP.get(distortion_model, 0)
-        spec['config']['n_d_size'] = 4 if distortion_model == 'fisheye' else spec['config']['nb_dist_coeffs']
-        spec['config']['dist_model_idx'] = spec['config']['nb_dist_coeffs']
 
     if not fix_extrinsics:
         nb_optim_cams = nb_cams - 1
@@ -592,6 +589,7 @@ def _get_bounds(spec, images_sizes_hw):
         info = spec['blocks']['D']
         nb_dist_coeffs = cfg['n_d_size']
         nb_sets = 1 if cfg['shared_intrinsics'] else cfg['nb_cams']
+        model = cfg['distortion_model']
 
         # Create bounds
 
@@ -600,28 +598,30 @@ def _get_bounds(spec, images_sizes_hw):
         # This works well for our Basler cameras + Basler 50 mm lenses + 10 mm extender rings
         k_lim = 0.1
         p_lim = 0.005
-        k_higher_order_lim = 0.05
+        k_higher = 0.05
 
-        # These ones should be a bit more generic
+        # Generic bounds that should work for most industrial lenses
         # k_lim = 0.5
         # p_lim = 0.05
-        # k_higher_order_lim = 0.05
+        # k_higher = 0.05
 
-        dist_bounds_map = [
-            (-k_lim, k_lim),  # k1
-            (-k_lim, k_lim),  # k2
-            (-p_lim, p_lim),  # p1
-            (-p_lim, p_lim),  # p2
-            (-k_lim, k_lim),  # k3
-            (-k_higher_order_lim, k_higher_order_lim),  # k4
-            (-k_higher_order_lim, k_higher_order_lim),  # k5
-            (-k_higher_order_lim, k_higher_order_lim)   # k6
-        ]
+        if model == 'fisheye':
+            # k1, k2, k3, k4
+            dist_bounds_map = [(-k_lim, k_lim)] * 4
+        else:
+            # k1, k2, p1, p2, k3, k4, k5, k6
+            dist_bounds_map = [
+                (-k_lim, k_lim), (-k_lim, k_lim),
+                (-p_lim, p_lim), (-p_lim, p_lim),
+                (-k_lim, k_lim),
+                (-k_higher, k_higher), (-k_higher, k_higher), (-k_higher, k_higher)
+            ]
 
-        # TODO: Fisheye map is different: k1, k2, k3, k4
+        # Slice to current model size
+        bounds_to_use = dist_bounds_map[:nb_dist_coeffs]
 
-        dist_lb = [b[0] for b in dist_bounds_map[:nb_dist_coeffs]]
-        dist_ub = [b[1] for b in dist_bounds_map[:nb_dist_coeffs]]
+        dist_lb = [b[0] for b in bounds_to_use]
+        dist_ub = [b[1] for b in bounds_to_use]
 
         # Tile for all cameras
         dist_lb = np.tile(dist_lb, nb_sets)
@@ -761,14 +761,8 @@ def _extract_current_intrinsics_vector(K, D, spec):
     """
     cfg = spec['config']
     is_shared = cfg['shared_intrinsics'] and cfg['nb_cams'] > 1
-
-    if is_shared:
-        K_use = K[:1]
-        D_use = D[:1]
-    else:
-        K_use = K
-        D_use = D
-
+    K_use = K[:1] if is_shared else K
+    D_use = D[:1] if is_shared else D
     parts = []
 
     if 'K' in spec['blocks']:
@@ -877,7 +871,6 @@ def cost_function(params, fixed_params, image_points, points_weights, spec, prio
     # ──────────────────────────────────────────────────────────────────────────────
     # DEBUG: Print RMS Errors
     # ──────────────────────────────────────────────────────────────────────────────
-
     # Mask and count
     mask = w_reproj > 0
     N = jnp.maximum(jnp.sum(mask), 1.0)
@@ -895,18 +888,15 @@ def cost_function(params, fixed_params, image_points, points_weights, spec, prio
     mre = jnp.sum(jnp.sqrt(sq_dist_per_point)) / N
 
     jax.debug.print("Component RMS: {x:.3f} px, MRE: {y:.3f} px", x=comp_rms, y=mre)
-
     # ──────────────────────────────────────────────────────────────────────────────
+
     # Priors with covariance matrices
-    # ──────────────────────────────────────────────────────────────────────────────
-
     if prior_info is not None:
-        origin_cam_idx = cfg['origin_cam_idx']
 
         # Extrinsics priors using SRIM
         if prior_info.extrinsics_srim is not None:
             all_indices = jnp.arange(cfg['nb_cams'])
-            optim_indices = jnp.delete(all_indices, origin_cam_idx)
+            optim_indices = jnp.delete(all_indices, cfg['origin_cam_idx'])
 
             # Current extrinsics for optimizable cameras: (C-1, 6)
             current_extr = jnp.concatenate([camera_rvecs[optim_indices], camera_tvecs[optim_indices]], axis=-1)
@@ -938,7 +928,6 @@ def cost_function(params, fixed_params, image_points, points_weights, spec, prio
 # ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 # Jacobian sparsity creation, and Covariance from Jacobian (pure NumPy)
 # ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
-
 
 def jacobian_sparsity(spec, prior_info: Optional[PriorInfo]) -> csr_matrix:
     """
@@ -1266,12 +1255,12 @@ def run_bundle_adjustment(
 
     # Setup (NumPy)
     C, P, N, _ = points2d_observed.shape
-    
-    camera_rvecs, camera_tvecs = geom.decompose_transform_matrix(cameras_poses)
-    object_rvecs, object_tvecs = geom.decompose_transform_matrix(object_poses) if object_poses is not None else (None, None)
 
+    camera_rvecs, camera_tvecs = geom.decompose_transform_matrix(cameras_poses)
+    object_rvecs, object_tvecs = geom.decompose_transform_matrix(object_poses) if object_poses is not None else (None,
+                                                                                                                 None)
     nb_pts_opt = object_points.shape[0] if object_points is not None and not fix_object_points else 0
-    
+
     # Create initial params dict
     initial_params = {
         'K': np.array(K).copy(),
@@ -1281,7 +1270,7 @@ def run_bundle_adjustment(
         'object_rvecs': np.array(object_rvecs).copy(),
         'object_tvecs': np.array(object_tvecs).copy()
     }
-    
+
     # Create specs dict
     spec = _get_parameter_spec(
         nb_cams=C,
@@ -1296,7 +1285,7 @@ def run_bundle_adjustment(
         fix_object_poses=fix_object_poses,
         fix_aspect_ratio=fix_aspect_ratio,
         shared_intrinsics=shared_intrinsics
-    ) 
+    )
 
     # Parameters packing (NumPy)
     nb_dist_coeffs = spec['config']['n_d_size']
@@ -1320,7 +1309,7 @@ def run_bundle_adjustment(
         initial_params=initial_params,
         images_sizes_hw=images_sizes_hw
     )
-    
+
     lb, ub = _get_bounds(
         spec=spec,
         images_sizes_hw=images_sizes_hw
@@ -1435,7 +1424,7 @@ def run_bundle_adjustment(
 
     # Unpack (NumPy)
     K_opt, D_opt, cam_rvecs_opt, cam_tvecs_opt, obj_points_opt, obj_rvecs_opt, obj_tvecs_opt = _unpack_params_jax(
-        spec, 
+        spec,
         jnp.array(res.x),   # unpacking assumes x is a JAX array so we cast res.x just one time, it's fine
         fixed_params
     )
@@ -1455,10 +1444,10 @@ def run_bundle_adjustment(
     # Estimate posterior covariance
     try:
         full_cov, cov_intr_final, cov_extr_final = covariance_from_jacobian(res, jac_wrapped, spec)
-        
+
         if cov_intr_final is not None:
             results['covariance_intrinsics'] = cov_intr_final
-        
+
         if cov_extr_final is not None:
             results['covariance_extrinsics'] = cov_extr_final
 

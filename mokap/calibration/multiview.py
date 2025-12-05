@@ -145,11 +145,11 @@ class MultiviewCalibrationTool:
         self._has_extrinsics[self.origin_cam_idx] = True  # origin camera is ths origin so it has extrinsics immediately
 
         identity = xp.eye(4, dtype=xp.float32)
-        self._cam_T_c2w = xp.repeat(identity[None, ...], nb_cameras, axis=0)
+        self._camera_poses = xp.repeat(identity[None, ...], nb_cameras, axis=0)   # current estimate of camera poses as T mats, in c2w
 
         # Object pose tracking
-        self._current_object_T_o2w: Optional[xp.ndarray] = None  # in world coordinates
-        self._object_T_o2w_stack = deque(maxlen=10)
+        self._current_object_pose: Optional[xp.ndarray] = None  # latest object pose as a T mat, in o2w
+        self._object_poses_stack = deque(maxlen=10)   # stack of object poses over time, as T mats, in o2w  # TODO: why is this limited to 10 ?????
 
         # Detection buffers
         self._detection_buffer: List[Dict[int, SingleviewDetection]] = [{} for _ in range(nb_cameras)]
@@ -329,7 +329,7 @@ class MultiviewCalibrationTool:
             detections: List of SingleviewDetection objects from different cameras
         """
         if not any(self._has_extrinsics):
-            self._current_object_T_o2w = None
+            self._current_object_pose = None
             return
 
         mv_detection = self._consolidate_frame_data(detections)
@@ -341,7 +341,7 @@ class MultiviewCalibrationTool:
             return
 
         # Extract object-to-camera transforms
-        T_c2w_ank = self._cam_T_c2w[mv_detection.cam_indices[active_and_known]]
+        T_c2w_ank = self._camera_poses[mv_detection.cam_indices[active_and_known]]
         T_o2c_ank = mv_detection.T_o2c[active_and_known]
 
         # Generates the object-to-world votes
@@ -360,18 +360,18 @@ class MultiviewCalibrationTool:
         # Quality control
         if not self._validate_frame_quality(mv_detection, T_o2w, T_c2w_new):
             # Frame rejected
-            self._current_object_T_o2w = None
+            self._current_object_pose = None
             return
 
         # Append new agreed uppon object pose
-        self._current_object_T_o2w = T_o2w
-        self._object_T_o2w_stack.append(T_o2w)
+        self._current_object_pose = T_o2w
+        self._object_poses_stack.append(T_o2w)
 
         # Update extrinsics with new estimate
         for i, cam_idx in enumerate(mv_detection.cam_indices):
 
             if cam_idx != self.origin_cam_idx:  # never update origin camera
-                self._cam_T_c2w = set_at(self._cam_T_c2w, cam_idx, T_c2w_new[i])
+                self._camera_poses = set_at(self._camera_poses, cam_idx, T_c2w_new[i])
                 self._has_extrinsics[cam_idx] = True
 
         # Store the accepted sample for bundle adjustment
@@ -397,11 +397,11 @@ class MultiviewCalibrationTool:
         Returns:
             Disambiguated object-to-world transforms
         """
-        if len(self._object_T_o2w_stack) == 0:
+        if len(self._object_poses_stack) == 0:
             return T_o2w_votes
 
         # Compute reference rotation from history
-        history_transforms = xp.stack(list(self._object_T_o2w_stack))
+        history_transforms = xp.stack(list(self._object_poses_stack))
         history_quats = quaternion_from_matrix(history_transforms)
         q_ref = quaternion_average(history_quats)
 
@@ -671,7 +671,7 @@ class MultiviewCalibrationTool:
 
             # Estimate initial object poses for BA initialisation
             T_o2c = mv_detection.T_o2c
-            T_c2w = self._cam_T_c2w[cams_in_sample]
+            T_c2w = self._camera_poses[cams_in_sample]
             T_o2w_votes = T_c2w @ T_o2c
 
             T_object_w_buf.append(self._consensus_poses_lenient(T_o2w_votes))
@@ -688,7 +688,7 @@ class MultiviewCalibrationTool:
 
         current_K = self._K
         current_D = self._D
-        current_camera_poses = self._cam_T_c2w
+        current_camera_poses = self._camera_poses
         current_object_poses = self._ba_object_poses
 
         results = None
@@ -866,7 +866,7 @@ class MultiviewCalibrationTool:
         if self._is_refined:
             return self._refined_cam_poses_c2w
         elif all(self._has_extrinsics):
-            return self._cam_T_c2w
+            return self._camera_poses
         else:
             return None
 
@@ -874,17 +874,16 @@ class MultiviewCalibrationTool:
     def object_poses(self) -> Optional[xp.ndarray]:
         """
         Get object poses.
-
         Returns refined poses after BA, or the current pose history otherwise.
         """
         if self._is_refined:
             return self._refined_object_poses_o2w
-        elif len(self._object_T_o2w_stack) > 0:
-            return xp.stack(list(self._object_T_o2w_stack))
+        elif len(self._object_poses_stack) > 0:
+            return xp.stack(list(self._object_poses_stack))
         else:
             return None
 
     @property
     def curent_object_pose(self) -> Optional[xp.ndarray]:
         """Most recent object pose in world coordinates."""
-        return self._current_object_T_o2w
+        return self._current_object_pose
