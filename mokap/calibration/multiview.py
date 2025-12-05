@@ -7,7 +7,7 @@ import psutil
 import numpy as np
 from mokap.geometry.backend import xp, ArrayLike, set_at
 
-from mokap.calibration import bundle_adjustment
+from mokap.calibration.bundle_adjustment import covariance_from_std, run_bundle_adjustment
 from mokap.calibration.common import solve_pnp_robust
 
 from mokap.utils.datatypes import DetectionPayload, DistortionModel
@@ -317,10 +317,10 @@ class MultiviewCalibrationTool:
 
         P = self.ba_sample_count
         if P < self._min_detections:
-            logger.error(f"[BA] Not enough samples for bundle adjustment. Have {P}, need {self._min_detections}.")
+            logger.error(f"[BA] Not enough samples. Have {P}, need {self._min_detections}.")
             return False
 
-        logger.debug(f"[BA] Starting 3-stage Bundle Adjustment with {P} samples.")
+        logger.debug(f"[BA] Starting 3-Stage Bundle Adjustment with {P} samples.")
 
         C = self.nb_cameras
         N = self._object_points.shape[0]
@@ -328,53 +328,63 @@ class MultiviewCalibrationTool:
         ba_succeeded = False
         final_results = None
 
-        # Priors weights to prevent the BA from overfittign
-        priors_stage1 = {
-            'intrinsics': {
-                'focal_length': 0.1,  # weak, just to prevent the *average* focal length from drifting into nonsense
-                'principal_point': 5.0,  # This can be quite strong, most modern lenses have it very close to the centre
-                'distortion': 0.0
-            },
-            'extrinsics': {
-                'rotation': 0.0,
-                'translation': 0.0
-            }
-        }
-        priors_stage2 = {
-            'intrinsics': {
-                'focal_length': 1.0,    # quite strong. Keeps each camera's focal length from deviating from the average found in Stage 1
-                'principal_point': 0.1, # weak, but still here to keep the principal point near the image center
-                'distortion': 0.5       # medium, keeps the initial distortion terms small and well-behaved
-            },
-            'extrinsics': {  # extrinsics priors off
-                'rotation': 0.0,
-                'translation': 0.0
-            }
-        }
-        priors_stage3 = {
-            'intrinsics': {
-                'focal_length': 1.0,    # still strong. This is critical to avoid overfitting. TODO: Could be stronger maybe?
-                'principal_point': 0.1, # same as in stage 2. Modern cameras with modern lenses should be pretty centered...
-                'distortion': 0.1       # Relaxed from stage 2. We want to refine these a bit more.
-            },
-            'extrinsics': { # We assume by then the geometry is pretty good, so we set priors on the extrinsics
-                            # This prevents a single camera with poor visibility in some frames from drifting
-
-                # A weight of ~ 700 on radians is comparable to a weight of 0.1 on mm for a target tolerance of 0.5 deg / 1.0 mm
-                # This keeps camera poses very stable, allowing only tiny final adjustments
-                # TODO: Maybe we want to do this scaling inside the bundle_adjustment module and only expose normalised weights here?
-                'rotation': 700,
-                'translation': 0.1
-            }
-        }
-
-        # The try except loop is a little safeguard to avoid filling up the RAM because of the jacobian
-        # (it grows quadratically with the nb of samples)
+        # The try-loop handles potential memory issues by reducing sample count
         current_P = self.ba_sample_count
+
+        def make_cov(sigma_f, sigma_c, sigma_d, sigma_r, sigma_t, n_d_coeffs, shared):
+            return covariance_from_std(
+                nb_cameras=C,
+                nb_dist_coeffs=n_d_coeffs,
+                fix_aspect_ratio=True,
+                shared_intrinsics=shared,
+                sigma_f=sigma_f, sigma_c=sigma_c, sigma_d=sigma_d, sigma_r=sigma_r, sigma_t=sigma_t
+            )
+
+        # # Priors weights to prevent the BA from overfittign
+        # priors_stage1 = {
+        #     'intrinsics': {
+        #         'focal_length': 0.1,  # weak, just to prevent the *average* focal length from drifting into nonsense
+        #         'principal_point': 5.0,  # This can be quite strong, most modern lenses have it very close to the centre
+        #         'distortion': 0.0
+        #     },
+        #     'extrinsics': {
+        #         'rotation': 0.0,
+        #         'translation': 0.0
+        #     }
+        # }
+        # priors_stage2 = {
+        #     'intrinsics': {
+        #         'focal_length': 1.0,    # quite strong. Keeps each camera's focal length from deviating from the average found in Stage 1
+        #         'principal_point': 0.1, # weak, but still here to keep the principal point near the image center
+        #         'distortion': 0.5       # medium, keeps the initial distortion terms small and well-behaved
+        #     },
+        #     'extrinsics': {  # extrinsics priors off
+        #         'rotation': 0.0,
+        #         'translation': 0.0
+        #     }
+        # }
+        # priors_stage3 = {
+        #     'intrinsics': {
+        #         'focal_length': 1.0,    # still strong. This is critical to avoid overfitting. TODO: Could be stronger maybe?
+        #         'principal_point': 0.1, # same as in stage 2. Modern cameras with modern lenses should be pretty centered...
+        #         'distortion': 0.1       # Relaxed from stage 2. We want to refine these a bit more.
+        #     },
+        #     'extrinsics': { # We assume by then the geometry is pretty good, so we set priors on the extrinsics
+        #                     # This prevents a single camera with poor visibility in some frames from drifting
+        #
+        #         # A weight of ~ 700 on radians is comparable to a weight of 0.1 on mm for a target tolerance of 0.5 deg / 1.0 mm
+        #         # This keeps camera poses very stable, allowing only tiny final adjustments
+        #         # TODO: Maybe we want to do this scaling inside the bundle_adjustment module and only expose normalised weights here?
+        #         'rotation': 700,
+        #         'translation': 0.1
+        #     }
+        # }
+
         while current_P >= self._min_detections:
             try:
                 logger.info(f"[BA] Attempting Bundle Adjustment with {current_P} samples.")
 
+                # Slice the buffers to current_P
                 current_samples = list(self.ba_samples)[-current_P:]
 
                 pts2d_buf = np.zeros((C, current_P, N, 2), dtype=np.float32)
@@ -410,147 +420,141 @@ class MultiviewCalibrationTool:
                     T_board_w_list.append(compose_transform_matrix(vector_from_quaternion(q_avg), t_avg))
 
                 # Prepare initial matrices
-                poses_T_initial = xp.stack(T_board_w_list)  # (P, 4, 4)
-                cam_T_online = self._T_c2w_all  # (C, 4, 4)
-
-                K_online = self._K
-                D_online = self._D
-
+                T_obj_initial = xp.stack(T_board_w_list)
                 pts2d_buf = xp.asarray(pts2d_buf)
                 vis_buf = xp.asarray(vis_buf)
 
                 self._points2d, self._visibility_mask = pts2d_buf, vis_buf  # store points for this run
 
-                # STAGE 1: Ideal pinhole world (shared intrinsics, no distortion)
-                # ---------------------------------------------------------------
-                # Here we care only about the overall camera layout and the average 3D structure of the scene
-                #
-                logger.debug(f"[BA] >>> STAGE 1: Consolidating cameras position with {current_P} frames...")
-                success_s1, results_s1 = bundle_adjustment.run_bundle_adjustment(
-                    K_initial=K_online,
-                    D_initial=D_online,
-                    cam_poses_initial=cam_T_online,
+                # STAGE 1: Global geometry (shared intrinsics, no distortion)
+                # ------------------------------------------------------------------
+                # Strategy: Trust the datasheet
+                # In high-mag setups, focal length is highly correlated with Z-translation.
+                # We constrain f/c to prevent the geometry from exploding.
 
+                logger.debug(f"[BA] >>> STAGE 1: Anchoring to datasheet specs ({current_P} frames)")
+
+                cov_extr_s1, cov_intr_s1 = make_cov(
+                    sigma_f=10.0,   # Allow 10 px deviation from datasheet
+                    sigma_c=0.2,    # Lock principal point to center
+                    sigma_d=1.0,    # Unused (distortion 'none')
+                    sigma_r=10.0,   # Loose extrinsics (finding the pose)
+                    sigma_t=1000.0, # Loose translation
+                    n_d_coeffs=0, shared=True
+                )
+
+                success_s1, results_s1 = run_bundle_adjustment(
+                    K=self._K,
+                    D=self._D,
+                    cameras_poses=self._T_c2w_all,
                     images_sizes_hw=self._images_sizes_hw,
-
-                    image_points=pts2d_buf,
+                    points2d_observed=pts2d_buf,
                     visibility_mask=vis_buf,
-
-                    object_points_initial=self._object_points,
-                    object_poses_initial=poses_T_initial,
-
+                    object_points=self._object_points,
+                    object_poses=T_obj_initial,
+                    origin_cam_idx=self.origin_idx,
+                    distortion_model='none',    # No distortion in stage 1
                     fix_intrinsics=False,
                     fix_extrinsics=False,
-                    fix_object_points=True,  # The board's shape is known and rigid
-                    fix_poses=False,  # The board's pose is being optimized
-
-                    # Stage 1 specific flags
-                    shared_intrinsics=True,     # Forces a single camera model for all views
+                    fix_object_points=True,     # The board's shape is known and rigid
+                    fix_object_poses=False,     # The board's pose is being optimized
                     fix_aspect_ratio=True,      # Assume fx = fy
-                    distortion_model='none',    # No distortion in stage 1
-                    priors=priors_stage1,
-
-                    origin_idx=self.origin_idx,
-                    radial_penalty=0.0,  # for fisrst stage we want to consider all points, even at the edge
-
+                    shared_intrinsics=True,     # Forces a single camera model for all views
+                    covariance_intrinsics=cov_intr_s1,
+                    covariance_extrinsics=cov_extr_s1,
+                    radial_penalty=0.0,
                     stage=1
                 )
                 if not success_s1:
                     raise RuntimeError("BA Stage 1 failed.")
 
-                # STAGE 2: Per-camera pinhole world (shared intrinsics, simple distortion)
-                # ------------------------------------------------------------------------
-                # Here we relax the shared model and start refining the per-camera details, but we use priors
-                # to keep them from deviating wildly from the stable average we found in Stage 1
-                #
-                logger.debug(f"[BA] >>> STAGE 2: Consolidating per-camera intrinsics with {current_P} frames...")
+                # STAGE 2: Per-camera intrinsics (simple distortion)
+                # ------------------------------------------------------------------
+                # Strategy: Relax shared constraint, but prevent drift.
+                # We use the results from Stage 1 (global average) as the mean for the priors.
+                # We enable distortion but constrain it so it doesn't eat up the focal length.
 
-                K_s2_init = results_s1['K_opt']
-                D_s2_init = results_s1['D_opt']
-                cam_T_s2_init = results_s1['cam_poses_opt']
-                poses_T_s2_init = results_s1['object_poses_opt']
+                logger.debug(f"[BA] >>> STAGE 2: Per-Camera Refinement")
 
-                success_s2, results_s2 = bundle_adjustment.run_bundle_adjustment(
-                    K_initial=K_s2_init,
-                    D_initial=D_s2_init,
-                    cam_poses_initial=cam_T_s2_init,
+                cov_extr_s2, cov_intr_s2 = make_cov(
+                    sigma_f=1.0,  # Keep close to the global average found in S1
+                    sigma_c=1.0,  # Allow slight PP shift per camera
+                    sigma_d=0.1,  # Allow small distortion (prevent overfitting)
+                    sigma_r=1.0,  # Allow extrinsics to adjust to the new f
+                    sigma_t=50.0,
+                    n_d_coeffs=4, shared=False
+                )
 
+                success_s2, results_s2 = run_bundle_adjustment(
+                    K=results_s1['K_opt'],
+                    D=results_s1['D_opt'],
+                    cameras_poses=results_s1['camera_poses_opt'],
                     images_sizes_hw=self._images_sizes_hw,
-
-                    image_points=pts2d_buf,
+                    points2d_observed=pts2d_buf,
                     visibility_mask=vis_buf,
-
-                    object_points_initial=self._object_points,
-                    object_poses_initial=poses_T_s2_init,
-
-                    # BA logic control flags
+                    object_points=self._object_points,
+                    object_poses=results_s1['object_poses_opt'],
+                    origin_cam_idx=self.origin_idx,
+                    distortion_model='simple',  # start optimising distortion
                     fix_intrinsics=False,
                     fix_extrinsics=False,
                     fix_object_points=True,
-                    fix_poses=False,
-
-                    # Stage 2 specific flags
-                    shared_intrinsics=False,    # We now optimize per-camera intrinsics
-                    fix_aspect_ratio=False,     # We relax the aspect ratio constraint
-                    distortion_model='simple',  # start optimising distortion
-
-                    priors=priors_stage2,
-                    radial_penalty=2.0, # for second stage we want to start penalising points too far from the working volume
-
-                    stage=2
+                    fix_object_poses=False,
+                    fix_aspect_ratio=True,
+                    shared_intrinsics=False,  # start optimising intrinsics per-camera
+                    covariance_intrinsics=cov_intr_s2,
+                    covariance_extrinsics=cov_extr_s2,
+                    radial_penalty=2.0,
+                    stage=2  # start penalising points too far from the working volume
                 )
                 if not success_s2:
                     raise RuntimeError("BA Stage 2 failed.")
 
-                # STAGE 3: Real world (Full extrinsics + intrinsics refinement with distortion)
-                # -----------------------------------------------------------------------------
-                # Everything should be close to the correct solution. We enable the most complex distortion models
-                # (like full or rational) and let all parameters adjust simultaneously for the final polish
-                #
-                logger.debug(f"[BA] >>> STAGE 3: Full refinement with {current_P} frames...")
+                # STAGE 3: Final polish (full distortion)
+                # ------------------------------------------------------------------
+                # Strategy: Lock Geometry, polish residuals
 
-                K_s3_init = results_s2['K_opt']
-                D_s3_init = results_s2['D_opt']
-                cam_T_s3_init = results_s2['cam_poses_opt']
-                poses_T_s3_init = results_s2['object_poses_opt']
+                logger.debug(f"[BA] >>> STAGE 3: Final polish")
 
-                success_s3, final_results_attempt = bundle_adjustment.run_bundle_adjustment(
-                    K_initial=K_s3_init,
-                    D_initial=D_s3_init,
-                    cam_poses_initial=cam_T_s3_init,
+                from mokap.calibration.bundle_adjustment import DIST_MODEL_MAP
+                n_d = DIST_MODEL_MAP.get(self._distortion_model, 0)
+                if self._distortion_model == 'fisheye': n_d = 4
 
+                cov_extr_s3, cov_intr_s3 = make_cov(
+                    sigma_f=1.0,    # Keep f stable
+                    sigma_c=1.0,
+                    sigma_d=0.05,   # Tighten distortion further
+                    sigma_r=0.0015, # in radians, so pretty much locked here
+                    sigma_t=10.0,   # in scene units
+                    n_d_coeffs=n_d, shared=False
+                )
+
+                success_s3, final_results = run_bundle_adjustment(
+                    K=results_s2['K_opt'],
+                    D=results_s2['D_opt'],
+                    cameras_poses=results_s2['camera_poses_opt'],
                     images_sizes_hw=self._images_sizes_hw,
-
-                    image_points=pts2d_buf,
+                    points2d_observed=pts2d_buf,
                     visibility_mask=vis_buf,
-
-                    object_points_initial=self._object_points,
-                    object_poses_initial=poses_T_s3_init,
-
-                    # BA logic control flags
+                    object_points=self._object_points,
+                    object_poses=results_s2['object_poses_opt'],
+                    origin_cam_idx=self.origin_idx,
+                    distortion_model=self._distortion_model,  # finally use the desired model
                     fix_intrinsics=False,
                     fix_extrinsics=False,
                     fix_object_points=True,
-                    fix_poses=False,
-
-                    # Stage 3 specific flags
+                    fix_object_poses=False,
+                    fix_aspect_ratio=True,
                     shared_intrinsics=False,
-                    fix_aspect_ratio=False,
-                    distortion_model=self._distortion_model,    # Use the desired model
-
-                    priors=priors_stage3,  # Priors are mega important at this stage
-
+                    covariance_intrinsics=cov_intr_s3,
+                    covariance_extrinsics=cov_extr_s3,
                     radial_penalty=4.0,  # now we kinda want to ignore the points far from the working volume
-
-                    stage=1
+                    stage=3
                 )
                 if not success_s3:
                     raise RuntimeError("BA Stage 3 failed.")
 
-                # If we reach here, all stages were successful
                 ba_succeeded = True
-                final_results = final_results_attempt
-
                 break
 
             except MemoryError:
@@ -575,7 +579,7 @@ class MultiviewCalibrationTool:
 
             # Store globally optimised results
             self._refined_intrinsics = (final_results['K_opt'], final_results['D_opt'])
-            self._refined_extrinsics = final_results['cam_poses_opt']  # (C, 4, 4)
+            self._refined_extrinsics = final_results['camera_poses_opt']  # (C, 4, 4)
             self._refined_board_poses = final_results['object_poses_opt']  # (P, 4, 4)
 
             self._refined = True
@@ -671,7 +675,7 @@ class MultiviewCalibrationTool:
             volume_of_trust = {k: (float(v[0]), float(v[1])) for k, v in volume_of_trust.items()}
 
             if volume_of_trust:
-                print("--- Volume of Trust ---")
+                print("[ Volume of Trust ]")
                 print(f"X range: {volume_of_trust['x'][0]:.2f} to {volume_of_trust['x'][1]:.2f} mm")
                 print(f"Y range: {volume_of_trust['y'][0]:.2f} to {volume_of_trust['y'][1]:.2f} mm")
                 print(f"Z range: {volume_of_trust['z'][0]:.2f} to {volume_of_trust['z'][1]:.2f} mm")
