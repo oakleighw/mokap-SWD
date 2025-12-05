@@ -142,7 +142,7 @@ class DetectionPayload:
     """
     Monocular detection of points 2D
     """
-    frame: int
+    frame_idx: int
     points2D: ArrayLike
     pointsIDs: ArrayLike
 

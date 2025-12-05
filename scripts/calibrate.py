@@ -280,11 +280,11 @@ def run_extrinsics(folder: Path,
 
     mv_tool = MultiviewCalibrationTool(
         nb_cameras=C,
-        images_sizes_hw=sizes_hw[:, :2],
+        images_sizes=sizes_hw[:, :2],
         object_points=DEFAULT_BOARD.object_points,
         K_init=Ks,
         D_init=Ds,
-        origin_idx=origin_idx,
+        origin_cam_idx=origin_idx,
         min_detections=min_samples,
         max_detections=min_samples * 2,
         distortion_model=DEFAULT_DIST_MODEL
@@ -327,7 +327,7 @@ def run_extrinsics(folder: Path,
                         if m.register_sample(min_new_area=0.1):
                             should_add = True
                             break
-            elif mv_tool.ba_sample_count < min_samples:
+            elif mv_tool.sample_count < min_samples:
                 # Coverage done, just filling the BA buffer
                 should_add = True
 
@@ -339,21 +339,21 @@ def run_extrinsics(folder: Path,
                     for i, det in enumerate(detections):
                         if det:
                             payload = DetectionPayload(
-                                frame=frame_idx,
+                                frame_idx=frame_idx,
                                 points2D=det[0],
                                 pointsIDs=det[1]
                             )
                             mv_tool.register(i, payload)
 
             # Check termination
-            if all_covered and mv_tool.ba_sample_count >= min_samples:
+            if all_covered and mv_tool.sample_count >= min_samples:
                 print("[Ready] Sufficient coverage and BA samples collected.")
                 break
 
             # Status
             if frame_idx > 0 and (frame_idx // step) % 10 == 0:
                 cov_str = ", ".join([f"{m.pct_coverage:.0f}%".rjust(4) for m in mono_tools])
-                print(f"\rFrame {frame_idx} | BA Samples: {mv_tool.ba_sample_count} | Coverage: [{cov_str}]", end="")
+                print(f"\rFrame {frame_idx} | BA Samples: {mv_tool.sample_count} | Coverage: [{cov_str}]", end="")
 
             frame_idx += 1
 
@@ -362,21 +362,21 @@ def run_extrinsics(folder: Path,
     finally:
         for c in caps: c.release()
 
-    if mv_tool.ba_sample_count < 10:
+    if mv_tool.sample_count < 10:
         print("[Error] Not enough common samples found for Bundle Adjustment.")
         return False
 
     # Bundle Adjustment
     print("\nRunning Bundle Adjustment (this may take a moment)...")
-    success = mv_tool.refine_all()
+    success = mv_tool.refine()
 
     if not success:
         print("Bundle Adjustment Failed.")
         return False
 
     # Finish
-    K_opt, D_opt = mv_tool.refined_intrinsics
-    T_opt = mv_tool.refined_extrinsics
+    K_opt, D_opt = mv_tool.intrinsics
+    T_opt = mv_tool.camera_poses
 
     # TODO: New io classes will save the matrix directly
     r_opt, t_opt = decompose_transform_matrix(T_opt)

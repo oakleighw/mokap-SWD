@@ -11,11 +11,9 @@ from mokap.gui.workers.workers_base import CalibrationProcessingWorker
 from mokap.utils.datatypes import (CalibrationData, DetectionPayload, ExtrinsicsPayload, IntrinsicsPayload,
                                    ChessBoard, CharucoBoard)
 
-from mokap.geometry import unproject
+from mokap.geometry import (unproject, decompose_transform_matrix, compose_transform_matrix,
+                            invert_vectors, rotate_points)
 
-from mokap.geometry import (
-    compose_transform_matrix, invert_vectors, rotate_points
-)
 
 
 logger = logging.getLogger(__name__)
@@ -106,8 +104,8 @@ class MultiviewWorker(CalibrationProcessingWorker):
 
             self.multiview_tool = MultiviewCalibrationTool(
                 nb_cameras=self._C,
-                images_sizes_hw=np.array(image_sizes_hw_list),
-                origin_idx=self._orig_cam_idx,
+                images_sizes=np.array(image_sizes_hw_list),
+                origin_cam_idx=self._orig_cam_idx,
                 K_init=self._cameras_matrices,
                 D_init=self._dist_coeffs,
                 object_points=self.calibration_board.object_points,
@@ -141,11 +139,13 @@ class MultiviewWorker(CalibrationProcessingWorker):
 
             if payload.rvec is not None and payload.tvec is not None:
                 r_c2w, t_c2w = invert_vectors(payload.rvec, payload.tvec)
+
                 self._rvecs_c2w[cam_idx] = r_c2w
                 self._tvecs_c2w[cam_idx] = t_c2w
 
         # Accept detection payloads in any stage (for visualization)
         elif isinstance(payload, DetectionPayload):
+
             # In stage > 0, also register the detection with the BA tool
             if self._current_stage > 0 and self.multiview_tool:
                 self.multiview_tool.register(cam_idx, payload)
@@ -157,36 +157,30 @@ class MultiviewWorker(CalibrationProcessingWorker):
     def _compute_3d_scene(self):
         """ Periodically calculates and emits all data needed for the 3D view """
 
-        # Determine which set of parameters to use for visualization
-        if self.multiview_tool and self.multiview_tool.is_refined:
-            Ks, Ds = self.multiview_tool.refined_intrinsics
-            rs_c2w, ts_c2w = self.multiview_tool.refined_extrinsics
-            # In this case, all intrinsics are guaranteed to be valid
-            ready_mask = np.ones(self._C, dtype=bool)
-
-        elif self.multiview_tool and self.multiview_tool.is_estimated:
+        if self.multiview_tool:
             Ks, Ds = self.multiview_tool.intrinsics
-            rs_c2w, ts_c2w = self.multiview_tool.extrinsics
-            # In this case, all intrinsics are guaranteed to be valid
+            Ts_c2w = self.multiview_tool.camera_poses
+
             ready_mask = np.ones(self._C, dtype=bool)
 
         else:
             # Before estimation, use the initial parameters stored in the worker
             Ks, Ds, rs_c2w, ts_c2w = self._cameras_matrices, self._dist_coeffs, self._rvecs_c2w, self._tvecs_c2w
+            Ts_c2w = compose_transform_matrix(rs_c2w, ts_c2w)   # TODO: get rid of this conversion
+
             # Here, we must rely on the live-updated ready flag
             ready_mask = self._intrinsics_ready.astype(bool)
 
-        if Ks is None or rs_c2w is None or ts_c2w is None:
+        if Ks is None or Ts_c2w is None:
             # nothing to draw, early exit
             return
 
-        Es_c2w = compose_transform_matrix(rs_c2w, ts_c2w)
-        cam_centres = Es_c2w[:, :3, 3]
+        cam_centres = Ts_c2w[:, :3, 3]
 
         # Back-project the 5 points (principal + 4 corners) into 3D space
         frustums_points_all = unproject(self._img_points_2d,
                                         xp.asarray([40] * Ks.shape[0]),
-                                        Ks, Es_c2w, xp.zeros_like(Ds),  # TODO: No need to create this at each call
+                                        Ks, Ts_c2w, xp.zeros_like(Ds),  # TODO: No need to create this at each call
                                         distortion_model='full')
 
         # Safety Check
@@ -227,9 +221,9 @@ class MultiviewWorker(CalibrationProcessingWorker):
         # Stage > 0: Cameras are static, the board moves
         elif self._current_stage > 0:
 
-            if self.multiview_tool and self.multiview_tool.current_board_pose is not None:
+            if self.multiview_tool and self.multiview_tool.curent_object_pose is not None:
                 # If we have a valid board pose, transform the board object points
-                board_pose = self.multiview_tool.current_board_pose
+                board_pose = self.multiview_tool.curent_object_pose
                 board_3d = (board_pose @ self._object_points_hom.T).T[:, :3]
 
                 # Detections are the specific points from the transformed board
@@ -276,17 +270,19 @@ class MultiviewWorker(CalibrationProcessingWorker):
         logger.info(f"[{self.name.title()}] Attempting to run final Bundle Adjustment.")
 
         self.blocking.emit(True)
-        success = self.multiview_tool.refine_all()
+        success = self.multiview_tool.refine()
         self.blocking.emit(False)
 
         if success:
             logger.info(f"[{self.name.title()}] Bundle Adjustment successful. Emitting refined parameters.")
 
-            K_opts, D_opts = self.multiview_tool.refined_intrinsics
-            r_opts, t_opts = self.multiview_tool.refined_extrinsics
+            K_opts, D_opts = self.multiview_tool.intrinsics
+            T_opts = self.multiview_tool.camera_poses
 
             # Update worker's internal state with the new best parameters
             self._cameras_matrices, self._dist_coeffs = K_opts, D_opts
+
+            r_opts, t_opts = decompose_transform_matrix(T_opts)   # TODO: get rid of rvec/tvec conversions
             self._rvecs_c2w, self._tvecs_c2w = r_opts, t_opts
 
             # Emit the final results for other workers and for saving

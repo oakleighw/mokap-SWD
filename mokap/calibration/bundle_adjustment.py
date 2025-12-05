@@ -452,6 +452,7 @@ def prepare_prior_info(
 # Helpers and specs config (NumPy)
 # ──────────────────────────────────────────────────────────────────────────────────────────────────────────────────────
 
+# TODO: Get rid of this and the double 'nb_dist_coeffs' and 'n_d_size' keys, it's confusing. Use DistortionModel Literal from datatypes
 DIST_MODEL_MAP = {'none': 0, 'simple': 4, 'standard': 5, 'rational': 8, 'thinprism': 12, 'tilted': 14, 'fisheye': 99}
 
 

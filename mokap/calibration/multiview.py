@@ -1,6 +1,7 @@
 import logging
 from collections import deque
-from typing import Tuple, Dict, Optional, List, Any
+from dataclasses import dataclass
+from typing import Dict, Optional, List, Tuple
 import gc
 import psutil
 
@@ -11,226 +12,488 @@ from mokap.calibration.bundle_adjustment import covariance_from_std, run_bundle_
 from mokap.calibration.common import solve_pnp_robust
 
 from mokap.utils.datatypes import DetectionPayload, DistortionModel
-from mokap.geometry import (project_to_cameras, reprojection_errors, project_to_cameras_multi,
-                            quaternion_average, average_qtposes, compute_bounds, flip_transform_180,
-                            compose_transform_matrix, decompose_transform_matrix,
-                            quaternion_from_vector, quaternion_from_matrix, vector_from_quaternion,
-                            invert_transform, quaternion_distance)
+from mokap.geometry import (
+    project_to_cameras,
+    reprojection_errors,
+    project_to_cameras_multi,
+    quaternion_average,
+    average_qtposes,
+    compute_bounds,
+    flip_transform_180,
+    compose_transform_matrix,
+    decompose_transform_matrix,
+    quaternion_from_vector,
+    quaternion_from_matrix,
+    vector_from_quaternion,
+    invert_transform,
+    quaternion_distance,
+    transform_points
+)
 
 logger = logging.getLogger(__name__)
 
 
+# TODO: The DetectionPayload dataclass is completely redundant now
+
+@dataclass
+class SingleviewDetection:
+    """
+    Represents a single camera's detection of the calibration object.
+    """
+    cam_idx: int
+    T_o2c: xp.ndarray       # (4, 4)
+    points2D: np.ndarray    # (N, 2)
+    pointsIDs: np.ndarray   # (N,)
+
+
+@dataclass
+class MultiviewDetection:
+    """
+    Represents a multi-camera detection of the calibration object.
+    """
+    cam_indices: xp.ndarray     # (n_C,)
+    T_o2c: xp.ndarray           # (n_C, 4, 4)
+    points2D: xp.ndarray        # (n_C, N, 2)
+    visibility_mask: xp.ndarray # (n_C, N)
+
+
+@dataclass
+class BundleAdjustmentConfig:
+
+    distortion_model: str
+    n_dist_coeffs: int  # TODO: useless since distortion model is passed
+
+    # Flags
+    fix_intrinsics: bool
+    fix_extrinsics: bool
+    fix_object_points: bool
+    fix_object_poses: bool
+    fix_aspect_ratio: bool
+    shared_intrinsics: bool
+
+    radial_penalty: float
+    
+    # Covariance parameters
+    sigma_f: float
+    sigma_c: float
+    sigma_d: float
+    sigma_r: float
+    sigma_t: float
+
+
 class MultiviewCalibrationTool:
+    """
+    Multi-camera calibration tool.
+
+    This tool processes detections of a calibration object from multiple cameras,
+    estimates camera extrinsics, and performs global bundle adjustment to refine
+    both intrinsics and extrinsics.
+
+    - Online extrinsics estimation from multi-view detections
+    - Temporal pose disambiguation using rotation history
+    - Three-stage graduated bundle adjustment
+    - Quality control based on reprojection errors
+    """
+
     def __init__(
             self,
-            nb_cameras:            int,
-            images_sizes_hw:       ArrayLike,
-            origin_idx:            int,
-            K_init:                ArrayLike,
-            D_init:                ArrayLike,
-            object_points:         ArrayLike,
-            min_detections:        int = 100,
-            max_detections:        int = 100,
-            angular_thresh:        float = 10.0,  # in degrees
-            translational_thresh:  float = 10.0,  # in object_points' units
+            nb_cameras: int,
+            images_sizes: ArrayLike,
+            origin_cam_idx: int,
+            K_init: ArrayLike,
+            D_init: ArrayLike,
+            object_points: ArrayLike,
+            min_detections: int = 100,
+            max_detections: int = 100,
+            angular_thresh: float = 10.0,  # in degrees
+            translational_thresh: float = 10.0,  # in object_points' units
             distortion_model: DistortionModel = 'standard'
-        ):
+    ):
+        """
+        Initialise the multiview calibration tool.
 
+        Args:
+            nb_cameras: Number of cameras in the rig
+            images_sizes: Image sizes (height, width) for each camera or single size for all
+            origin_cam_idx: Index of the origin camera (fixed at identity transform)
+            K_init: Initial camera matrices (3x3) or array of matrices
+            D_init: Initial distortion coefficients or array of coefficients
+            object_points: Known 3D points on calibration object (N, 3)
+            min_detections: Minimum number of frames required for bundle adjustment
+            max_detections: Maximum number of frames to keep in buffer
+            angular_thresh: Angular threshold for pose consensus (degrees)
+            translational_thresh: Translation threshold for pose consensus (same units as object_points)
+            distortion_model: Distortion model to use
+        """
+        
         self.nb_cameras = nb_cameras
-        self.origin_idx = origin_idx
+        self.origin_cam_idx = origin_cam_idx
         self._distortion_model = distortion_model
-
-        images_sizes_hw = np.asarray(images_sizes_hw)
-        if images_sizes_hw.ndim == 2 and images_sizes_hw.shape[0] == self.nb_cameras:
-            self._images_sizes_hw = images_sizes_hw[:, :2]
-
-        elif images_sizes_hw.ndim == 1 and 2 <= images_sizes_hw.shape[0] <= 3:
-            logger.debug('Only one size passed, assuming identical image size for all cameras.')
-
-            self._images_sizes_hw = np.asarray([images_sizes_hw[:2]] * self.nb_cameras)
-        else:
-            raise AttributeError("Can't understand image size.")
-
+        self._images_sizes_hw = self._validate_image_sizes(images_sizes)
         self._angular_thresh_rad: float = np.deg2rad(angular_thresh)
         self._translational_thresh: float = translational_thresh
 
-        # Known 3D board model points (N, 3)
-        self._object_points = xp.asarray(object_points, dtype=xp.float32)
-        self._board_pts_hom = xp.hstack([
-            self._object_points, xp.ones((self._object_points.shape[0], 1), dtype=xp.float32)
-        ])
+        # Initialise 3D object model
+        self._object_points = xp.asarray(object_points, dtype=xp.float32)  # in object-local coordinates
 
-        # buffers for incoming frames
-        self._detection_buffer = [dict() for _ in range(nb_cameras)]
-        self._last_frame = np.full(nb_cameras, -1, dtype=int)
-
-        # State for extrinsics (camera-to-world)
+        # Intrinsics state
+        self._K = self._validate_camera_matrices(K_init)
+        self._D = self._validate_distortion_coeffs(D_init)
+        
+        # Extrinsics state
         self._has_extrinsics = np.zeros(nb_cameras, dtype=bool)
+        self._has_extrinsics[self.origin_cam_idx] = True  # origin camera is ths origin so it has extrinsics immediately
 
         identity = xp.eye(4, dtype=xp.float32)
-        self._T_c2w_all = xp.repeat(identity[None, ...], nb_cameras, axis=0)
+        self._cam_T_c2w = xp.repeat(identity[None, ...], nb_cameras, axis=0)
 
-        # State for board pose (world)
-        self._latest_board_pose_w: Optional[xp.ndarray] = None
-        self._board_pose_history = deque(maxlen=10)
+        # Object pose tracking
+        self._current_object_T_o2w: Optional[xp.ndarray] = None  # in world coordinates
+        self._object_T_o2w_stack = deque(maxlen=10)
 
-        # intrinsics state
-
-        init_cam_matrices_np = np.asarray(K_init)
-        if init_cam_matrices_np.ndim == 2:
-            logger.debug("A single camera matrix was provided. Broadcasting to all cameras.")
-            self._K = xp.asarray([init_cam_matrices_np] * self.nb_cameras, dtype=xp.float32)
-        else:
-            self._K = xp.asarray(init_cam_matrices_np, dtype=xp.float32)
-
-        init_dist_coeffs_np = np.asarray(D_init)
-        if init_dist_coeffs_np.ndim == 1:
-            logger.debug("A single set of distortion coeffs was provided. Broadcasting to all cameras.")
-            self._D = xp.asarray([init_dist_coeffs_np] * self.nb_cameras, dtype=xp.float32)
-        else:
-            self._D = xp.asarray(init_dist_coeffs_np, dtype=xp.float32)
-
-        if self._K.shape != (self.nb_cameras, 3, 3):
-            raise ValueError(
-                f"Shape mismatch for init_cam_matrices. Expected ({self.nb_cameras}, 3, 3), got {self._K.shape}")
-        if self._D.shape[0] != self.nb_cameras:
-            raise ValueError(
-                f"Shape mismatch for init_dist_coeffs. Expected ({self.nb_cameras}, D), got {self._D.shape}")
-
-        # triangulation & BA buffers
-        self.ba_samples = deque(maxlen=max_detections)
+        # Detection buffers
+        self._detection_buffer: List[Dict[int, SingleviewDetection]] = [{} for _ in range(nb_cameras)]
+        self._current_frame_indices = np.full(nb_cameras, -1, dtype=int)  # latest detection per camera
+        
+        # Bundle adjustment samples buffers
+        self._samples = deque(maxlen=max_detections)
         self._min_detections = min_detections
 
-        # bs results
-        self._refined = False
+        # Refinement results
+        self._is_refined = False
+        
         self._refined_intrinsics = None
-        self._refined_extrinsics = None  # T matrices (C, 4, 4)
-        self._refined_board_poses = None  # T matrices (P, 4, 4)
-        self._points2d = None
-        self._visibility_mask = None
+        self._refined_cam_poses_c2w = None      # T matrices (C, 4, 4)
+        self._refined_object_poses_o2w = None   # T matrices (P, 4, 4)
+        
+        self._points2d_final = None
+        self._visibility_final = None
         self._volume_of_trust = None
 
-    def _find_stale_frames(self):
-        global_min = int(self._last_frame.min())
+        # Quality control thresholds
+        self._max_frame_rms_threshold = 5.0  # in pixels
 
-        pending = set()
+    def _validate_image_sizes(self, images_sizes_hw: ArrayLike) -> np.ndarray:
 
-        for buf in self._detection_buffer:
-            pending.update(buf.keys())
+        images_sizes_hw = np.asarray(images_sizes_hw)
 
-        stale = [f for f in pending if f < global_min]
-        return stale
+        if images_sizes_hw.ndim == 2 and images_sizes_hw.shape[0] == self.nb_cameras:
+            return images_sizes_hw[:, :2]
+        elif images_sizes_hw.ndim == 1 and 2 <= images_sizes_hw.shape[0] <= 3:
+            logger.debug('Only one size passed, assuming identical image size for all cameras.')
+            return np.asarray([images_sizes_hw[:2]] * self.nb_cameras)
+        else:
+            raise AttributeError("Can't understand image size.")
+
+    def _validate_camera_matrices(self, K_init: ArrayLike) -> xp.ndarray:
+
+        K_np = np.asarray(K_init)
+
+        if K_np.ndim == 2:
+            logger.debug("A single camera matrix was provided. Broadcasting to all cameras.")
+            K = xp.asarray([K_np] * self.nb_cameras, dtype=xp.float32)
+        else:
+            K = xp.asarray(K_np, dtype=xp.float32)
+
+        if K.shape != (self.nb_cameras, 3, 3):
+            raise ValueError(
+                f"Shape mismatch for init_cam_matrices. Expected ({self.nb_cameras}, 3, 3), got {K.shape}")
+        return K
+
+    def _validate_distortion_coeffs(self, D_init: ArrayLike) -> xp.ndarray:
+
+        D_np = np.asarray(D_init)
+
+        if D_np.ndim == 1:
+            logger.debug("A single set of distortion coeffs was provided. Broadcasting to all cameras.")
+            D = xp.asarray([D_np] * self.nb_cameras, dtype=xp.float32)
+        else:
+            D = xp.asarray(D_np, dtype=xp.float32)
+
+        if D.shape[0] != self.nb_cameras:
+            raise ValueError(
+                f"Shape mismatch for init_dist_coeffs. Expected ({self.nb_cameras}, D), got {D.shape}")
+        return D
+
+    def register(self, cam_idx: int, detection: DetectionPayload):
+        """
+        Register a new detection from a camera:
+        - Validates the detection (enough points, successful PnP)
+        - Stores the detection in a frame buffer
+        - Triggers frame processing when detections from multiple cameras are available
+
+        Args:
+            cam_idx: Index of the camera
+            detection: Detection payload containing points and frame number
+        """
+        
+        if detection.pointsIDs is None or detection.points2D is None:
+            return
+
+        if len(detection.pointsIDs) < 4:
+            return
+
+        # Estimate object-to-camera pose
+        success, T_o2c, errors_dict = solve_pnp_robust(
+            points3d=self._object_points[detection.pointsIDs],
+            points2d=detection.points2D,
+            K=self._K[cam_idx],
+            D=self._D[cam_idx]
+        )
+
+        if not success:
+            return
+
+        self._current_frame_indices[cam_idx] = detection.frame_idx
+        
+        # Store detection in frame buffer
+        cam_detection = SingleviewDetection(
+            cam_idx=cam_idx,
+            T_o2c=T_o2c,
+            points2D=detection.points2D,
+            pointsIDs=detection.pointsIDs
+        )
+        self._detection_buffer[cam_idx][detection.frame_idx] = cam_detection
+
+        # Process any complete frames
+        self._flush_frames()
 
     def _flush_frames(self):
-        for f in self._find_stale_frames():
-            cams = [c for c in range(self.nb_cameras) if f in self._detection_buffer[c]]
-            if len(cams) < 2:
-                for c in cams:
-                    self._detection_buffer[c].pop(f, None)
-                continue
+        """Process all stale frames that have detections from multiple cameras."""
 
-            entries = [(c, *self._detection_buffer[c].pop(f)) for c in cams]
-            self._process_frame(entries)
+        for frame_num in self._find_stale_frames():
+            # Collect all cameras that detected this frame
+            detections = []
+            for cam_idx in range(self.nb_cameras):
+                if frame_num in self._detection_buffer[cam_idx]:
+                    detection = self._detection_buffer[cam_idx].pop(frame_num)
+                    detections.append(detection)
 
-    def _gather_frame_data(self, entries):
-        """ Gathers and pads frame data into JAX arrays for vectorized processing """
+            # Only process frames with detections from at least 2 cameras
+            if len(detections) >= 2:
+                self._process_frame(detections)
 
-        C = len(entries)
+    def _find_stale_frames(self) -> List[int]:
+        """
+        Find frame numbers that are behind the minimum processed frame across all cameras.
+
+        A frame is considered "stale" if it's less than the minimum frame number that
+        has been seen across all cameras, indicating all cameras have moved past it.
+        """
+        global_min = int(self._current_frame_indices.min())
+
+        # Collect all pending frame numbers
+        pending_frames = set()
+        for buffer in self._detection_buffer:
+            pending_frames.update(buffer.keys())
+
+        # Return frames that are behind the global minimum
+        return [f for f in pending_frames if f < global_min]
+
+    def _consolidate_frame_data(self, detections: List[SingleviewDetection]) -> MultiviewDetection:
+        """
+        Convert list of single view camera detections into multi-view arrays.
+        """
+
+        n_C = len(detections)   # number of cameras with a detection in this frame
         N = self._object_points.shape[0]
 
-        cam_indices = np.array([c for c, _, _, _ in entries], dtype=np.int32)
+        cam_indices = np.zeros(n_C, dtype=np.int32)
+        T_o2c = np.zeros((n_C, 4, 4), dtype=np.float32)
+        points2d = np.zeros((n_C, N, 2), dtype=np.float32)
+        visibility_mask = np.zeros((n_C, N), dtype=bool)
 
-        gt_points_padded_np = np.zeros((C, N, 2), dtype=np.float32)
-        visibility_mask_np = np.zeros((C, N), dtype=bool)
+        for i, det in enumerate(detections):
+            cam_indices[i] = det.cam_idx
+            T_o2c[i, :, :] = det.T_o2c
+            points2d[i, det.pointsIDs, :] = det.points2D
+            visibility_mask[i, det.pointsIDs] = True
 
-        for i, (_, _, points2d, pointsids) in enumerate(entries):
-            gt_points_padded_np[i, pointsids, :] = points2d
-            visibility_mask_np[i, pointsids] = True
+        return MultiviewDetection(
+            cam_indices=cam_indices,
+            T_o2c=T_o2c,
+            points2D=points2d,
+            visibility_mask=visibility_mask
+        )
 
-        return xp.asarray(cam_indices), xp.asarray(gt_points_padded_np), xp.asarray(visibility_mask_np)
+    def _process_frame(self, detections: List[SingleviewDetection]):
+        """
+        Process a complete frame with detections from multiple cameras.
+            - Estimates the object pose in world coordinates
+            - Disambiguates 180-degree PnP ambiguities using pose history
+            - Validates pose consensus across views
+            - Updates camera extrinsics
+            - Does quality control based on reprojection error
 
-    def _process_frame(self, entries: List[Tuple[int, Any, Any, Any]]):
-
+        Args:
+            detections: List of SingleviewDetection objects from different cameras
+        """
         if not any(self._has_extrinsics):
-            self._latest_board_pose_w = None
+            self._current_object_T_o2w = None
             return
 
-        cam_indices, gt_points_padded, visibility_mask = self._gather_frame_data(entries)
+        mv_detection = self._consolidate_frame_data(detections)
 
-        known_mask = xp.array([self._has_extrinsics[c] for c in cam_indices])
-        if not xp.any(known_mask):
+        # Check which cameras in this detection have known extrinsics
+        active_and_known = xp.array([self._has_extrinsics[cam_idx] for cam_idx in mv_detection.cam_indices])
+
+        if not xp.any(active_and_known):
             return
 
-        # Initial board pose estimation
-        T_b2c_all = xp.stack([entry[1] for entry in entries])
-        T_c2w_known = self._T_c2w_all[cam_indices[known_mask]]
-        T_b2c_known = T_b2c_all[known_mask]
+        # Extract object-to-camera transforms
+        T_c2w_ank = self._cam_T_c2w[mv_detection.cam_indices[active_and_known]]
+        T_o2c_ank = mv_detection.T_o2c[active_and_known]
 
-        # Initial vote for the board's pose based on currently known cameras
-        T_b2w_votes = T_c2w_known @ T_b2c_known
+        # Generates the object-to-world votes
+        T_o2w_votes = T_c2w_ank @ T_o2c_ank
 
-        # Temporal disambiguation using a stable ref pose
-        if len(self._board_pose_history) > 0:
+        # Disambiguate using pose history if available, and find a consensus
+        T_o2w_votes = self._disambiguate_poses(T_o2w_votes, T_c2w_ank, T_o2c_ank)
+        T_o2w = self._consensus_poses_strict(T_o2w_votes)   # uses the strict one online estimation
+        if T_o2w is None:
+            return
 
-            history_q = quaternion_from_matrix(xp.stack(list(self._board_pose_history)))
+        # Calculate new camera extrinsics for the currently active (and known) cameras
+        T_c2b_ank = invert_transform(T_o2c_ank)
+        T_c2w_new = T_o2w @ T_c2b_ank
 
-            # We average the rotation (via quaternions)
-            q_ref = quaternion_average(history_q)
+        # Quality control
+        if not self._validate_frame_quality(mv_detection, T_o2w, T_c2w_new):
+            # Frame rejected
+            self._current_object_T_o2w = None
+            return
 
-            # Get the alternative PnP solutions (180-degree flip)
-            T_b2c_alt = flip_transform_180(T_b2c_known)
+        # Append new agreed uppon object pose
+        self._current_object_T_o2w = T_o2w
+        self._object_T_o2w_stack.append(T_o2w)
 
-            # Calculate world poses for alternative PnP result
-            T_b2w_votes_alt = T_c2w_known @ T_b2c_alt
+        # Update extrinsics with new estimate
+        for i, cam_idx in enumerate(mv_detection.cam_indices):
 
-            # For each vote determine which (original or alternative) is closer to the stable ref
-            q_votes = quaternion_from_matrix(T_b2w_votes)
-            q_votes_alt = quaternion_from_matrix(T_b2w_votes_alt)
+            if cam_idx != self.origin_cam_idx:  # never update origin camera
+                self._cam_T_c2w = set_at(self._cam_T_c2w, cam_idx, T_c2w_new[i])
+                self._has_extrinsics[cam_idx] = True
 
-            # Calculate angular distance to the reference
-            dist_original = quaternion_distance(q_votes, q_ref)
-            dist_alt = quaternion_distance(q_votes_alt, q_ref)
+        # Store the accepted sample for bundle adjustment
+        self._samples.append(mv_detection)
 
-            # Choose the best pose for each camera view
-            use_alt_mask = dist_alt < dist_original
-            T_b2w_votes = xp.where(use_alt_mask[:, None, None], T_b2w_votes_alt, T_b2w_votes)
+    def _disambiguate_poses(
+            self,
+            T_o2w_votes: xp.ndarray,
+            T_c2w_known: xp.ndarray,
+            T_o2c_known: xp.ndarray
+    ) -> xp.ndarray:
+        """
+        Resolve 180-degree PnP ambiguities using pose history.
 
-            nb_corrected = xp.sum(use_alt_mask)
-            if nb_corrected > 0:
-                logger.debug(f"[FLIP_CORRECTED] Corrected {nb_corrected} PnP results using stable reference.")
+        PnP can have a 180-degree rotation ambiguity. This method uses the
+        recent pose history to determine which solution is more consistent.
 
-        # Averaging and quality control
-        r_stack, t_stack = decompose_transform_matrix(T_b2w_votes)
+        Args:
+            T_o2w_votes: Initial object-to-world transforms (N, 4, 4)
+            T_c2w_known: Camera-to-world transforms for cameras with known extrinsics
+            T_o2c_known: Object-to-camera transforms for those cameras
+
+        Returns:
+            Disambiguated object-to-world transforms
+        """
+        if len(self._object_T_o2w_stack) == 0:
+            return T_o2w_votes
+
+        # Compute reference rotation from history
+        history_transforms = xp.stack(list(self._object_T_o2w_stack))
+        history_quats = quaternion_from_matrix(history_transforms)
+        q_ref = quaternion_average(history_quats)
+
+        # Get alternative PnP solutions (180-degree flip)
+        T_o2c_alt = flip_transform_180(T_o2c_known)
+        T_o2w_votes_alt = T_c2w_known @ T_o2c_alt
+
+        # Compare distances to reference
+        q_votes = quaternion_from_matrix(T_o2w_votes)
+        q_votes_alt = quaternion_from_matrix(T_o2w_votes_alt)
+
+        dist_original = quaternion_distance(q_votes, q_ref)
+        dist_alt = quaternion_distance(q_votes_alt, q_ref)
+
+        # Select closer solution
+        use_alt_mask = dist_alt < dist_original
+        T_o2w_votes = xp.where(use_alt_mask[:, None, None], T_o2w_votes_alt, T_o2w_votes)
+
+        nb_corrected = xp.sum(use_alt_mask)
+        if nb_corrected > 0:
+            logger.debug(f"[FLIP_CORRECTED] Corrected {nb_corrected} PnP results using stable reference.")
+
+        return T_o2w_votes
+
+    def _consensus_poses_lenient(self, T_o2w_votes: xp.ndarray) -> xp.ndarray:
+        """
+        Find consensus object pose from multiple camera views using a more
+        lenient average method (Markley's method, no outlier filtering).
+        """
+
+        # Decompose transforms for q and t
+        r_stack, t_stack = decompose_transform_matrix(T_o2w_votes)
         q_stack = quaternion_from_vector(r_stack)
-        rt_stack = xp.concatenate([q_stack, t_stack], axis=1)
+        q_avg = quaternion_average(q_stack)
+        t_avg = xp.median(t_stack, axis=0)
 
+        # Re compose final transform
+        return compose_transform_matrix(vector_from_quaternion(q_avg), t_avg)
+
+    def _consensus_poses_strict(self, T_o2w_votes: xp.ndarray) -> Optional[xp.ndarray]:
+        """
+        Find consensus object pose from multiple camera views using strict thresholds.
+        Uses IRLS-style outlier rejection.
+        """
+        
+        # Decompose transforms for q and t
+        r_stack, t_stack = decompose_transform_matrix(T_o2w_votes)
+        q_stack = quaternion_from_vector(r_stack)
+        qt_stack = xp.concatenate([q_stack, t_stack], axis=1)
+
+        # IRLS-style filtering of the poses with multiple iterations
         q_avg, t_avg, success = average_qtposes(
-            qt_stack=rt_stack,
+            qt_stack=qt_stack,
             thresh_radians=self._angular_thresh_rad,
-            thresh_distance=self._translational_thresh
+            thresh_distance=self._translational_thresh,
+            iters=3
         )
 
         if not success:
             logger.debug(
-                f"[CONSENSUS_FAIL] Frame rejected. Could not find a consistent board pose among {rt_stack.shape[0]} views.")
-            self._latest_board_pose_w = None  # invalidate the single-frame pose
-            return
+                f"[CONSENSUS_FAIL] Frame rejected. Could not find a consistent object pose "
+                f"among {qt_stack.shape[0]} views."
+            )
+            return None
 
-        # Update state with the new good pose
-        T_b2w = compose_transform_matrix(vector_from_quaternion(q_avg), t_avg)
-        self._latest_board_pose_w = T_b2w
-        self._board_pose_history.append(T_b2w)
+        # Re compose final transform
+        return compose_transform_matrix(vector_from_quaternion(q_avg), t_avg)
 
-        # Calculate new camera extrinsics based on the optimised board pose
-        T_c2b_all = invert_transform(T_b2c_all)
-        T_c2w_new = T_b2w @ T_c2b_all
+    def _validate_frame_quality(
+            self,
+            frame_data: MultiviewDetection,
+            T_o2w: xp.ndarray,
+            T_c2w_new: xp.ndarray
+    ) -> bool:
+        """
+        Validate frame quality using reprojection error.
 
-        world_pts = (T_b2w @ self._board_pts_hom.T).T[:, :3]
+        Args:
+            frame_data: Vectorized frame data
+            T_o2w: Object-to-world transform
+            T_c2w_new: New camera-to-world transforms
 
-        # Get world-to-camera transforms for projection
+        Returns:
+            True if frame passes quality check, False otherwise
+        """
+        # Transform object points to world
+        world_pts = transform_points(self._object_points, T_o2w)
+
+        # Project to cameras
         T_w2c_new = invert_transform(T_c2w_new)
-        K_batch = self._K[cam_indices]
-        D_batch = self._D[cam_indices]
+        K_batch = self._K[frame_data.cam_indices]
+        D_batch = self._D[frame_data.cam_indices]
 
         reproj_pts, reproj_mask = project_to_cameras(
             world_pts,
@@ -240,414 +503,388 @@ class MultiviewCalibrationTool:
             distortion_model=self._distortion_model
         )
 
-        effective_visibility = visibility_mask * reproj_mask
-
-        errors_dict = reprojection_errors(gt_points_padded, reproj_pts, effective_visibility)
-        frame_rms_euclidean = errors_dict['rms_euclidean']
-
-        FRAME_ERROR_THRESHOLD = 5.0
-        if frame_rms_euclidean > FRAME_ERROR_THRESHOLD:
-            logger.debug(f"[QUALITY_REJECT] Frame rejected. High Euclidean RMS Error: {frame_rms_euclidean:.2f}px")
-
-            # if the frame is bad, we should not have added it to the history. So we dump it. TODO: that's a bit suboptimal but that'll do for now
-            if len(self._board_pose_history) > 0 and xp.all(self._board_pose_history[-1] == T_b2w):
-                self._board_pose_history.pop()
-
-            self._latest_board_pose_w = None
-
-            return
-
-        logger.debug(f"[ACCEPTED] Frame Euclidean RMS: {frame_rms_euclidean:.2f} px.")
-
-        # Commit the new extrinsics to the main state for all cameras in this frame
-        for i, cam_idx in enumerate(cam_indices):
-            if cam_idx != self.origin_idx:  # Never update the origin camera
-                self._T_c2w_all = set_at(self._T_c2w_all, cam_idx, T_c2w_new[i])
-
-            self._has_extrinsics[cam_idx] = True
-
-        self.ba_samples.append(entries)
-
-    def register(self, cam_idx: int, detection: DetectionPayload):
-
-        if detection.pointsIDs is None or detection.points2D is None:
-            return
-
-        if len(detection.pointsIDs) < 4:
-            return
-
-        # Reestimate the board-to-camera pose and validate it
-        success, T_b2c, errors_dict = solve_pnp_robust(
-            points3d=self._object_points[detection.pointsIDs],
-            points2d=detection.points2D,
-            K=self._K[cam_idx],
-            D=self._D[cam_idx]
+        # Calculate reprojection error
+        effective_visibility = frame_data.visibility_mask * reproj_mask
+        errors_dict = reprojection_errors(
+            frame_data.points2D,
+            reproj_pts,
+            effective_visibility
         )
 
-        # if PnP fails, return
-        if not success:
-            return
+        frame_rms = errors_dict['rms_euclidean']
 
-        # From here on T_b2c should be sane
+        if frame_rms > self._max_frame_rms_threshold:
+            logger.debug(
+                f"[QUALITY_REJECT] Frame rejected. High Euclidean RMS Error: {frame_rms:.2f}px"
+            )
+            return False
 
-        f = detection.frame
-        self._last_frame[cam_idx] = f
-        self._detection_buffer[cam_idx][f] = (T_b2c, detection.points2D, detection.pointsIDs)
+        logger.debug(f"[ACCEPTED] Frame Euclidean RMS: {frame_rms:.2f} px.")
+        return True
 
-        # The origin camera's extrinsics are fixed at identity, so its flag is always true
-        # This only needs to be set once
-        if not self._has_extrinsics[self.origin_idx]:
-            self._has_extrinsics[self.origin_idx] = True
 
-        self._flush_frames()
-
-    def refine_all(self) -> bool:
+    def refine(self) -> bool:
         """
-        Performs a global, three-stage bundle adjustment (BA) over all collected samples
-        (Sort of graduated non-convexity process)
+        Perform global three-stage bundle adjustment over all collected samples.
 
-        - Stage 1: Solves for a stable global geometry with shared intrinsics and no distortion
-        - Stage 2: Refines per-camera intrinsics (still no distortion)
-        - Stage 3: Performs a full refinement with all parameters (including distortion)
+        This implements a graduated non-convexity approach:
+        - Stage 1: Establish stable geometry with shared intrinsics and no distortion
+        - Stage 2: Refine per-camera intrinsics with simple distortion model
+        - Stage 3: Final polish with full distortion model
+
+        Handles memory constraints by reducing sample count if MemoryError occurs.
+
+        Returns:
+            True if bundle adjustment succeeded, False otherwise
         """
-
         if not all(self._has_extrinsics):
             logger.error("[BA] Initial extrinsics have not been estimated yet.")
             return False
-
-        P = self.ba_sample_count
+        
+        P = self.sample_count
         if P < self._min_detections:
             logger.error(f"[BA] Not enough samples. Have {P}, need {self._min_detections}.")
             return False
 
         logger.debug(f"[BA] Starting 3-Stage Bundle Adjustment with {P} samples.")
 
-        C = self.nb_cameras
-        N = self._object_points.shape[0]
+        ba_configs = self._create_ba_stage_configs()
 
-        ba_succeeded = False
-        final_results = None
-
-        # The try-loop handles potential memory issues by reducing sample count
-        current_P = self.ba_sample_count
-
-        def make_cov(sigma_f, sigma_c, sigma_d, sigma_r, sigma_t, n_d_coeffs, shared):
-            return covariance_from_std(
-                nb_cameras=C,
-                nb_dist_coeffs=n_d_coeffs,
-                fix_aspect_ratio=True,
-                shared_intrinsics=shared,
-                sigma_f=sigma_f, sigma_c=sigma_c, sigma_d=sigma_d, sigma_r=sigma_r, sigma_t=sigma_t
-            )
-
+        current_P = P
         while current_P >= self._min_detections:
             try:
                 logger.info(f"[BA] Attempting Bundle Adjustment with {current_P} samples.")
 
-                # Slice the buffers to current_P
-                current_samples = list(self.ba_samples)[-current_P:]
+                self._prepare_ba_data(current_P)
+                final_results = self._run_multistage_ba(ba_configs)
+                self._store_ba_results(final_results)
 
-                pts2d_buf = np.zeros((C, current_P, N, 2), dtype=np.float32)
-                vis_buf = np.zeros((C, current_P, N), dtype=bool)
-
-                for p_idx, entries in enumerate(current_samples):
-                    for cam_idx, _, pts2D, ids in entries:
-                        pts2d_buf[cam_idx, p_idx, ids, :] = pts2D
-                        vis_buf[cam_idx, p_idx, ids] = True
-
-                # Initial guess for board poses (from online estimation)
-                T_board_w_list = []
-
-                for p_idx, entries in enumerate(current_samples):
-
-                    cam_indices_in_frame = xp.array([c for c, _, _, _ in entries])
-
-                    T_b2c_in_frame = xp.stack([T_b2c for _, T_b2c, _, _ in entries])
-                    T_c2w_in_frame = self._T_c2w_all[cam_indices_in_frame]
-
-                    T_b2w_votes = T_c2w_in_frame @ T_b2c_in_frame
-
-                    r_stack, t_stack = decompose_transform_matrix(T_b2w_votes)
-                    q_stack = quaternion_from_vector(r_stack)
-
-                    # Simple average for BA initialisation
-                    # (Because the spread of this cluster is a direct result of the accumulated errors
-                    # during online camera pose estimates - which are unavoidable!!
-                    # The hardcore filter used online would likely jusyt eliminate everyone here)
-                    q_avg = quaternion_average(q_stack)
-                    t_avg = xp.median(t_stack, axis=0)
-
-                    T_board_w_list.append(compose_transform_matrix(vector_from_quaternion(q_avg), t_avg))
-
-                # Prepare initial matrices
-                T_obj_initial = xp.stack(T_board_w_list)
-                pts2d_buf = xp.asarray(pts2d_buf)
-                vis_buf = xp.asarray(vis_buf)
-
-                self._points2d, self._visibility_mask = pts2d_buf, vis_buf  # store points for this run
-
-                # STAGE 1: Global geometry (shared intrinsics, no distortion)
-                # ------------------------------------------------------------------
-                # Strategy: Trust the datasheet
-                # In high-mag setups, focal length is highly correlated with Z-translation.
-                # We constrain f/c to prevent the geometry from exploding.
-
-                logger.debug(f"[BA] >>> STAGE 1: Anchoring to datasheet specs ({current_P} frames)")
-
-                cov_extr_s1, cov_intr_s1 = make_cov(
-                    sigma_f=10.0,   # Allow 10 px deviation from datasheet
-                    sigma_c=0.2,    # Lock principal point to center
-                    sigma_d=1.0,    # Unused (distortion 'none')
-                    sigma_r=10.0,   # Loose extrinsics (finding the pose)
-                    sigma_t=1000.0, # Loose translation
-                    n_d_coeffs=0, shared=True
-                )
-
-                success_s1, results_s1 = run_bundle_adjustment(
-                    K=self._K,
-                    D=self._D,
-                    cameras_poses=self._T_c2w_all,
-                    images_sizes_hw=self._images_sizes_hw,
-                    points2d_observed=pts2d_buf,
-                    visibility_mask=vis_buf,
-                    object_points=self._object_points,
-                    object_poses=T_obj_initial,
-                    origin_cam_idx=self.origin_idx,
-                    distortion_model='none',    # No distortion in stage 1
-                    fix_intrinsics=False,
-                    fix_extrinsics=False,
-                    fix_object_points=True,     # The board's shape is known and rigid
-                    fix_object_poses=False,     # The board's pose is being optimized
-                    fix_aspect_ratio=True,      # Assume fx = fy
-                    shared_intrinsics=True,     # Forces a single camera model for all views
-                    covariance_intrinsics=cov_intr_s1,
-                    covariance_extrinsics=cov_extr_s1,
-                    radial_penalty=0.0,
-                    stage=1
-                )
-                if not success_s1:
-                    raise RuntimeError("BA Stage 1 failed.")
-
-                # STAGE 2: Per-camera intrinsics (simple distortion)
-                # ------------------------------------------------------------------
-                # Strategy: Relax shared constraint, but prevent drift.
-                # We use the results from Stage 1 (global average) as the mean for the priors.
-                # We enable distortion but constrain it so it doesn't eat up the focal length.
-
-                logger.debug(f"[BA] >>> STAGE 2: Per-Camera Refinement")
-
-                cov_extr_s2, cov_intr_s2 = make_cov(
-                    sigma_f=1.0,  # Keep close to the global average found in S1
-                    sigma_c=1.0,  # Allow slight PP shift per camera
-                    sigma_d=0.1,  # Allow small distortion (prevent overfitting)
-                    sigma_r=1.0,  # Allow extrinsics to adjust to the new f
-                    sigma_t=50.0,
-                    n_d_coeffs=4, shared=False
-                )
-
-                success_s2, results_s2 = run_bundle_adjustment(
-                    K=results_s1['K_opt'],
-                    D=results_s1['D_opt'],
-                    cameras_poses=results_s1['camera_poses_opt'],
-                    images_sizes_hw=self._images_sizes_hw,
-                    points2d_observed=pts2d_buf,
-                    visibility_mask=vis_buf,
-                    object_points=self._object_points,
-                    object_poses=results_s1['object_poses_opt'],
-                    origin_cam_idx=self.origin_idx,
-                    distortion_model='simple',  # start optimising distortion
-                    fix_intrinsics=False,
-                    fix_extrinsics=False,
-                    fix_object_points=True,
-                    fix_object_poses=False,
-                    fix_aspect_ratio=True,
-                    shared_intrinsics=False,  # start optimising intrinsics per-camera
-                    covariance_intrinsics=cov_intr_s2,
-                    covariance_extrinsics=cov_extr_s2,
-                    radial_penalty=2.0,
-                    stage=2  # start penalising points too far from the working volume
-                )
-                if not success_s2:
-                    raise RuntimeError("BA Stage 2 failed.")
-
-                # STAGE 3: Final polish (full distortion)
-                # ------------------------------------------------------------------
-                # Strategy: Lock Geometry, polish residuals
-
-                logger.debug(f"[BA] >>> STAGE 3: Final polish")
-
-                from mokap.calibration.bundle_adjustment import DIST_MODEL_MAP
-                n_d = DIST_MODEL_MAP.get(self._distortion_model, 0)
-                if self._distortion_model == 'fisheye': n_d = 4
-
-                cov_extr_s3, cov_intr_s3 = make_cov(
-                    sigma_f=1.0,    # Keep f stable
-                    sigma_c=1.0,
-                    sigma_d=0.05,   # Tighten distortion further
-                    sigma_r=0.05,   # Approx 2.8 degrees to allow rotation during dist model switch
-                    sigma_t=10.0,   # in scene units
-                    n_d_coeffs=n_d, shared=False
-                )
-
-                success_s3, final_results = run_bundle_adjustment(
-                    K=results_s2['K_opt'],
-                    D=results_s2['D_opt'],
-                    cameras_poses=results_s2['camera_poses_opt'],
-                    images_sizes_hw=self._images_sizes_hw,
-                    points2d_observed=pts2d_buf,
-                    visibility_mask=vis_buf,
-                    object_points=self._object_points,
-                    object_poses=results_s2['object_poses_opt'],
-                    origin_cam_idx=self.origin_idx,
-                    distortion_model=self._distortion_model,  # finally use the desired model
-                    fix_intrinsics=False,
-                    fix_extrinsics=False,
-                    fix_object_points=True,
-                    fix_object_poses=False,
-                    fix_aspect_ratio=True,
-                    shared_intrinsics=False,
-                    covariance_intrinsics=cov_intr_s3,
-                    covariance_extrinsics=cov_extr_s3,
-                    radial_penalty=4.0,  # now we kinda want to ignore the points far from the working volume
-                    stage=3
-                )
-                if not success_s3:
-                    raise RuntimeError("BA Stage 3 failed.")
-
-                ba_succeeded = True
-                break
+                logger.info(f"Bundle adjustment complete using {current_P} samples. Storing refined parameters.")
+                return True
 
             except MemoryError:
-                gc.collect()
-                mem = psutil.virtual_memory()
-                logger.warning(
-                    f"[BA] Memory error encountered with {current_P} samples. "
-                    f"RAM usage: {mem.percent}% ({mem.used / 1e9:.2f}/{mem.total / 1e9:.2f} GB). "
-                    f"Reducing sample count and retrying."
-                )
-
-                # Reduce sample count by 10% for the next attempt
-                current_P = int(current_P * 0.9)
-                continue
+                current_P = self._handle_memory_error(current_P)
 
             except RuntimeError as e:
                 logger.error(f"[BA] {e}. Could not converge even with {current_P} samples. Aborting.")
                 return False
 
-        if ba_succeeded and final_results is not None:
-            logger.info(f"Bundle adjustment complete using {current_P} samples. Storing refined parameters.")
+        logger.error(
+            f"[BA] Failed to complete bundle adjustment. "
+            f"Minimum sample requirement is {self._min_detections}, but failed even after "
+            f"reducing to {current_P}."
+        )
+        return False
 
-            # Store globally optimised results
-            self._refined_intrinsics = (final_results['K_opt'], final_results['D_opt'])
-            self._refined_extrinsics = final_results['camera_poses_opt']  # (C, 4, 4)
-            self._refined_board_poses = final_results['object_poses_opt']  # (P, 4, 4)
+    def _create_ba_stage_configs(self) -> List[BundleAdjustmentConfig]:
+        """
+        Create configuration for all three stages of bundle adjustment.
 
-            self._refined = True
-            self.volume_of_trust()
-            self.ba_samples.clear()
-            return True
-        else:
-            logger.error(f"[BA] Failed to complete bundle adjustment. "
-                         f"Minimum sample requirement is {self._min_detections}, but failed even after reducing to {current_P}.")
-            return False
+        Stage 1: Anchor to datasheet specs with shared intrinsics
+        Stage 2: Per-camera intrinsics with simple distortion
+        Stage 3: Full refinement with complete distortion model
+        """
 
-    @property
-    def intrinsics(self) -> Tuple[xp.ndarray, xp.ndarray]:
-        return self._K, self._D
+        # TODO: Get rid of this. Use DistortionModel datatype
+        #  (DistortionModel = Literal['none', 'simple', 'standard', 'rational', 'thinprism', 'tilted', 'fisheye'])
+        from mokap.calibration.bundle_adjustment import DIST_MODEL_MAP
+        n_d_full = DIST_MODEL_MAP.get(self._distortion_model, 0)
+        if self._distortion_model == 'fisheye':
+            n_d_full = 4
 
-    @property
-    def extrinsics(self) -> xp.ndarray:
-        # Returns (C, 4, 4) matrix
-        return self._T_c2w_all
+        return [
+            # Stage 1: Global geometry with shared intrinsics, no distortion
+            BundleAdjustmentConfig(
+                distortion_model='none',
+                fix_intrinsics=False,
+                fix_extrinsics=False,
+                fix_object_points=True,
+                fix_object_poses=False,
+                fix_aspect_ratio=True,
+                shared_intrinsics=True,
+                radial_penalty=0.0,
+                sigma_f=10.0,  # Allow 10px deviation from datasheet
+                sigma_c=0.2,  # Lock principal point to center
+                sigma_d=1.0,  # Unused (distortion 'none')
+                sigma_r=10.0,  # Loose extrinsics (finding the pose)
+                sigma_t=1000.0,  # Loose translation
+                n_dist_coeffs=0
+            ),
+            # Stage 2: Per-camera intrinsics with simple distortion
+            BundleAdjustmentConfig(
+                distortion_model='simple',
+                fix_intrinsics=False,
+                fix_extrinsics=False,
+                fix_object_points=True,
+                fix_object_poses=False,
+                fix_aspect_ratio=True,
+                shared_intrinsics=False,
+                radial_penalty=2.0,
+                sigma_f=1.0,  # Keep close to global average from Stage 1
+                sigma_c=1.0,  # Allow slight PP shift per camera
+                sigma_d=0.1,  # Allow small distortion (prevent overfitting)
+                sigma_r=1.0,  # Allow extrinsics to adjust
+                sigma_t=50.0,
+                n_dist_coeffs=4
+            ),
+            # Stage 3: Final polish with full distortion model
+            BundleAdjustmentConfig(
+                distortion_model=self._distortion_model,
+                fix_intrinsics=False,
+                fix_extrinsics=False,
+                fix_object_points=True,
+                fix_object_poses=False,
+                fix_aspect_ratio=True,
+                shared_intrinsics=False,
+                radial_penalty=4.0,
+                sigma_f=1.0,
+                sigma_c=1.0,
+                sigma_d=0.05,  # Tighten distortion further
+                sigma_r=0.05,  # Approx 2.8 degrees
+                sigma_t=10.0,
+                n_dist_coeffs=n_d_full
+            )
+        ]
 
-    @property
-    def is_estimated(self) -> bool:
-        return all(self._has_extrinsics)
+    def _prepare_ba_data(self, P: int) -> None:
+        """Prepare data buffers for bundle adjustment."""
 
-    @property
-    def current_board_pose(self) -> Optional[xp.ndarray]:
-        return self._latest_board_pose_w
+        C = self.nb_cameras
+        N = self._object_points.shape[0]
 
-    @property
-    def refined_intrinsics(self) -> Tuple[xp.ndarray, xp.ndarray]:
-        return self._refined_intrinsics
+        # Get most recent samples
+        current_samples: List[MultiviewDetection] = list(self._samples)[-P:]
 
-    @property
-    def refined_extrinsics(self) -> xp.ndarray:
-        return self._refined_extrinsics
+        # Init buffers
+        pts2d_buf = np.zeros((C, P, N, 2), dtype=np.float32)
+        vis_buf = np.zeros((C, P, N), dtype=bool)
+        T_object_w_buf = []
 
-    @property
-    def refined_board_poses(self) -> xp.ndarray:
-        return self._refined_board_poses
+        for sample_idx, mv_detection in enumerate(current_samples):
 
-    @property
-    def image_points(self):
-        return self._points2d, self._visibility_mask
+            cams_in_sample = mv_detection.cam_indices
+
+            # Fill buffers
+            for i, cam_idx in enumerate(cams_in_sample):
+                pts2d_buf[cam_idx, sample_idx, :, :] = mv_detection.points2D[i]
+                vis_buf[cam_idx, sample_idx, :] = mv_detection.visibility_mask[i]
+
+            # Estimate initial object poses for BA initialisation
+            T_o2c = mv_detection.T_o2c
+            T_c2w = self._cam_T_c2w[cams_in_sample]
+            T_o2w_votes = T_c2w @ T_o2c
+
+            T_object_w_buf.append(self._consensus_poses_lenient(T_o2w_votes))
+
+        # Store as xp arrays
+        self._ba_points2d = xp.asarray(pts2d_buf)
+        self._ba_visibility = xp.asarray(vis_buf)
+        self._ba_object_poses = xp.stack(T_object_w_buf)
+        self._ba_num_samples = P
+
+
+    def _run_multistage_ba(self, configs: List[BundleAdjustmentConfig]) -> Dict:
+        """Run three-stage bundle adjustment."""
+
+        current_K = self._K
+        current_D = self._D
+        current_camera_poses = self._cam_T_c2w
+        current_object_poses = self._ba_object_poses
+
+        results = None
+        stage_names = ["Anchoring to specs", "Per-camera refinement", "Final polish"]
+
+        for s, config in enumerate(configs):
+
+            logger.debug(f"[BA] >>> STAGE {s}: {stage_names[s]} ({self._ba_num_samples} frames)")
+
+            # Create covariance matrices for this stage
+            cov_extr, cov_intr = covariance_from_std(
+                nb_cameras=self.nb_cameras,
+                nb_dist_coeffs=config.n_dist_coeffs,    # TODO: This function should use distortion model datatype, not this
+                fix_aspect_ratio=config.fix_aspect_ratio,
+                shared_intrinsics=config.shared_intrinsics,
+                sigma_f=config.sigma_f,
+                sigma_c=config.sigma_c,
+                sigma_d=config.sigma_d,
+                sigma_r=config.sigma_r,
+                sigma_t=config.sigma_t
+            )
+
+            # Run bundle adjustment for this stage
+            success, results = run_bundle_adjustment(
+                K=current_K,
+                D=current_D,
+                cameras_poses=current_camera_poses,
+                images_sizes_hw=self._images_sizes_hw,
+                points2d_observed=self._ba_points2d,        # TODO: Why is this receiving an attribute and object_poses is receiving current_object_poses?
+                visibility_mask=self._ba_visibility,
+                object_points=self._object_points,
+                object_poses=current_object_poses,
+                origin_cam_idx=self.origin_cam_idx,
+                distortion_model=config.distortion_model,
+                fix_intrinsics=config.fix_intrinsics,
+                fix_extrinsics=config.fix_extrinsics,
+                fix_object_points=config.fix_object_points,
+                fix_object_poses=config.fix_object_poses,
+                fix_aspect_ratio=config.fix_aspect_ratio,
+                shared_intrinsics=config.shared_intrinsics,
+                covariance_intrinsics=cov_intr,
+                covariance_extrinsics=cov_extr,
+                radial_penalty=config.radial_penalty,
+                stage=s
+            )
+
+            if not success:
+                raise RuntimeError(f"BA Stage {s} failed.")
+
+            # Use results as input for next stage
+            current_K = results['K_opt']
+            current_D = results['D_opt']
+            current_camera_poses = results['camera_poses_opt']
+            current_object_poses = results['object_poses_opt']
+
+        return results
+
+    def _store_ba_results(self, results: Dict) -> None:
+
+        self._refined_intrinsics = (results['K_opt'], results['D_opt'])
+        self._refined_cam_poses_c2w = results['camera_poses_opt']  # (C, 4, 4)
+        self._refined_object_poses_o2w = results['object_poses_opt']   # (P, 4, 4)
+
+        self._points2d_final = self._ba_points2d
+        self._visibility_final = self._ba_visibility
+
+        self._is_refined = True
+        self.volume_of_trust()
+        self._samples.clear()
+
+        # Clean up BA buffers
+        self._ba_points2d = None
+        self._ba_visibility = None
+        self._ba_object_poses = None
+
+    def _handle_memory_error(self, current_P: int) -> int:
+        """
+        Handle memory error during bundle adjustment.
+
+        Args:
+            current_P: Current number of samples
+
+        Returns:
+            Reduced number of samples for next attempt
+        """
+        gc.collect()
+        mem = psutil.virtual_memory()
+        logger.warning(
+            f"[BA] Memory error encountered with {current_P} samples. "
+            f"RAM usage: {mem.percent}% ({mem.used / 1e9:.2f}/{mem.total / 1e9:.2f} GB). "
+            f"Reducing sample count and retrying."
+        )
+        return int(current_P * 0.9)
+
 
     def volume_of_trust(
             self,
             threshold: float = 1.0,
             iqr_factor: float = 1.5
-        ) -> Optional[Dict[str, Tuple[float, float]]]:
+    ) -> Optional[Dict[str, Tuple[float, float]]]:
+        """
+        Calculate the "volume of trust" - the 3D region with reliable reprojection.
 
-        if self._refined:
-            # calculate the 3D world coordinates of all point instances using the refined poses
-            # Board Poses: (P, 4, 4)
-            # Board Points: (N, 4) (Homogeneous)
-            T_b2w_all_opt = self.refined_board_poses
-            world_pts_all_instances = xp.einsum('pij,nj->pni', T_b2w_all_opt, self._board_pts_hom)[:, :, :3]
+        This computes the bounding box of points with low reprojection error,
+        indicating the spatial region where the calibration is most accurate.
 
-            # Reprojection and error calculation
-            observed_pts2d, visibility_mask = self.image_points
+        Args:
+            threshold: Error threshold in pixels
+            iqr_factor: IQR factor for outlier detection
 
-            # Get world-to-camera transforms
-            T_c2w = self.refined_extrinsics  # (C, 4, 4)
-            T_w2c = invert_transform(T_c2w)
+        Returns:
+            Dictionary with 'x', 'y', 'z' keys containing (min, max) tuples
+        """
 
-            # Project all 3D points into all cameras
-            reprojected_pts, valid_depth_mask = project_to_cameras_multi(
-                world_pts_all_instances,
-                T_w2c,
-                *self._refined_intrinsics,
-                distortion_model=self._distortion_model
-            )
+        if not self._is_refined:
+            return None
 
-            effective_visibility = visibility_mask * valid_depth_mask
+        # Transform all object poses to world coordinates
+        object_points_world = transform_points(self._object_points, self._refined_object_poses_o2w)
 
-            errors_dict = reprojection_errors(
-                observed_pts2d,
-                reprojected_pts,
-                effective_visibility,
-                per_point_errors=True   # to get the distances for volume of trust calculation
-            )
-            # Extract per-point Euclidean distances
-            points_errors = errors_dict['mre_per_point']
+        # Invert all camera poses to world-to-camera
+        T_cam_w2c = invert_transform(self._refined_cam_poses_c2w)  # (C, 4, 4)
 
-            # And compute the reliable bounding box using the world points and their errors
-            volume_of_trust = compute_bounds(
-                world_pts_all_instances,
-                points_errors,
-                error_threshold=threshold,
-                iqr_factor=iqr_factor
-            )
+        # Project all 3D points into all cameras
+        reprojected_pts, valid_depth_mask = project_to_cameras_multi(
+            object_points_world,
+            T_cam_w2c,
+            *self._refined_intrinsics,
+            distortion_model=self._distortion_model
+        )
 
-            # Convert back to floats to save
-            volume_of_trust = {k: (float(v[0]), float(v[1])) for k, v in volume_of_trust.items()}
+        # Get reprojection errors
+        effective_visibility = self._visibility_final * valid_depth_mask
 
-            if volume_of_trust:
-                print("[ Volume of Trust ]")
-                print(f"X range: {volume_of_trust['x'][0]:.2f} to {volume_of_trust['x'][1]:.2f} mm")
-                print(f"Y range: {volume_of_trust['y'][0]:.2f} to {volume_of_trust['y'][1]:.2f} mm")
-                print(f"Z range: {volume_of_trust['z'][0]:.2f} to {volume_of_trust['z'][1]:.2f} mm")
+        errors_dict = reprojection_errors(
+            self._points2d_final,
+            reprojected_pts,
+            effective_visibility,
+            per_point_errors=True
+        )
+        points_errors = errors_dict['mre_per_point']
 
-                self._volume_of_trust = volume_of_trust
+        # Compute reliable bounding box
+        volume = compute_bounds(
+            object_points_world,
+            points_errors,
+            error_threshold=threshold,
+            iqr_factor=iqr_factor
+        )
+        volume = {k: (float(v[0]), float(v[1])) for k, v in volume.items()}
+        if volume:
+            print("[ Volume of Trust ]")
+            print(f"X range: {volume['x'][0]:.2f} to {volume['x'][1]:.2f} mm")
+            print(f"Y range: {volume['y'][0]:.2f} to {volume['y'][1]:.2f} mm")
+            print(f"Z range: {volume['z'][0]:.2f} to {volume['z'][1]:.2f} mm")
 
-            return self._volume_of_trust
+            self._volume_of_trust = volume
+
+        return self._volume_of_trust
 
     @property
-    def ba_sample_count(self) -> int:
-        return len(self.ba_samples)
+    def sample_count(self) -> int:
+        """Number of samples currently stored for bundle adjustment."""
+        return len(self._samples)
 
     @property
-    def is_refined(self) -> bool:
-        return self._refined
+    def intrinsics(self) -> Tuple[xp.ndarray, xp.ndarray]:
+        if self._is_refined:
+            return self._refined_intrinsics
+        else:
+            return self._K, self._D
+
+    @property
+    def camera_poses(self) -> Optional[xp.ndarray]:
+        if self._is_refined:
+            return self._refined_cam_poses_c2w
+        elif all(self._has_extrinsics):
+            return self._cam_T_c2w
+        else:
+            return None
+
+    @property
+    def object_poses(self) -> Optional[xp.ndarray]:
+        """
+        Get object poses.
+
+        Returns refined poses after BA, or the current pose history otherwise.
+        """
+        if self._is_refined:
+            return self._refined_object_poses_o2w
+        elif len(self._object_T_o2w_stack) > 0:
+            return xp.stack(list(self._object_T_o2w_stack))
+        else:
+            return None
+
+    @property
+    def curent_object_pose(self) -> Optional[xp.ndarray]:
+        """Most recent object pose in world coordinates."""
+        return self._current_object_T_o2w
