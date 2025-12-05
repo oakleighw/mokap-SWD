@@ -153,7 +153,7 @@ def run_intrinsics(folder: Path,
                 # State Machine
                 if not refining[i]:
                     system_stable = False  # not stable if still collecting
-                    if m.pct_coverage >= min_coverage and m.curr_nb_samples >= min_samples:
+                    if m.pct_coverage >= min_coverage and m.sample_count >= min_samples:
                         refining[i] = True
                         print(f"[Cam {cam_names[i]}] Target coverage reached. Starting refinement.")
                 else:
@@ -204,8 +204,8 @@ def run_intrinsics(folder: Path,
     results = {}
 
     for i, (name, m) in enumerate(zip(cam_names, tools)):
-        if m.curr_nb_samples > min_samples:
-            print(f"Computing final calibration for camera '{name}' ({m.curr_nb_samples} samples)...")
+        if m.sample_count > min_samples:
+            print(f"Computing final calibration for camera '{name}' ({m.sample_count} samples)...")
             m.compute_intrinsics(keep_stacks=False, fix_aspect_ratio=False, distortion_model='standard')
             err = np.nanmean(m.calibration_rmse_perview)
             results[name] = err

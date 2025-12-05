@@ -176,11 +176,11 @@ class MonocularCalibrationTool:
         return self._curr_T_b2c is not None
 
     @property
-    def curr_nb_points(self) -> int:
+    def points_count(self) -> int:
         return self._points2d.shape[0] if self._points2d is not None else 0
 
     @property
-    def curr_nb_samples(self) -> int:
+    def sample_count(self) -> int:
         return len(self.stack_points2d)
 
     @property
@@ -341,7 +341,7 @@ class MonocularCalibrationTool:
     def register_sample(self, min_new_area: float = 0.2) -> bool:
         """ Registers a sample if the new area is above threshold """
 
-        if not self.has_detection or self.curr_nb_points < self._min_pts:
+        if not self.has_detection or self.points_count < self._min_pts:
             return False
 
         # if no threshold, or if the new area is above thrshold

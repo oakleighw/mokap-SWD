@@ -151,7 +151,7 @@ class MonocularWorker(CalibrationProcessingWorker):
             # Policy for auto-computation
             if self._auto_compute and not self._last_calib_failed:
                 is_ready = (self.monocular_tool.pct_coverage >= self._coverage_threshold and
-                            self.monocular_tool.curr_nb_samples >= self._min_stack_for_calib)
+                            self.monocular_tool.sample_count >= self._min_stack_for_calib)
 
                 if is_ready:
 
@@ -228,7 +228,7 @@ class MonocularWorker(CalibrationProcessingWorker):
             payload = CoveragePayload(
                 grid=self.monocular_tool.grid,
                 coverage_percent=self.monocular_tool.pct_coverage,
-                nb_samples=self.monocular_tool.curr_nb_samples,
+                nb_samples=self.monocular_tool.sample_count,
                 total_points=self.monocular_tool.detector.board.nb_points
             )
             self.send_payload.emit(CalibrationData(self.cam_name, payload))
@@ -261,7 +261,7 @@ class MonocularWorker(CalibrationProcessingWorker):
             CalibrationData(self.cam_name, CoveragePayload(
                 grid=self.monocular_tool.grid,
                 coverage_percent=self.monocular_tool.pct_coverage,
-                nb_samples=self.monocular_tool.curr_nb_samples,
+                nb_samples=self.monocular_tool.sample_count,
                 total_points=self.monocular_tool.detector.board.nb_points
             ))
         )
