@@ -148,11 +148,12 @@ if __name__ == "__main__":
         if len(valid_errs) > 0:
             mean_e = np.mean(valid_errs)
             max_e = np.max(valid_errs)
+            min_e = np.min(valid_errs)
         else:
-            mean_e, max_e = np.nan, np.nan
+            mean_e, max_e, min_e = np.nan, np.nan, np.nan
 
         camera_stats[name] = {'mean': mean_e, 'max': max_e}
-        print(f"  {name:<15}: Mean={mean_e:.4f} px, Max={max_e:.4f} px")
+        print(f"  {name:<15}: Mean={mean_e:.4f} px, Max={max_e:.4f} px, Min={min_e:.4f} px")
     print("──────────────────────────────────────")
 
     # Find worst point

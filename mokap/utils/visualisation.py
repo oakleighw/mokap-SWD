@@ -451,10 +451,12 @@ def visualise_calibration_scene(
         stats_text = "Per-camera errors (px):\n"
         for i, cam_name in enumerate(camera_names):
             mean_err = np.nanmean(point_errors[i])
-            max_err = np.nanmean(point_errors[i])
+            max_err = np.nanmax(point_errors[i])
+            min_err = np.nanmin(point_errors[i])
 
             stats_text += (f"{cam_name:>10}: Mean={mean_err if np.isfinite(mean_err) else '-':.2f}, "
-                           f"Max={max_err if np.isfinite(max_err) else '-':.2f}\n")
+                           f"Max={max_err if np.isfinite(max_err) else '-':.2f}, "
+                           f"Min={min_err if np.isfinite(min_err) else '-':.2f}\n")
         ax.text2D(0.02, 0.98, stats_text, transform=ax.transAxes, fontsize=9, verticalalignment='top',
                   family='monospace', bbox=dict(boxstyle='round', facecolor='white', alpha=0.8))
 

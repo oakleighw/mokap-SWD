@@ -73,11 +73,14 @@ def print_intrinsics_details(names: List[str], tools: List[MonocularCalibrationT
         cx, cy = K[0, 2], K[1, 2]
 
         # Flatten and format distortion coeffs
-        d_str = ", ".join([f"{x:.4g}" for x in D.flatten()])
+        d_str = ", ".join([f"{x:.3f}" for x in D.flatten()])
 
         print(f"[{name}]")
-        print(f"  Focal:   fx={fx:.2f}, fy={fy:.2f}")
-        print(f"  Center:  cx={cx:.2f}, cy={cy:.2f}")
+        if np.isclose(fx, fy):
+            print(f"  Focal:   f={fx:.2f}")
+        else:
+            print(f"  Focal:   fx={fx:.2f}, fy={fy:.2f}")
+        print(f"  Center:  cx={cx:.2f} px, cy={cy:.2f}")
         print(f"  Dist:    [{d_str}]")
     print("───────────────────────────")
 
@@ -102,7 +105,7 @@ def run_intrinsics(folder: Path,
     Runs the monocular intrinsic calibration loop.
     Returns True if calibration finished and was saved/accepted.
     """
-    print(f"\n[INTRINSICS] Starting calibration in: {folder}")
+    print(f"[INTRINSICS] Starting calibration in: {folder}")
     video_paths, cam_names, work_dir = get_video_files(folder)
     caps, sizes_hw = open_cameras(video_paths)
     C = len(caps)
@@ -130,7 +133,7 @@ def run_intrinsics(folder: Path,
                 frames.append(fr if ret else None)
 
             if any(f is None for f in frames):
-                print("\n[Video End] Reached end of stream.")
+                print("[Video End] Reached end of stream.")
                 break
 
             # Skip redundant frames if requested
@@ -177,7 +180,7 @@ def run_intrinsics(folder: Path,
             # if all active cameras are stable, we quit.
             if system_stable and any_refining:
                 # don't exit if some cameras are lagging significantly in collection unless video is ending
-                print(f"\n[Stable] No improvement for {stabilize_frames} frames.")
+                print(f"[Stable] No improvement for {stabilize_frames} frames.")
                 break
 
             # Status print
@@ -192,7 +195,7 @@ def run_intrinsics(folder: Path,
             frame_idx += 1
 
     except KeyboardInterrupt:
-        print("\n[Interrupt] User stopped processing.")
+        print("[Interrupt] User stopped processing.")
     finally:
         for c in caps: c.release()
 
@@ -234,7 +237,7 @@ def run_extrinsics(folder: Path,
     Runs the multi-view extrinsic calibration loop.
     Requires intrinsics to exist on disk (or be recently written).
     """
-    print(f"\n[EXTRINSICS] Starting calibration in: {folder}")
+    print(f"[EXTRINSICS] Starting calibration in: {folder}")
     video_paths, cam_names, work_dir = get_video_files(folder)
 
     # Identify origin cam
@@ -344,7 +347,7 @@ def run_extrinsics(folder: Path,
 
             # Check termination
             if all_covered and mv_tool.ba_sample_count >= min_samples:
-                print("\n[Ready] Sufficient coverage and BA samples collected.")
+                print("[Ready] Sufficient coverage and BA samples collected.")
                 break
 
             # Status
@@ -355,12 +358,12 @@ def run_extrinsics(folder: Path,
             frame_idx += 1
 
     except KeyboardInterrupt:
-        print("\n[Interrupt] Stopping collection.")
+        print("[Interrupt] Stopping collection.")
     finally:
         for c in caps: c.release()
 
     if mv_tool.ba_sample_count < 10:
-        print("\n[Error] Not enough common samples found for Bundle Adjustment.")
+        print("[Error] Not enough common samples found for Bundle Adjustment.")
         return False
 
     # Bundle Adjustment

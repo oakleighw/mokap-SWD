@@ -86,7 +86,7 @@ def _jax_distort(points_norm, D, model_idx):
     out_x, out_y = x, y
 
     # Models
-    if model_idx == 4:  # Simple / Fisheye-polynomial
+    if model_idx == 4:  # Simple
         radial = 1.0 + k1 * r2 + k2 * r2 * r2
         out_x = x * radial
         out_y = y * radial
@@ -114,7 +114,7 @@ def _jax_distort(points_norm, D, model_idx):
         return points_norm * factor[..., None]
 
     # Tangential (for standard/rational)
-    if model_idx in [5, 8]:
+    if model_idx in [4, 5, 8]:
         xy = x * y
         x2 = x * x
         y2 = y * y
@@ -263,8 +263,11 @@ def covariance_from_std(
     nb_optim_cams = nb_cameras - 1
     nb_intr_sets = 1 if shared_intrinsics else nb_cameras
 
+    # Tiny epsilon to avoid singular matrices if any sigma passed is 0
+    eps = 1e-9
+
     # Extrinsics: (C-1, 6, 6) diagonal (each camera has rvec, tvec)
-    extr_variances = np.array([sigma_r ** 2] * 3 + [sigma_t ** 2] * 3)
+    extr_variances = np.array([sigma_r ** 2 + eps] * 3 + [sigma_t ** 2 + eps] * 3)
     extrinsics_cov = np.zeros((nb_optim_cams, 6, 6))
     for i in range(nb_optim_cams):
         extrinsics_cov[i] = np.diag(extr_variances)
@@ -275,12 +278,12 @@ def covariance_from_std(
 
     # Build variance vector for one intrinsics set
     if fix_aspect_ratio:
-        intr_variances = np.array([sigma_f ** 2, sigma_c ** 2, sigma_c ** 2])
+        intr_variances = np.array([sigma_f ** 2 + eps, sigma_c ** 2 + eps, sigma_c ** 2 + eps])
     else:
-        intr_variances = np.array([sigma_f ** 2, sigma_f ** 2, sigma_c ** 2, sigma_c ** 2])
+        intr_variances = np.array([sigma_f ** 2 + eps, sigma_f ** 2 + eps, sigma_c ** 2 + eps, sigma_c ** 2 + eps])
 
     # Add distortion variances
-    intr_variances = np.concatenate([intr_variances, np.full(nb_dist_coeffs, sigma_d ** 2)])
+    intr_variances = np.concatenate([intr_variances, np.full(nb_dist_coeffs, sigma_d ** 2 + eps)])
 
     intrinsics_cov = np.zeros((nb_intr_sets, intrinsics_dim, intrinsics_dim))
     for i in range(nb_intr_sets):
@@ -1405,7 +1408,7 @@ def run_bundle_adjustment(
         rms, mre = match.groups()
         return f"| Component RMS: {rms} px | MRE: {mre} px"
     title = f'Stage: {stage}' if stage else 'Bundle Adjustment'
-    with alive_bar(title=title, length=20, force_tty=True) as bar:
+    with alive_bar(title=title, length=20, force_tty=True, stats=False, monitor=False, spinner=None) as bar:
         with CallbackOutputStream(bar,
                 pattern=r"Component RMS: ([0-9\.]+) px, MRE: ([0-9\.]+) px",
                 refresh_rate=10,    # update text every 10 evals
