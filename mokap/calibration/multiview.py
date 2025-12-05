@@ -340,46 +340,6 @@ class MultiviewCalibrationTool:
                 sigma_f=sigma_f, sigma_c=sigma_c, sigma_d=sigma_d, sigma_r=sigma_r, sigma_t=sigma_t
             )
 
-        # # Priors weights to prevent the BA from overfittign
-        # priors_stage1 = {
-        #     'intrinsics': {
-        #         'focal_length': 0.1,  # weak, just to prevent the *average* focal length from drifting into nonsense
-        #         'principal_point': 5.0,  # This can be quite strong, most modern lenses have it very close to the centre
-        #         'distortion': 0.0
-        #     },
-        #     'extrinsics': {
-        #         'rotation': 0.0,
-        #         'translation': 0.0
-        #     }
-        # }
-        # priors_stage2 = {
-        #     'intrinsics': {
-        #         'focal_length': 1.0,    # quite strong. Keeps each camera's focal length from deviating from the average found in Stage 1
-        #         'principal_point': 0.1, # weak, but still here to keep the principal point near the image center
-        #         'distortion': 0.5       # medium, keeps the initial distortion terms small and well-behaved
-        #     },
-        #     'extrinsics': {  # extrinsics priors off
-        #         'rotation': 0.0,
-        #         'translation': 0.0
-        #     }
-        # }
-        # priors_stage3 = {
-        #     'intrinsics': {
-        #         'focal_length': 1.0,    # still strong. This is critical to avoid overfitting. TODO: Could be stronger maybe?
-        #         'principal_point': 0.1, # same as in stage 2. Modern cameras with modern lenses should be pretty centered...
-        #         'distortion': 0.1       # Relaxed from stage 2. We want to refine these a bit more.
-        #     },
-        #     'extrinsics': { # We assume by then the geometry is pretty good, so we set priors on the extrinsics
-        #                     # This prevents a single camera with poor visibility in some frames from drifting
-        #
-        #         # A weight of ~ 700 on radians is comparable to a weight of 0.1 on mm for a target tolerance of 0.5 deg / 1.0 mm
-        #         # This keeps camera poses very stable, allowing only tiny final adjustments
-        #         # TODO: Maybe we want to do this scaling inside the bundle_adjustment module and only expose normalised weights here?
-        #         'rotation': 700,
-        #         'translation': 0.1
-        #     }
-        # }
-
         while current_P >= self._min_detections:
             try:
                 logger.info(f"[BA] Attempting Bundle Adjustment with {current_P} samples.")
@@ -524,7 +484,7 @@ class MultiviewCalibrationTool:
                     sigma_f=1.0,    # Keep f stable
                     sigma_c=1.0,
                     sigma_d=0.05,   # Tighten distortion further
-                    sigma_r=0.0015, # in radians, so pretty much locked here
+                    sigma_r=0.05,   # Approx 2.8 degrees to allow rotation during dist model switch
                     sigma_t=10.0,   # in scene units
                     n_d_coeffs=n_d, shared=False
                 )
