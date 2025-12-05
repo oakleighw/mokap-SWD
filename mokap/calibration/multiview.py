@@ -275,7 +275,7 @@ class MultiviewCalibrationTool:
         Find frame numbers that are behind the minimum processed frame across
         cameras that have actually seen something.
         """
-        valid_indices = self._current_frame_indices[self._current_frame_indices > -1]
+        valid_indices = self._current_frame_indices[self._current_frame_indices >= 0]
 
         # If no camera has seen anything, nothing is stale
         if len(valid_indices) == 0:
@@ -350,16 +350,17 @@ class MultiviewCalibrationTool:
 
         # Disambiguate using pose history if available, and find a consensus
         T_o2w_votes = self._disambiguate_poses(T_o2w_votes, T_c2w_ank, T_o2c_ank)
-        T_o2w = self._consensus_poses_strict(T_o2w_votes)   # uses the strict one online estimation
+        # T_o2w = self._consensus_poses_strict(T_o2w_votes)   # uses the strict one online estimation
+        T_o2w = self._consensus_poses_lenient(T_o2w_votes)   # uses the strict one online estimation
         if T_o2w is None:
             return
 
         # Calculate new camera extrinsics for the currently active (and known) cameras
-        T_c2b_ank = invert_transform(T_o2c_ank)
-        T_c2w_new = T_o2w @ T_c2b_ank
+        T_c2o_detected = invert_transform(mv_detection.T_o2c)
+        T_c2w_detected = T_o2w @ T_c2o_detected
 
         # Quality control
-        if not self._validate_frame_quality(mv_detection, T_o2w, T_c2w_new):
+        if not self._validate_frame_quality(mv_detection, T_o2w, T_c2w_detected):
             # Frame rejected
             self._current_object_pose = None
             return
@@ -372,7 +373,7 @@ class MultiviewCalibrationTool:
         for i, cam_idx in enumerate(mv_detection.cam_indices):
 
             if cam_idx != self.origin_cam_idx:  # never update origin camera
-                self._camera_poses = set_at(self._camera_poses, cam_idx, T_c2w_new[i])
+                self._camera_poses = set_at(self._camera_poses, cam_idx, T_c2w_detected[i])
                 self._has_extrinsics[cam_idx] = True
 
         # Store the accepted sample for bundle adjustment
