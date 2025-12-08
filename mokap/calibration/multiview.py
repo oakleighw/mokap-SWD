@@ -40,6 +40,8 @@ class SingleviewDetection:
     """
     Represents a single camera's detection of the calibration object.
     """
+    frame_idx: int
+
     cam_idx: int
     T_o2c: xp.ndarray       # (4, 4)
     points2D: np.ndarray    # (N, 2)
@@ -51,6 +53,8 @@ class MultiviewDetection:
     """
     Represents a multi-camera detection of the calibration object.
     """
+    frame_idx: int
+
     cam_indices: xp.ndarray     # (n_C,)
     T_o2c: xp.ndarray           # (n_C, 4, 4)
     points2D: xp.ndarray        # (n_C, N, 2)
@@ -245,6 +249,7 @@ class MultiviewCalibrationTool:
 
         # Store detection in frame buffer
         cam_detection = SingleviewDetection(
+            frame_idx=detection.frame_idx,
             cam_idx=cam_idx,
             T_o2c=T_o2c,
             points2D=detection.points2D,
@@ -299,18 +304,23 @@ class MultiviewCalibrationTool:
         n_C = len(detections)   # number of cameras with a detection in this frame
         N = self._object_points.shape[0]
 
+        frame_indices = np.zeros(n_C, dtype=np.int32)
         cam_indices = np.zeros(n_C, dtype=np.int32)
         T_o2c = np.zeros((n_C, 4, 4), dtype=np.float32)
         points2d = np.zeros((n_C, N, 2), dtype=np.float32)
         visibility_mask = np.zeros((n_C, N), dtype=bool)
 
         for i, det in enumerate(detections):
+            frame_indices[i] = det.frame_idx
             cam_indices[i] = det.cam_idx
             T_o2c[i, :, :] = det.T_o2c
             points2d[i, det.pointsIDs, :] = det.points2D
             visibility_mask[i, det.pointsIDs] = True
 
+        assert np.all(frame_indices == frame_indices[0])
+
         return MultiviewDetection(
+            frame_idx=int(frame_indices[0]),
             cam_indices=cam_indices,
             T_o2c=T_o2c,
             points2D=points2d,
@@ -514,10 +524,10 @@ class MultiviewCalibrationTool:
         frame_rms = errors_dict['rms_euclidean']
 
         if frame_rms > self._max_frame_rms_threshold:
-            logger.debug(f"[QUALITY_REJECT] Frame rejected. High Euclidean RMS: {frame_rms:.2f}px")
+            logger.debug(f"[QUALITY_REJECT] Frame {frame_data.frame_idx} rejected. High Euclidean RMS: {frame_rms:.2f}px")
             return False
 
-        logger.debug(f"[ACCEPTED] Frame Euclidean RMS: {frame_rms:.2f} px.")
+        logger.debug(f"[ACCEPTED] Frame {frame_data.frame_idx} Euclidean RMS: {frame_rms:.2f} px.")
         return True
 
 

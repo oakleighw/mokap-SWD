@@ -2,7 +2,7 @@ import logging
 import sys
 
 logger = logging.getLogger('mokap')
-logger.setLevel(logging.INFO)
+logger.setLevel(logging.DEBUG)
 
 # A handler for printing to the console (stderr)
 console_handler = logging.StreamHandler(sys.stdout)
