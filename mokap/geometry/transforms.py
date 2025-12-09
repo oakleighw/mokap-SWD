@@ -1,6 +1,7 @@
-from typing import Tuple
+from typing import Tuple, Union
+
 try:
-    from .backend import xp, jit, _eps, _tiny
+    from .backend import xp, jit, _eps, _tiny, ArrayLike
 except ImportError:
     from mokap.geometry.backend import xp, jit, _eps, _tiny
 
@@ -535,8 +536,8 @@ def invert_vectors(
 
 @jit
 def matrix_from_axis_angle(
-        angle_degrees: xp.ndarray,
-        axis: xp.ndarray
+        angle_degrees: Union[float, xp.ndarray],
+        axis: ArrayLike
 ) -> xp.ndarray:
     """
     Creates rotation matrices from angle-axis representation.
@@ -548,7 +549,7 @@ def matrix_from_axis_angle(
     Returns:
         Rotation matrices (..., 3, 3)
     """
-    angle_degrees = xp.asarray(angle_degrees)
+    angle_degrees = xp.atleast_1d(angle_degrees)
     axis = xp.asarray(axis)
 
     theta = xp.deg2rad(angle_degrees)
@@ -568,8 +569,8 @@ def matrix_from_axis_angle(
 @jit
 def rotate_points(
         points3d: xp.ndarray,
-        angle_degrees: xp.ndarray,
-        axis: xp.ndarray,
+        angle_degrees: Union[float, xp.ndarray],
+        axis: ArrayLike,
 ) -> xp.ndarray:
     """
     Rotates 3D points around a specific axis.
@@ -590,8 +591,8 @@ def rotate_points(
 @jit
 def rotate_pose(
         T: xp.ndarray,
-        angle_degrees: xp.ndarray,
-        axis: xp.ndarray,
+        angle_degrees: Union[float, xp.ndarray],
+        axis: ArrayLike,
 ) -> xp.ndarray:
     """
     Rotates a pose matrix T by a global rotation defined by an axis and angle.
