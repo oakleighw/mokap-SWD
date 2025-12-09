@@ -398,7 +398,7 @@ def visualise_calibration_scene(
         worst_point_idx: Optional[int] = None,
         object_points: Optional[ArrayLike] = None,
         object_pose: Optional[ArrayLike] = None,
-        orientation: str = 'upright',
+        orientation: Optional[str] = None,
         frustum_scale: float = 0.5,
         ax: Optional[Axes3D] = None
 ) -> Axes3D:
@@ -406,9 +406,8 @@ def visualise_calibration_scene(
     ax = init_3d_plot(ax)
 
     # View transform
-    T_view = None
-    if orientation == 'upright':
-        T_view = np.eye(4)
+    T_view = np.eye(4)
+    if orientation is not None and orientation == 'upright':
         T_view[1, 1] = -1
         T_view[2, 2] = -1
 
