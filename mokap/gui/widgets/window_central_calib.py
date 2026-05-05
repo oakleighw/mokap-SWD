@@ -1,20 +1,22 @@
 import logging
 from typing import Union
 import cv2
-from pathlib import Path
+
 from PySide6.QtCore import Signal, Qt, Slot
 from PySide6.QtGui import QImage, QPixmap
 from PySide6.QtWidgets import QHBoxLayout, QFrame, QVBoxLayout, QGroupBox, QGridLayout, QLabel, QComboBox, QPushButton, \
     QSpinBox, QDoubleSpinBox, QFileDialog, QWidget
-from pyqtgraph.opengl import GLGridItem, GLViewWidget, GLScatterPlotItem, GLLinePlotItem, GLMeshItem, MeshData
+
+from pyqtgraph.opengl import GLGridItem, GLViewWidget, GLScatterPlotItem, GLLinePlotItem, GLMeshItem
+
 import numpy as np
-import jax.numpy as jnp
+from mokap.geometry.backend import xp
+
 from mokap.gui.style.commons import *
 from mokap.gui.widgets import BOARD_TYPES
 from mokap.gui.widgets.widgets_base import Base
 from mokap.utils import hex_to_rgb
 from mokap.utils.datatypes import CharucoBoard, ChessBoard
-from mokap.utils.geometry.transforms import rotate_points3d, rotate_extrinsics_matrix
 
 logger = logging.getLogger(__name__)
 
@@ -476,9 +478,9 @@ class CentralCalibrationWindow(Base):
 
     def _update_gl_items(self,
                          cam_name:          str,
-                         frustum_points:    jnp.ndarray,
-                         optical_axis:      jnp.ndarray,
-                         detection_points:  jnp.ndarray,
+                         frustum_points:    xp.ndarray,
+                         optical_axis:      xp.ndarray,
+                         detection_points:  xp.ndarray,
                          is_ready:          bool):
 
         gl_items = self._percamera_gl_items[cam_name]

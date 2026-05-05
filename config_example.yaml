@@ -1,8 +1,8 @@
-# ----------------------------------
 #  Mokap Example Configuration File
-# ----------------------------------
+# _________________________________
 
-# --- Global Acquisition Settings ---
+
+# [ Global Acquisition Settings ]
 base_path: D:/MokapTests    # where the recordings will be stored
 hardware_trigger: true      # whether to use an external hardware trigger
 framerate: 60               # in frames per seconds (Hz)
@@ -16,12 +16,12 @@ black_level: 1.0
 gamma: 1.0
 roi: [0, 0, 1440, 1080]     # ROI can be [x offset, y offset, width, height] or [width, height] (automatically centered)
 
-# --- Global Saving & Encoding Settings ---
+# [ Global Saving & Encoding Settings ]
 save_format: mp4          # or 'png', 'jpg', 'bmp', 'tiff'
 save_quality: 90          # 0-100 scale (only for images, ignored in video encoding)
 frame_buffer_size: 200    # max number of frames to buffer in RAM (per camera)
 
-# --- Hardware trigger parameters ---
+# [ Hardware trigger parameters ]
 # You can use a Raspberry Pi
 trigger:
   type: raspberry
@@ -47,13 +47,13 @@ trigger:
 #  name: my-first-camera     # use the friendly name from 'sources'
 #  output_line: 2            # The GPIO line to use for output
 
-# --- Video encoding parameters ---
+# [ Video encoding parameters ]
 ffmpeg:
   path: 'ffmpeg'
   gpu: true
 
   params:
-    # --- CPU Profiles ---
+    # [ CPU Profiles ]
     # H.265
     cpu_h265: >-
       -c:v libx265 -preset superfast -tune zerolatency -crf 20 -x265-params "vbv-maxrate=60000k:vbv-bufsize=120000k:keyint=100:min-keyint=100"
@@ -61,7 +61,7 @@ ffmpeg:
     cpu_h264: >-
       -c:v libx264 -preset superfast -tune zerolatency -crf 21
 
-    # --- NVIDIA Profiles ---
+    # [ NVIDIA Profiles ]
     # H.265
     gpu_nvenc_h265: >-
       -c:v hevc_nvenc -preset fast -tune ll -rc constqp -qp 19 -g 100 -bf 0
@@ -69,25 +69,25 @@ ffmpeg:
     gpu_nvenc_h264: >-
       -c:v h264_nvenc -preset fast -tune ll -rc constqp -qp 20 -g 100 -bf 0
 
-    # --- AMD profile (Windows) ---
+    # [ AMD profile (Windows) ]
     gpu_amf: >-
       -c:v hevc_amf -preset quality -low_latency 1 -rc vbr_hq -quality 20 -g 100 -bf 0
 
-    # --- AMD profile (Linux) ---
+    # [ AMD profile (Linux) ]
     gpu_vaapi: >-
       -vaapi_device /dev/dri/renderD128 -c:v hevc_vaapi -qp 21 -g 100 -bf 0
 
-    # --- Apple profiles ---
+    # [ Apple profiles ]
     gpu_videotoolbox: >-
       -c:v hevc_videotoolbox -realtime true -q:v 80 -allow_sw 1 -g 100
 
-    # --- Intel QSV profiles (for Intel Arc GPUs, or Intel CPUs with QSV) ---
+    # [ Intel QSV profiles (for Intel Arc GPUs, or Intel CPUs with QSV) ]
     gpu_arc_av1: >-
       -c:v av1_qsv -preset veryfast -global_quality 23 -low_power 0 -g 100 -bf 0
     gpu_arc_hevc: >-
       -c:v hevc_qsv -preset veryfast -global_quality 21 -low_power 0 -g 100 -bf 0
 
-# --- Camera-Specific Definitions ---
+# [ Camera-Specific Definitions ]
 
 # This is where you add your cameras
 sources:

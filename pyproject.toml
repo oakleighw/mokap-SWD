@@ -5,7 +5,7 @@ description = "An easy to use but powerful multi-camera acquisition software"
 readme = "README.md"
 requires-python = "==3.10.*"
 dependencies = [
-    "numpy==1.26.4",
+    "numpy",
     "paramiko",
     "pillow",
     "psutil",
@@ -24,6 +24,7 @@ dependencies = [
     "alive_progress",
     "jax>=0.6.1",
     "pyserial>=3.5",
+    "polars>=1.31.0",
 ]
 [tool.setuptools]
 py-modules = ['mokap']

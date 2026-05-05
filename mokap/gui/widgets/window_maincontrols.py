@@ -54,8 +54,12 @@ class MainControls(QMainWindow, SnapMixin):
         self.nb_cams = self.manager.nb_cameras
         self._cameras_names = tuple(cam.name for cam in self.manager.cameras)
 
-        # Note: The new camera interface uses .roi to get width/height, not .shape
-        self.sources_shapes = {cam.name: (cam.roi[3], cam.roi[2]) for cam in self.manager.cameras}  # (height, width)
+        self.sources_shapes_hw = {
+            cam.name: (
+                cam.roi[3],     # ROI is [x, y, width, height]
+                cam.roi[2]
+            ) for cam in self.manager.cameras
+        }
 
         # The colours dict is keyed by serial, but we can map it here to the friendly name
         self.cams_colours = {cam.name: self.manager.colours[cam.unique_id] for cam in self.manager.cameras}
@@ -823,10 +827,10 @@ class MainControls(QMainWindow, SnapMixin):
             # Create and start the headless Multiview worker with the correct origin name.
             self.multiview_thread = QThread(self)
             self.multiview_worker = MultiviewWorker(
-                self.cameras_names,
-                origin_name,
-                self.sources_shapes,
-                self.board_params
+                cameras_names=self.cameras_names,
+                origin_camera=origin_name,
+                sources_shapes_hw=self.sources_shapes_hw,
+                calibration_board=self.board_params
             )
             self.multiview_worker.moveToThread(self.multiview_thread)
 
@@ -892,5 +896,5 @@ class MainControls(QMainWindow, SnapMixin):
 
         # Update memory pressure
         buffers_state = np.array(self.manager.buffered)
-        pressure = np.mean(buffers_state / self.manager.buffer_size) * 100
+        pressure = np.nanmean(buffers_state / self.manager.buffer_size) * 100
         self._mem_pressure_bar.setValue(int(pressure))

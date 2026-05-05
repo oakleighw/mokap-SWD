@@ -8,22 +8,7 @@ from pathlib import Path
 from mokap.utils.fileio import generate_board_svg
 from mokap.utils import fileio
 
-DistortionModel = Literal['none', 'simple', 'standard', 'full', 'rational']
-
-
-@dataclass
-class CalibrateCameraResult:
-    """ A container for the results of an intrinsic camera calibration """
-    success: bool
-    rms_error: float = np.inf
-    K_new: Optional[np.ndarray] = None
-    D_new: Optional[np.ndarray] = None
-    rvecs: Optional[np.ndarray] = None
-    tvecs: Optional[np.ndarray] = None
-    std_devs_intrinsics: Optional[np.ndarray] = None
-    error_message: str = ""
-    # field avoids including the large error array in the __repr__
-    per_view_errors: Optional[np.ndarray] = field(default=None, repr=False)
+DistortionModel = Literal['none', 'simple', 'standard', 'rational', 'thinprism', 'tilted', 'fisheye']
 
 
 class ChessBoard:
@@ -57,12 +42,12 @@ class ChessBoard:
 
     @property
     def object_points(self) -> np.ndarray:
-        """ Returns the theoretical 3D locations (X, Y, Z=0) of the inner points """
+        """Returns the 3D locations in object-local space (X, Y, Z=0) of the inner points."""
         return self._object_points
 
     @property
     def corner_points(self) -> np.ndarray:
-        """ Returns the theoretical 3D locations (X, Y, Z=0) of the outer corners """
+        """Returns the 3D locations in object-local space (X, Y, Z=0) of the outer corners."""
         return self._corners
 
     @property
@@ -125,11 +110,14 @@ class CharucoBoard(ChessBoard):
         w = self.cols * side_pixels + 2 * self.margin
         h = self.rows * side_pixels + 2 * self.margin
         f = square_size_px if square_size_px else 1
-        return self.to_opencv().generateImage((w * f, h * f), marginSize=self.margin, borderBits=self.padding)
+        return self.to_opencv().generateImage((w * f, h * f),
+                                              marginSize=self.margin,
+                                              borderBits=self.padding)
+
 
 ##
 
-# TODO: merge some of these payloads
+# TODO: all of this is going to he handled by the new shared CameraModel classes
 
 @dataclass
 class ReprojectionPayload:
@@ -146,15 +134,15 @@ class CoveragePayload:
     total_points: int
 
 @dataclass
-class ErrorsPayload:
-    errors: Optional[ArrayLike] = None
+class PerViewErrorsPayload:
+    per_view_rmse: Optional[ArrayLike] = None  # Per-view Euclidean RMS Errors
 
 @dataclass
 class DetectionPayload:
     """
     Monocular detection of points 2D
     """
-    frame: int
+    frame_idx: int
     points2D: ArrayLike
     pointsIDs: ArrayLike
 
@@ -163,19 +151,20 @@ class IntrinsicsPayload:
 
     camera_matrix: ArrayLike
     dist_coeffs: ArrayLike
-    errors: Optional[ArrayLike] = None
+    per_view_rmse: Optional[ArrayLike] = None  # Per-view Euclidean RMS Errors
 
     @classmethod
     def from_file(cls, filepath, camera_name: Optional[str] = None):
         params = fileio.read_parameters(filepath, camera_name)
-        return cls(camera_matrix=params['camera_matrix'], dist_coeffs=params['dist_coeffs'], errors=params.get('errors'))
+        per_view_rmse = params.get('errors')   # TODO: this key should be renamed in the toml
+        return cls(camera_matrix=params['camera_matrix'], dist_coeffs=params['dist_coeffs'], per_view_rmse=per_view_rmse)
 
 @dataclass
 class ExtrinsicsPayload:
 
     rvec: ArrayLike
     tvec: ArrayLike
-    error: Optional[float] = None
+    pose_error: Optional[float] = None  # Euclidean RMS Error for a single pose
 
     @classmethod
     def from_file(cls, filepath, camera_name: Optional[str] = None):
@@ -188,10 +177,11 @@ class CalibrationData:
     Encapsulation of a payload with the camera name
     """
     camera_name: str
-    payload: IntrinsicsPayload | ExtrinsicsPayload | DetectionPayload | ErrorsPayload | ReprojectionPayload | CoveragePayload
+    payload: IntrinsicsPayload | ExtrinsicsPayload | DetectionPayload | PerViewErrorsPayload | ReprojectionPayload | CoveragePayload
 
     def to_file(self, filepath):
         if isinstance(self.payload, IntrinsicsPayload):
-            fileio.write_intrinsics(filepath, self.camera_name, self.payload.camera_matrix, self.payload.dist_coeffs, self.payload.errors)
+            fileio.write_intrinsics(filepath, self.camera_name, self.payload.camera_matrix, self.payload.dist_coeffs, self.payload.per_view_rmse)
+
         elif isinstance(self.payload, ExtrinsicsPayload):
             fileio.write_extrinsics(filepath, self.camera_name, self.payload.rvec, self.payload.tvec)

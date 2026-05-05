@@ -5,7 +5,7 @@ from PySide6.QtCore import Slot
 from numpy.typing import ArrayLike
 from mokap.calibration.monocular import MonocularCalibrationTool
 from mokap.gui.workers.workers_base import CalibrationProcessingWorker
-from mokap.utils.datatypes import (ChessBoard, CharucoBoard, CalibrationData, ErrorsPayload,
+from mokap.utils.datatypes import (ChessBoard, CharucoBoard, CalibrationData, PerViewErrorsPayload,
                                    IntrinsicsPayload, ExtrinsicsPayload, DetectionPayload, CoveragePayload,
                                    ReprojectionPayload, DistortionModel)
 
@@ -62,7 +62,8 @@ class MonocularWorker(CalibrationProcessingWorker):
             imsize_hw=(self.img_h, self.img_w),
             min_stack=self._min_stack_for_calib,
             focal_mm=self._cam_th_focal,
-            sensor_size=self._sensor_size
+            sensor_size=self._sensor_size,
+            distortion_model=self._distortion_model
         )
 
     @Slot(object)
@@ -89,7 +90,7 @@ class MonocularWorker(CalibrationProcessingWorker):
 
             # Notify the UI that errors and data are reset/invalid
             self.send_payload.emit(
-                CalibrationData(self.cam_name, ErrorsPayload(np.array([np.inf])))
+                CalibrationData(self.cam_name, PerViewErrorsPayload(np.array([np.inf])))
             )
             self.send_payload.emit(
                 CalibrationData(self.cam_name, CoveragePayload(grid=np.zeros((1, 1), dtype=bool),
@@ -111,7 +112,7 @@ class MonocularWorker(CalibrationProcessingWorker):
 
         if isinstance(payload, IntrinsicsPayload):
             # This is the single entry point for updating intrinsics
-            self.monocular_tool.set_intrinsics(payload.camera_matrix, payload.dist_coeffs, payload.errors)
+            self.monocular_tool.set_intrinsics(payload.camera_matrix, payload.dist_coeffs, payload.calibration_errors_perview)
 
     @Slot(np.ndarray, int)
     def handle_frame(self, frame: ArrayLike, frame_idx: int):
@@ -150,7 +151,7 @@ class MonocularWorker(CalibrationProcessingWorker):
             # Policy for auto-computation
             if self._auto_compute and not self._last_calib_failed:
                 is_ready = (self.monocular_tool.pct_coverage >= self._coverage_threshold and
-                            self.monocular_tool.curr_nb_samples >= self._min_stack_for_calib)
+                            self.monocular_tool.sample_count >= self._min_stack_for_calib)
 
                 if is_ready:
 
@@ -173,24 +174,31 @@ class MonocularWorker(CalibrationProcessingWorker):
                     # Regardless of success, send out the update to refresh UI
                     self.send_intrinsics_update()
 
-        # --- Pose and reprojection (for all stages) ---
+        # Pose and reprojection (for all stages)
 
         is_reprojecting_now = False  # assume false by default
         if self.monocular_tool.has_intrinsics:
 
             self.monocular_tool.compute_extrinsics()
 
-            # Send reprojection payload for visualization
+            # Send reprojection payload for visualisation
             if self.monocular_tool.has_extrinsics:
 
                 is_reprojecting_now = True
 
                 # Send extrinsics payload (will be None if pose failed)
                 rvec, tvec = self.monocular_tool.extrinsics
-                pose_error = self.monocular_tool.pose_error
+                current_pose_error = self.monocular_tool.current_rmse
 
                 self.send_payload.emit(
-                    CalibrationData(self.cam_name, ExtrinsicsPayload(rvec=rvec, tvec=tvec, error=pose_error))
+                    CalibrationData(
+                        self.cam_name,
+                        ExtrinsicsPayload(
+                            rvec=rvec,
+                            tvec=tvec,
+                            pose_error=current_pose_error
+                        )
+                    )
                 )
 
                 # Reproject points
@@ -220,7 +228,7 @@ class MonocularWorker(CalibrationProcessingWorker):
             payload = CoveragePayload(
                 grid=self.monocular_tool.grid,
                 coverage_percent=self.monocular_tool.pct_coverage,
-                nb_samples=self.monocular_tool.curr_nb_samples,
+                nb_samples=self.monocular_tool.sample_count,
                 total_points=self.monocular_tool.detector.board.nb_points
             )
             self.send_payload.emit(CalibrationData(self.cam_name, payload))
@@ -232,12 +240,12 @@ class MonocularWorker(CalibrationProcessingWorker):
 
             # Send errors
             self.send_payload.emit(
-                CalibrationData(self.cam_name, ErrorsPayload(self.monocular_tool.intrinsics_errors))
+                CalibrationData(self.cam_name, PerViewErrorsPayload(self.monocular_tool.calibration_rmse_perview))
             )
 
             # Send intrinsics themselves
             K, D = self.monocular_tool.intrinsics
-            intr_payload = IntrinsicsPayload(K, D, self.monocular_tool.intrinsics_errors)
+            intr_payload = IntrinsicsPayload(K, D, self.monocular_tool.calibration_rmse_perview)
             self.send_payload.emit(CalibrationData(self.cam_name, intr_payload))
 
     # Other slots for manual control
@@ -253,7 +261,7 @@ class MonocularWorker(CalibrationProcessingWorker):
             CalibrationData(self.cam_name, CoveragePayload(
                 grid=self.monocular_tool.grid,
                 coverage_percent=self.monocular_tool.pct_coverage,
-                nb_samples=self.monocular_tool.curr_nb_samples,
+                nb_samples=self.monocular_tool.sample_count,
                 total_points=self.monocular_tool.detector.board.nb_points
             ))
         )
@@ -294,7 +302,7 @@ class MonocularWorker(CalibrationProcessingWorker):
         self.clear_samples()
 
         # Set the intrinsics in the tool
-        self.monocular_tool.set_intrinsics(intrinsics.camera_matrix, intrinsics.dist_coeffs, intrinsics.errors)
+        self.monocular_tool.set_intrinsics(intrinsics.camera_matrix, intrinsics.dist_coeffs, intrinsics.per_view_rmse)
         # And forward to the coordinator (it will route to the Multiview and UI)
         self.send_payload.emit(
             CalibrationData(self.cam_name, intrinsics)
@@ -304,5 +312,5 @@ class MonocularWorker(CalibrationProcessingWorker):
     def save_intrinsics(self, file_path: str):
         if self.monocular_tool.has_intrinsics:
             data = CalibrationData(self.cam_name, IntrinsicsPayload(*self.monocular_tool.intrinsics,
-                                                                    self.monocular_tool.intrinsics_errors))
+                                                                    self.monocular_tool.calibration_rmse_perview))
             data.to_file(file_path)

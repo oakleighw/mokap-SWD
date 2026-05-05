@@ -1,8 +1,10 @@
 import logging
 from typing import Tuple, Union, Optional
 import cv2
+
 import numpy as np
-from numpy.typing import ArrayLike
+from mokap.geometry.backend import ArrayLike
+
 from mokap.utils.datatypes import CharucoBoard, ChessBoard
 
 logger = logging.getLogger(__name__)
@@ -42,11 +44,14 @@ class ChessboardDetector:
             0.1  # epsilon is the minimum allowed movement (in pixels) of a point from one iteration to the next
         )
 
-    def detect(self,
-               frame: ArrayLike,
-                refine_points: bool = False,
-               **kwargs
-               ) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[None, None]]:
+    def detect(
+            self,
+            frame: ArrayLike,
+            refine_points: bool = False,
+            **kwargs
+        ) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[None, None]]:
+
+        frame = np.asarray(frame)
 
         if frame.ndim == 3:
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
@@ -122,11 +127,16 @@ class CharucoDetector(ChessboardDetector):
 
     def detect(self,
                frame: ArrayLike,
-               camera_matrix: Optional[ArrayLike] = None,
-               dist_coeffs: Optional[ArrayLike] = None,
+               K: Optional[ArrayLike] = None,
+               D: Optional[ArrayLike] = None,
                refine_markers: bool = True,
                refine_points: bool = False
                ) -> Union[Tuple[np.ndarray, np.ndarray], Tuple[None, None]]:
+
+        # OpenCV needs numpy
+        frame = np.asarray(frame)
+        K = np.asarray(K) if K is not None else None
+        D = np.asarray(D) if D is not None else None
 
         if frame.ndim == 3:
             frame = cv2.cvtColor(frame, cv2.COLOR_RGB2GRAY)
@@ -146,8 +156,9 @@ class CharucoDetector(ChessboardDetector):
                 rejectedCorners=rejected,           # Input/Output /!\
                 parameters=self._detector_parameters,
                 # Known bug with refineDetectedMarkers, fixed in OpenCV 4.9: https://github.com/opencv/opencv/pull/24139
-                cameraMatrix=camera_matrix if cv2.getVersionMajor() >= 4 and cv2.getVersionMinor() >= 9 else None,
-                distCoeffs=dist_coeffs)
+                cameraMatrix=K if cv2.getVersionMajor() >= 4 and cv2.getVersionMinor() >= 9 else None,
+                distCoeffs=D
+            )
 
         if marker_ids is None or len(marker_ids) == 0:
             return None, None
@@ -158,9 +169,10 @@ class CharucoDetector(ChessboardDetector):
             markerIds=marker_ids,
             image=frame,
             board=self._board_opencv,
-            cameraMatrix=camera_matrix,
-            distCoeffs=dist_coeffs,
-            minMarkers=1)
+            cameraMatrix=K,
+            distCoeffs=D,
+            minMarkers=1
+        )
 
         if chessboard_points is None or nb_chessboard_points <= 1:
             return None, None
