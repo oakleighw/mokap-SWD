@@ -15,6 +15,7 @@ dependencies = [
     "pyyaml",
     "opencv-contrib-python",
     "pypylon",
+    "imagingcontrol4",
     "scikit-image",
     "screeninfo",
     "pyside6",

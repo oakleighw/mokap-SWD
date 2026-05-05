@@ -12,6 +12,7 @@ logger = logging.getLogger(__name__)
 if TYPE_CHECKING:
     from mokap.core.cameras.basler import BaslerCamera
     from mokap.core.cameras.flir import FLIRCamera
+    from mokap.core.cameras.ic4imaging import IC4ImagingCamera
 
 
 class noprint:
@@ -123,8 +124,36 @@ class CameraFactory:
                 system.ReleaseInstance()
 
         except ImportError:
-            logger.debug("PySpin SDK not found. Skipping FLIR camera discovery.")
+            logger.warning("FLIR PySpin SDK not found. If you have FLIR cameras, download it from: https://www.teledynevisionsolutions.com/support/support-center/software-firmware-downloads/iis/spinnaker-sdk-download/")
             pass
+
+        # --- Discover IC Imaging Control 4 Cameras ---
+        try:
+            import imagingcontrol4 as ic4
+
+            # Initialize library
+            try:
+                ic4.Library.init()
+            except ic4.IC4Exception:
+                pass  # Library might already be initialized
+
+            # Enumerate devices
+            ic4_devices = ic4.DeviceEnum.devices()
+
+            for device_info in ic4_devices:
+                CameraFactory._discovered_devices.append({
+                    'vendor': 'ICImaging',
+                    'model': device_info.model_name,
+                    'serial': device_info.serial,
+                    'native_object': device_info  # Store the DeviceInfo object
+                })
+
+        except ImportError:
+            logger.warning("IC Imaging Control 4 SDK not found. Install it with: pip install imagingcontrol4")
+            pass
+
+        except Exception as e:
+            logger.error(f"Error during IC Imaging camera discovery: {e}")
 
         # --- Discover Webcams ---
         try:
@@ -241,6 +270,25 @@ class CameraFactory:
 
                 if system:
                     system.ReleaseInstance()
+                return None
+
+        elif vendor == 'icimaging':
+            try:
+                from mokap.core.cameras.ic4imaging import IC4ImagingCamera
+
+                device_info_obj = device_info.get('native_object')
+                if device_info_obj is not None:
+                    return IC4ImagingCamera(device_info_obj)
+                else:
+                    logger.error("IC Imaging device info is missing the DeviceInfo object.")
+                    return None
+
+            except ImportError:
+                logger.error("Cannot create IC Imaging camera. Is the ic4python SDK installed?")
+                return None
+
+            except Exception as e:
+                logger.error(f"Error creating IC Imaging camera instance: {e}")
                 return None
 
         elif vendor == 'webcam':
