@@ -539,6 +539,12 @@ class LiveViewBase(Base):
             if self._video_initialised:
                 self._clear_display()
 
+        # Update exposure value in Information panel
+        try:
+            self.exposure_value.setText(f"{self._camera.exposure:.1f} µs")
+        except (AttributeError, TypeError):
+            pass
+
         # temp = self._camera.temperature
         # temp_state = self._camera.temperature_state
         #

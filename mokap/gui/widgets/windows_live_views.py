@@ -494,6 +494,15 @@ class RecordingLiveView(LiveViewBase):
         if self._val_in_sync[label].isChecked():
             # Tell the manager to broadcast the setting to everyone
             self._mainwindow.manager.set_all_cameras(label, value)
+            
+            # Immediately update ALL synced camera windows' sliders
+            for window in self._mainwindow.video_windows:
+                if hasattr(window, '_val_in_sync') and label in window._val_in_sync:
+                    if window._val_in_sync[label].isChecked():
+                        # Read the actual value from each camera and update its slider
+                        actual_value = getattr(window._camera, label)
+                        window.update_slider_value(label, actual_value)
+                        window._last_polled_values[label] = actual_value
         else:
             # Set the parameter only on this specific camera
             setattr(self._camera, label, value)
