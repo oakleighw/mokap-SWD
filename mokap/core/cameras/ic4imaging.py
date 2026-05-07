@@ -60,7 +60,6 @@ class IC4ImagingCamera(GenICamCamera):
         self._grabber: Optional[ic4.Grabber] = None
         self._sink: Optional[ic4.SnapSink] = None
         self._warned_features = set()
-        self._actual_max_framerate: Optional[float] = None # may change based on resolution/bandwidth, so we probe it at connection time and cache the result
 
         super().__init__(unique_id=device_info.serial)
 
@@ -73,7 +72,6 @@ class IC4ImagingCamera(GenICamCamera):
             self._grabber.device_open(self._device_info)
             self._is_connected = True
             self._apply_configuration(config)
-            self._probe_actual_max_framerate()
 
             logger.info(f"Connected to IC Imaging camera {self.unique_id}")
 
@@ -210,9 +208,6 @@ class IC4ImagingCamera(GenICamCamera):
 
     def _get_feature_max_value(self, name: str) -> Any:
         try:
-            if name == 'AcquisitionFrameRate' and self._actual_max_framerate is not None:
-                return self._actual_max_framerate
-
             prop_id = self._get_prop_id(name)
             prop = self._grabber.device_property_map.find(prop_id)
             
@@ -229,24 +224,6 @@ class IC4ImagingCamera(GenICamCamera):
         except ic4.IC4Exception as e:
             logger.debug(f"IC4 exception getting max for feature '{name}': {e}")
             return 1000
-
-    def _probe_actual_max_framerate(self) -> None:
-        """Probe actual max framerate at current resolution (bandwidth-limited)"""
-        try:
-            theoretical_max = float(self._get_feature_max_value('AcquisitionFrameRate'))
-            current_fps = float(self._get_feature_value('AcquisitionFrameRate'))
-
-            self._set_feature_value('AcquisitionFrameRate', theoretical_max)
-            actual_max = float(self._get_feature_value('AcquisitionFrameRate'))
-
-            self._set_feature_value('AcquisitionFrameRate', current_fps)
-
-            self._actual_max_framerate = actual_max
-            logger.debug(f"Probed actual max fps: {actual_max} (theoretical: {theoretical_max})")
-
-        except Exception as e:
-            logger.debug(f"Could not probe actual max framerate: {e}")
-            self._actual_max_framerate = None
 
     def _get_prop_id(self, name: str) -> Any:
         """Convert GenICam feature name to IC4 PropId (tries: mapping → attribute → UPPER_SNAKE_CASE → string)"""
@@ -299,7 +276,7 @@ class IC4ImagingCamera(GenICamCamera):
     def framerate_range(self) -> Tuple[float, float]:
         try:
             min_fps = float(self._get_feature_min_value('AcquisitionFrameRate'))
-            max_fps = self._actual_max_framerate if self._actual_max_framerate else float(self._get_feature_max_value('AcquisitionFrameRate'))
+            max_fps = float(self._get_feature_max_value('AcquisitionFrameRate'))
             return min_fps, max_fps
 
         except (AttributeError, ValueError, TypeError):
