@@ -124,7 +124,7 @@ class CameraFactory:
                 system.ReleaseInstance()
 
         except ImportError:
-            logger.warning("FLIR PySpin SDK not found. If you have FLIR cameras, download it from: https://www.teledynevisionsolutions.com/support/support-center/software-firmware-downloads/iis/spinnaker-sdk-download/")
+            logger.debug("PySpin SDK not found. Skipping FLIR camera discovery.")
             pass
 
         # --- Discover IC Imaging Control 4 Cameras ---

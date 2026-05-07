@@ -654,6 +654,10 @@ class MultiCam:
 
         logger.debug(f"Broadcasting '{parameter} = {value}' to all cameras.")
 
+        # The trigger framerate must be set via its own property
+        if parameter == 'framerate' and self.hardware_triggered:
+            self.framerate = value
+
         for cam in self.cameras:
             try:
                 # use setattr to dynamically set the property (e.g., 'exposure', 'gain')
