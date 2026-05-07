@@ -383,7 +383,7 @@ class RecordingLiveView(LiveViewBase):
     def update_slider_value(self, label, value):
         """
         This runs on the main GUI thread and is called by the polling loop in PreviewBase._update_slow
-        (when a parameter change is detected on the camera object)
+        (when a parameter change is detected on the camera object), or when syncing sliders across windows
         """
         if label not in self.camera_controls_sliders:
             return
@@ -395,18 +395,21 @@ class RecordingLiveView(LiveViewBase):
         slider.blockSignals(True)
 
         if scale == 'log':
-            # This logic shouldn't be needed for log sliders as their value isn't clamped by range,
-            # but we keep it for correctness.
+            # Convert the actual value to slider position (0-1000) using log mapping
             params = self.log_slider_params[label]
-            current_value = self._inv_log_map(slider.value(), **params)
-            value_label.setText(pretty_microseconds(current_value))
+            slider_pos = self._log_map(value, params['min_val'], params['max_val'], params['slider_min'], params['slider_max'])
+            slider.setValue(int(slider_pos))
+            value_label.setText(pretty_microseconds(value))
+        elif scale == 1:
+            # Direct integer mapping (no scaling needed)
+            slider.setValue(int(value))
+            value_label.setText(f'{int(value)}')
         else:
-            # Get the new, clamped integer value directly from the slider
-            clamped_int_value = slider.value()
-            current_value = clamped_int_value / scale
-            value_label.setText(f'{int(current_value)}')
+            # Scaled mapping (multiply by scale factor to get integer slider position)
+            slider.setValue(int(value * scale))
+            value_label.setText(f'{value:.2f}')
 
-        self._last_polled_values[label] = current_value
+        self._last_polled_values[label] = value
 
         if label == 'framerate':
             self._capture_fps_deque.clear()
