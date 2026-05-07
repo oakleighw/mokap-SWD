@@ -168,6 +168,7 @@ class Base(QWidget, SnapMixin):
 class LiveViewBase(Base):
 
     send_frame = Signal(np.ndarray, int)
+    warning_changed = Signal(bool)
 
     def __init__(self, camera, main_window_ref):
         super().__init__(main_window_ref)
@@ -493,9 +494,13 @@ class LiveViewBase(Base):
                 target_framerate = self._camera.framerate
 
                 if abs(avg_fps - target_framerate) > (target_framerate * 0.1):  # 10% tolerance
-                    self._warning = True
+                    if not self._warning:  # only emit if state changed
+                        self._warning = True
+                        self.warning_changed.emit(True)
                 else:
-                    self._warning = False
+                    if self._warning:  # only emit if state changed
+                        self._warning = False
+                        self.warning_changed.emit(False)
 
                 self.capturefps_value.setText(f"{avg_fps:.2f} fps")
 
@@ -533,7 +538,9 @@ class LiveViewBase(Base):
         else:
             self.capturefps_value.setText("Off")
             self.brightness_value.setText("-")
-            self._warning = False
+            if self._warning:
+                self._warning = False
+                self.warning_changed.emit(False)
             self._capture_fps_deque.clear()
 
             if self._video_initialised:

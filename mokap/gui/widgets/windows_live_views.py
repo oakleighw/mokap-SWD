@@ -53,6 +53,9 @@ class RecordingLiveView(LiveViewBase):
         self._init_specific_ui()
         self.auto_size()
 
+        # Connect warning signal to display handler
+        self.warning_changed.connect(self.set_warning_indicator)
+
         # Start worker and timers
         self.worker_thread.start()
         self._start_timers()
@@ -81,7 +84,7 @@ class RecordingLiveView(LiveViewBase):
 
         self.warning_text = pg.TextItem(anchor=(0.5, 0), color=(255, 165, 0))
         self.warning_text.setPos(self.source_shape_hw[1] / 2, 10)
-        self.warning_text.setHtml('<span style="font-size: 16pt; font-weight: bold;">[ WARNING ]</span>')
+        self.warning_text.setHtml('<span style="font-size: 16pt; font-weight: bold;">[ FPS WARNING ]</span>')
         self.view_box.addItem(self.warning_text)
         self.warning_text.hide()  # also initially hidden
 
