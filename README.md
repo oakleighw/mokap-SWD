@@ -122,6 +122,9 @@ Refer to FLIR's guide for detailed instructions. But in short:
 * Make sure you have mokap installed, and activate Mokap's virtual env (see below)
 * Install the Spinnaker Python wheels with `uv pip install /path/to/spinnaker_python-3.2.0.62-cp310-cp310-win_amd64.whl` (replace with the path and the name of the `.whl` file you downloaded)
 
+#### Imaging Source Cameras
+* You must install imagingcontrol4 into the uv environment with ``` uv pip install imagingcontrol4 ```
+
 #### Mokap
 
 1. Clone this repository:
