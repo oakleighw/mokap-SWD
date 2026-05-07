@@ -51,21 +51,16 @@ FEATURE_MAPPING = _build_feature_mapping()
 
 class IC4ImagingCamera(GenICamCamera):
     """
-    Concrete implementation for The Imaging Source IC Imaging Control 4 cameras.
-    Inherits all GenICam logic from the GenICamCamera parent class.
-    Only handles IC4-specific connection, grabbing, and feature access.
+    Implementation for The Imaging Source IC Imaging Control 4 cameras
+    (only adds IC4-specific connection, grabbing, and feature access)
     """
 
     def __init__(self, device_info: ic4.DeviceInfo):
-        """
-        Args:
-            device_info: DeviceInfo object from IC4 device enumeration
-        """
         self._device_info = device_info
         self._grabber: Optional[ic4.Grabber] = None
         self._sink: Optional[ic4.SnapSink] = None
         self._warned_features = set()
-        self._actual_max_framerate: Optional[float] = None  # Cache actual achievable max fps
+        self._actual_max_framerate: Optional[float] = None # may change based on resolution/bandwidth, so we probe it at connection time and cache the result
 
         super().__init__(unique_id=device_info.serial)
 
@@ -73,19 +68,13 @@ class IC4ImagingCamera(GenICamCamera):
         if self.is_connected:
             logger.warning(f"Camera {self.unique_id} is already connected.")
             return
-
         try:
-            # Library should already be initialized from discovery phase
-            # Create and open grabber
             self._grabber = ic4.Grabber()
             self._grabber.device_open(self._device_info)
             self._is_connected = True
-
             self._apply_configuration(config)
-            
-            # After configuration, probe the actual achievable max framerate at current resolution
             self._probe_actual_max_framerate()
-            
+
             logger.info(f"Connected to IC Imaging camera {self.unique_id}")
 
         except ic4.IC4Exception as e:
@@ -93,15 +82,12 @@ class IC4ImagingCamera(GenICamCamera):
             raise RuntimeError(f"Failed to connect to IC Imaging camera {self.unique_id}: {e}") from e
 
     def disconnect(self) -> None:
-        if self.is_grabbing:
-            self.stop_grabbing()
-
+        if self.is_grabbing: self.stop_grabbing()
         if self._grabber:
             try:
                 self._grabber.device_close()
             except ic4.IC4Exception as e:
                 logger.warning(f"Error closing IC4 device: {e}")
-
         self._grabber = None
         self._sink = None
         self._is_connected = False
@@ -114,10 +100,8 @@ class IC4ImagingCamera(GenICamCamera):
                 self._sink = ic4.SnapSink()
 
             try:
-                logger.debug(f"Setting up stream for {self.unique_id}...")
                 self._grabber.stream_setup(self._sink, setup_option=ic4.StreamSetupOption.ACQUISITION_START)
                 self._is_grabbing = True
-                logger.debug(f"Started grabbing on {self.unique_id}")
             except ic4.IC4Exception as e:
                 raise RuntimeError(f"Failed to start grabbing on {self.unique_id}: {e}") from e
 
@@ -126,7 +110,6 @@ class IC4ImagingCamera(GenICamCamera):
             try:
                 self._grabber.stream_stop()
                 self._is_grabbing = False
-                logger.debug(f"Stopped grabbing on {self.unique_id}")
             except ic4.IC4Exception as e:
                 logger.error(f"Error stopping grabbing on {self.unique_id}: {e}")
 
@@ -137,7 +120,6 @@ class IC4ImagingCamera(GenICamCamera):
         if not self.is_grabbing:
             raise RuntimeError("Camera is not grabbing. Call start_grabbing() first.")
 
-        # Increase timeout in trigger mode since we wait for external signal
         if self.hardware_triggered:
             timeout_ms = max(timeout_ms, 5000)
 
@@ -147,14 +129,11 @@ class IC4ImagingCamera(GenICamCamera):
             if image is None:
                 raise IOError(f"Grab failed: Timeout after {timeout_ms} ms")
 
-            # Convert IC4 image to numpy array
             try:
                 image_arr = image.numpy_copy()
             except AttributeError:
-                # Fallback if numpy_copy not available
                 image_arr = image.numpy_wrap().copy()
 
-            # Prepare metadata
             try:
                 frame_meta = {
                     'timestamp': image.meta_data.device_timestamp_ns if hasattr(image, 'meta_data') else 0,
@@ -166,7 +145,6 @@ class IC4ImagingCamera(GenICamCamera):
             return image_arr, frame_meta
 
         except ic4.IC4Exception as e:
-            logger.error(f"IC4 exception during grab on {self.unique_id}: {e}")
             raise IOError(f"Failed to grab frame: {e}") from e
 
     # --- GenICamCamera abstract contract ---
@@ -175,41 +153,37 @@ class IC4ImagingCamera(GenICamCamera):
         try:
             prop_id = self._get_prop_id(name)
             prop = self._grabber.device_property_map.find(prop_id)
-            
+
             if prop is None:
                 raise AttributeError(f"Feature '{name}' not found")
-            
+
             return prop.value
 
         except ic4.IC4Exception as e:
             raise AttributeError(f"Failed to get feature '{name}': {e}") from e
-        except AttributeError:
-            raise
 
     def _set_feature_value(self, name: str, value: Any) -> Any:
         try:
             prop_id = self._get_prop_id(name)
             self._grabber.device_property_map.set_value(prop_id, value)
-            
-            # Read back to get actual value set
+
             prop = self._grabber.device_property_map.find(prop_id)
             return prop.value if prop else value
 
         except ic4.IC4Exception as e:
-            # Gracefully handle missing properties - don't raise, just log once and return
             if name not in self._warned_features:
                 logger.debug(f"Feature '{name}' not available or not writable: {e}")
                 self._warned_features.add(name)
-            return value  # Return the requested value even if we couldn't set it
+            return value
 
     def _get_feature_entries(self, name: str) -> list[str]:
         try:
             prop_id = self._get_prop_id(name)
             prop = self._grabber.device_property_map.find(prop_id)
-            
+
             if prop is None or not hasattr(prop, 'entries'):
                 return []
-            
+
             return [entry.name for entry in prop.entries]
 
         except ic4.IC4Exception as e:
@@ -227,7 +201,7 @@ class IC4ImagingCamera(GenICamCamera):
             if not hasattr(prop, 'minimum'):
                 logger.debug(f"Property '{name}' has no 'minimum' attribute")
                 return 0
-            
+
             return prop.minimum
 
         except ic4.IC4Exception as e:
@@ -236,10 +210,9 @@ class IC4ImagingCamera(GenICamCamera):
 
     def _get_feature_max_value(self, name: str) -> Any:
         try:
-            # Special handling for AcquisitionFrameRate: use probed actual max if available
             if name == 'AcquisitionFrameRate' and self._actual_max_framerate is not None:
                 return self._actual_max_framerate
-            
+
             prop_id = self._get_prop_id(name)
             prop = self._grabber.device_property_map.find(prop_id)
             
@@ -250,7 +223,7 @@ class IC4ImagingCamera(GenICamCamera):
             if not hasattr(prop, 'maximum'):
                 logger.debug(f"Property '{name}' has no 'maximum' attribute")
                 return 1000
-            
+
             return prop.maximum
 
         except ic4.IC4Exception as e:
@@ -258,66 +231,45 @@ class IC4ImagingCamera(GenICamCamera):
             return 1000
 
     def _probe_actual_max_framerate(self) -> None:
-        """
-        Probe the actual achievable max framerate at current resolution.
-        This is called after configuration to determine bandwidth-limited max fps.
-        """
+        """Probe actual max framerate at current resolution (bandwidth-limited)"""
         try:
-            # Try to set framerate to theoretical max and see what actually gets set
             theoretical_max = float(self._get_feature_max_value('AcquisitionFrameRate'))
-            
-            # Save current framerate
             current_fps = float(self._get_feature_value('AcquisitionFrameRate'))
-            
-            # Try setting to theoretical max
+
             self._set_feature_value('AcquisitionFrameRate', theoretical_max)
-            
-            # Read back what was actually set (will be clamped by camera based on resolution)
             actual_max = float(self._get_feature_value('AcquisitionFrameRate'))
-            
-            # Restore original framerate
+
             self._set_feature_value('AcquisitionFrameRate', current_fps)
-            
-            # Cache the actual achievable max
+
             self._actual_max_framerate = actual_max
-            logger.debug(f"Probed actual max framerate: {actual_max} fps (theoretical max: {theoretical_max} fps)")
-            
+            logger.debug(f"Probed actual max fps: {actual_max} (theoretical: {theoretical_max})")
+
         except Exception as e:
             logger.debug(f"Could not probe actual max framerate: {e}")
             self._actual_max_framerate = None
 
-    # --- Helper method ---
-
     def _get_prop_id(self, name: str) -> Any:
-        """
-        Convert GenICam feature name to IC4 property identifier.
-        Tries: mapping dict → PropId attribute → UPPER_SNAKE_CASE → raw string
-        """
-        # 1. Check manual mapping
+        """Convert GenICam feature name to IC4 PropId (tries: mapping → attribute → UPPER_SNAKE_CASE → string)"""
         if name in FEATURE_MAPPING:
             return FEATURE_MAPPING[name]
 
-        # 2. Try PropId attribute directly
         try:
             return getattr(ic4.PropId, name)
         except AttributeError:
             pass
 
-        # 3. Try UPPER_SNAKE_CASE conversion
         try:
             upper_name = ''.join(['_' + c if c.isupper() else c for c in name]).lstrip('_').upper()
             return getattr(ic4.PropId, upper_name)
         except AttributeError:
             pass
 
-        # 4. Fallback to string name (IC4 property_map.find() accepts strings)
         return name
 
     # --- IC4-specific property overrides ---
 
     @property
     def framerate(self) -> float:
-        """Read current framerate from camera instead of just returning cached value."""
         try:
             self._framerate = float(self._get_feature_value('AcquisitionFrameRate'))
         except AttributeError:
@@ -326,28 +278,18 @@ class IC4ImagingCamera(GenICamCamera):
 
     @framerate.setter
     def framerate(self, value: float):
-        """
-        Override parent to handle IC4's acquisition model directly.
-        IC4 doesn't have AcquisitionFrameRateEnable; use AcquisitionMode instead.
-        Framerate is settable in both free-run and trigger mode.
-        """
         try:
-            # For IC4, set AcquisitionMode to 'Continuous' for free-run mode (ignored in trigger mode)
             if not self.hardware_triggered:
                 try:
                     self._set_feature_value('AcquisitionMode', 'Continuous')
                 except AttributeError:
-                    logger.debug("AcquisitionMode not available on this camera")
+                    pass
 
-            # Clamp framerate to valid range
             min_fps, max_fps = self.framerate_range
             clamped_value = max(min_fps, min(value, max_fps))
 
-            # Set the target framerate (controls trigger rate in trigger mode, free-run rate otherwise)
-            actual_value_set = self._set_feature_value('AcquisitionFrameRate', clamped_value)
-            self._framerate = actual_value_set
-            mode = "trigger" if self.hardware_triggered else "free-run"
-            logger.debug(f"Set {self.name}'s framerate to {self._framerate} fps ({mode} mode).")
+            actual_value = self._set_feature_value('AcquisitionFrameRate', clamped_value)
+            self._framerate = actual_value
 
         except AttributeError as e:
             logger.warning(f"Camera {self.name} does not support framerate control: {e}")
@@ -355,27 +297,17 @@ class IC4ImagingCamera(GenICamCamera):
 
     @property
     def framerate_range(self) -> Tuple[float, float]:
-        """
-        Override parent to query IC4 framerate range with bandwidth awareness.
-        At connection, we probe the actual achievable max fps at current resolution.
-        """
         try:
             min_fps = float(self._get_feature_min_value('AcquisitionFrameRate'))
-            
-            # Use cached actual max if available (set during connect), otherwise query theoretical max
-            if self._actual_max_framerate is not None:
-                max_fps = self._actual_max_framerate
-            else:
-                max_fps = float(self._get_feature_max_value('AcquisitionFrameRate'))
-            
+            max_fps = self._actual_max_framerate if self._actual_max_framerate else float(self._get_feature_max_value('AcquisitionFrameRate'))
             return min_fps, max_fps
+
         except (AttributeError, ValueError, TypeError):
-            logger.warning(f"Could not determine framerate range for {self.unique_id}.")
+            logger.warning(f"Could not determine framerate range for {self.unique_id}")
             return 0.5, 500.0
 
     @property
     def exposure(self) -> float:
-        """Read current exposure from camera instead of just returning cached value."""
         try:
             self._exposure = float(self._get_feature_value('ExposureTime'))
         except AttributeError:
@@ -384,22 +316,17 @@ class IC4ImagingCamera(GenICamCamera):
 
     @exposure.setter
     def exposure(self, value: float):
-        """
-        Override parent to ensure proper max value constraint for IC4.
-        """
         was_grabbing = self.is_grabbing
         if was_grabbing:
             self.stop_grabbing()
 
         try:
-            # Clamp value to valid range
             min_exp = float(self._get_feature_min_value('ExposureTime'))
             max_exp = float(self._get_feature_max_value('ExposureTime'))
             clamped_value = max(min_exp, min(value, max_exp))
 
-            actual_value_set = self._set_feature_value('ExposureTime', clamped_value)
-            self._exposure = actual_value_set
-            logger.debug(f"Set {self.name}'s exposure to {self._exposure} µs.")
+            actual_value = self._set_feature_value('ExposureTime', clamped_value)
+            self._exposure = actual_value
 
         except AttributeError as e:
             logger.warning(f"Camera {self.name} does not support exposure control: {e}")
@@ -411,18 +338,17 @@ class IC4ImagingCamera(GenICamCamera):
 
     @property
     def exposure_range(self) -> Tuple[float, float]:
-        """Get valid exposure range for IC4 cameras."""
         try:
             min_exp = float(self._get_feature_min_value('ExposureTime'))
             max_exp = float(self._get_feature_max_value('ExposureTime'))
             return min_exp, max_exp
+
         except (AttributeError, ValueError, TypeError):
-            logger.warning(f"Could not determine exposure range for {self.unique_id}.")
+            logger.warning(f"Could not determine exposure range for {self.unique_id}")
             return 1.0, 1000000.0
 
     @property
     def gain(self) -> float:
-        """Read current gain from camera instead of just returning cached value."""
         try:
             self._gain = float(self._get_feature_value('Gain'))
         except AttributeError:
@@ -431,22 +357,17 @@ class IC4ImagingCamera(GenICamCamera):
 
     @gain.setter
     def gain(self, value: float):
-        """
-        Override parent to ensure proper max value constraint for IC4.
-        """
         was_grabbing = self.is_grabbing
         if was_grabbing:
             self.stop_grabbing()
 
         try:
-            # Clamp value to valid range
             min_gain = float(self._get_feature_min_value('Gain'))
             max_gain = float(self._get_feature_max_value('Gain'))
             clamped_value = max(min_gain, min(value, max_gain))
 
-            actual_value_set = self._set_feature_value('Gain', clamped_value)
-            self._gain = actual_value_set
-            logger.debug(f"Set {self.name}'s gain to {self._gain}.")
+            actual_value = self._set_feature_value('Gain', clamped_value)
+            self._gain = actual_value
 
         except AttributeError as e:
             logger.warning(f"Camera {self.name} does not support gain control: {e}")
@@ -458,13 +379,13 @@ class IC4ImagingCamera(GenICamCamera):
 
     @property
     def gain_range(self) -> Tuple[float, float]:
-        """Get valid gain range for IC4 cameras."""
         try:
             min_gain = float(self._get_feature_min_value('Gain'))
             max_gain = float(self._get_feature_max_value('Gain'))
             return min_gain, max_gain
+
         except (AttributeError, ValueError, TypeError):
-            logger.warning(f"Could not determine gain range for {self.unique_id}.")
+            logger.warning(f"Could not determine gain range for {self.unique_id}")
             return 0.0, 32.0
 
     @property
