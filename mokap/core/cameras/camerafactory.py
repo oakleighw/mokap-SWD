@@ -131,11 +131,11 @@ class CameraFactory:
         try:
             import imagingcontrol4 as ic4
 
-            # Initialize library
             try:
                 ic4.Library.init()
-            except ic4.IC4Exception:
-                pass  # Library might already be initialized
+            except Exception as e:
+                if 'already called' not in str(e).lower():
+                    raise
 
             # Enumerate devices
             ic4_devices = ic4.DeviceEnum.devices()

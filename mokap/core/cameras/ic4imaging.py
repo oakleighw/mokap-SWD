@@ -1,4 +1,5 @@
 import logging
+import time
 
 import imagingcontrol4 as ic4
 import numpy as np
@@ -48,6 +49,19 @@ def _build_feature_mapping():
 
 FEATURE_MAPPING = _build_feature_mapping()
 
+class _QueueSinkListener(ic4.QueueSinkListener):
+    def __init__(self, buffer_count: int):
+        self._buffer_count = buffer_count
+
+    def sink_connected(self, sink, image_type, min_buffers_required) -> bool:
+        sink.alloc_and_queue_buffers(max(self._buffer_count, min_buffers_required))
+        return True
+
+    def sink_disconnected(self, sink):
+        pass
+
+    def frames_queued(self, sink):
+        pass
 
 class IC4ImagingCamera(GenICamCamera):
     """
@@ -58,7 +72,8 @@ class IC4ImagingCamera(GenICamCamera):
     def __init__(self, device_info: ic4.DeviceInfo):
         self._device_info = device_info
         self._grabber: Optional[ic4.Grabber] = None
-        self._sink: Optional[ic4.SnapSink] = None
+        self._sink: Optional[ic4.QueueSink] = None
+        self._sink_buffer_count = 10
         self._warned_features = set()
 
         super().__init__(unique_id=device_info.serial)
@@ -94,13 +109,21 @@ class IC4ImagingCamera(GenICamCamera):
 
     def start_grabbing(self) -> None:
         if self.is_connected and not self.is_grabbing:
-            if not self._sink:
-                self._sink = ic4.SnapSink()
+            if not self._sink or not self._sink.is_attached:
+                self._sink = ic4.QueueSink(
+                    _QueueSinkListener(self._sink_buffer_count),
+                    max_output_buffers=0,
+                )
 
             try:
+                # The sink listener queues buffers during sink_connected so the stream can start immediately.
                 self._grabber.stream_setup(self._sink, setup_option=ic4.StreamSetupOption.ACQUISITION_START)
+                
                 self._is_grabbing = True
+                logger.info(f"Acquisition started on {self.unique_id}")
+                
             except ic4.IC4Exception as e:
+                self._is_grabbing = False
                 raise RuntimeError(f"Failed to start grabbing on {self.unique_id}: {e}") from e
 
     def stop_grabbing(self) -> None:
@@ -112,39 +135,43 @@ class IC4ImagingCamera(GenICamCamera):
                 logger.error(f"Error stopping grabbing on {self.unique_id}: {e}")
 
     def grab_frame(self, timeout_ms: int = 2000) -> Tuple[np.ndarray, Dict[str, Any]]:
-        if not self._grabber or not self.is_connected:
-            raise RuntimeError("Camera is not connected or has been released.")
-
-        if not self.is_grabbing:
-            raise RuntimeError("Camera is not grabbing. Call start_grabbing() first.")
-
-        if self.hardware_triggered:
-            timeout_ms = max(timeout_ms, 5000)
+        if not self._sink or not self._sink.is_attached:
+            return None, None
 
         try:
-            image = self._sink.snap_single(timeout_ms)
+            deadline = time.monotonic() + (timeout_ms / 1000.0)
+            image = None
+            while image is None:
+                image = self._sink.try_pop_output_buffer()
+                if image is not None:
+                    break
+
+                if timeout_ms <= 0 or time.monotonic() >= deadline:
+                    return None, None
+
+                time.sleep(0.001)
 
             if image is None:
-                raise IOError(f"Grab failed: Timeout after {timeout_ms} ms")
+                raise IOError("Grab failed: Timeout")
 
             try:
-                image_arr = image.numpy_copy()
-            except AttributeError:
                 image_arr = image.numpy_wrap().copy()
 
-            try:
                 frame_meta = {
-                    'timestamp': image.meta_data.device_timestamp_ns if hasattr(image, 'meta_data') else 0,
-                    'frame_number': image.meta_data.device_frame_number if hasattr(image, 'meta_data') else 0,
+                    'frame_number': image.meta_data.device_frame_number,
+                    'timestamp': image.meta_data.device_timestamp_ns 
                 }
-            except (AttributeError, TypeError):
-                frame_meta = {'timestamp': 0, 'frame_number': 0}
 
-            return image_arr, frame_meta
+                return image_arr, frame_meta
+            finally:
+                image.release()
 
         except ic4.IC4Exception as e:
-            raise IOError(f"Failed to grab frame: {e}") from e
-
+            if e.code == ic4.ErrorCode.NoData:
+                # Return None so the manager loop knows to just skip this iteration
+                return None, None
+            raise IOError(f"Failed to grab frame: {e}")
+        
     # --- GenICamCamera abstract contract ---
 
     def _get_feature_value(self, name: str) -> Any:
