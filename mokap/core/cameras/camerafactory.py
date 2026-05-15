@@ -57,7 +57,7 @@ class CameraFactory:
     _discovered_devices = []
 
     @staticmethod
-    def discover_cameras() -> List[Dict[str, str]]:
+    def discover_cameras(include_webcams: bool = False) -> List[Dict[str, str]]:
         """
         Scan for all connected cameras from supported vendors.
         Returns a list of dictionaries, each with info about a camera.
@@ -69,7 +69,7 @@ class CameraFactory:
             from pypylon import pylon as py
             tlf = py.TlFactory.GetInstance()
             pylon_devices = tlf.EnumerateDevices()
-            
+
             for dev_info in pylon_devices:
                 CameraFactory._discovered_devices.append({
                     'vendor': 'Basler',
@@ -157,23 +157,24 @@ class CameraFactory:
             logger.error(f"Error during IC Imaging camera discovery: {e}")
 
         # --- Discover Webcams ---
-        try:
-            # We call the discover_webcams function which returns WebcamCamera instances
-            found_webcams = discover_webcams()
+        if include_webcams:
+            try:
+                # We call the discover_webcams function which returns WebcamCamera instances
+                found_webcams = discover_webcams()
 
-            for cam_instance in found_webcams:
-                CameraFactory._discovered_devices.append({
-                    'vendor': 'Webcam',
-                    'model': f'OpenCV Camera Index {cam_instance._index}',
-                    'serial': cam_instance.unique_id,
-                    'native_object': cam_instance._index  # Store the index needed for creation
-                })
-                # We don't need the instance itself anymore, just its info
-                del cam_instance
+                for cam_instance in found_webcams:
+                    CameraFactory._discovered_devices.append({
+                        'vendor': 'Webcam',
+                        'model': f'OpenCV Camera Index {cam_instance._index}',
+                        'serial': cam_instance.unique_id,
+                        'native_object': cam_instance._index  # Store the index needed for creation
+                    })
+                    # We don't need the instance itself anymore, just its info
+                    del cam_instance
 
-        except Exception as e:
-            logger.error(f"Error during Webcam discovery: {e}")
-            pass
+            except Exception as e:
+                logger.error(f"Error during Webcam discovery: {e}")
+                pass
 
         return CameraFactory._discovered_devices
 

@@ -90,8 +90,20 @@ class BaslerCamera(GenICamCamera):
         try:
             grab_result = self._ptr.RetrieveResult(timeout_ms, pylon.TimeoutHandling_ThrowException)
             if grab_result:
-                # pylon's Array creates a copy by default, so it is safe
-                return grab_result.Array, {'frame_number': grab_result.ImageNumber, 'timestamp': grab_result.TimeStamp}
+                try:
+                    # pylon's Array creates a copy by default, so it is safe
+                    frame = grab_result.Array
+                except ValueError:
+                    # Some pylon builds do not expose Bayer/Mono raw formats via Array.
+                    # Fall back to the raw buffer for 8-bit single-plane images.
+                    width = grab_result.GetWidth()
+                    height = grab_result.GetHeight()
+                    padding_x = grab_result.GetPaddingX() if hasattr(grab_result, 'GetPaddingX') else 0
+                    raw = np.frombuffer(grab_result.GetBuffer(), dtype=np.uint8)
+                    stride = width + padding_x
+                    frame = raw.reshape((height, stride))[:, :width].copy()
+
+                return frame, {'frame_number': grab_result.ImageNumber, 'timestamp': grab_result.TimeStamp}
             else:
                 raise IOError(f"Grab failed: {grab_result.GetErrorCode()} {grab_result.GetErrorDescription()}")
         finally:

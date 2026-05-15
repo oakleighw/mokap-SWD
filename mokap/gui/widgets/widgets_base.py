@@ -401,6 +401,10 @@ class LiveViewBase(Base):
 
             # if we found a new frame, process it for display
             if raw_frame is not None and frame_data is not None:
+                if raw_frame.size == 0:
+                    logger.debug(f"[{self.name}] Skipping empty frame during display conversion.")
+                    continue
+
                 pixel_format = frame_data.get('pixel_format') or self._fmt
                 try:
                     match pixel_format:

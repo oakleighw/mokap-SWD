@@ -146,7 +146,19 @@ class MultiCam:
 
         # Get a list of all physically present devices from the factory
         # TODO: re-implement virtual cameras support
-        all_discovered_devices = CameraFactory.discover_cameras()
+        # Get the camera configurations from the config file
+        configured_sources = self.config.get('sources', {})
+        if not configured_sources:
+            logger.warning("No cameras defined in the 'sources' section of the config file.")
+            return
+
+        requested_vendors = {
+            str(cam_config.get('vendor', '')).lower()
+            for cam_config in configured_sources.values()
+            if cam_config.get('vendor')
+        }
+
+        all_discovered_devices = CameraFactory.discover_cameras(include_webcams=('webcam' in requested_vendors))
 
         if not all_discovered_devices:
             logger.warning("No cameras found.")
@@ -156,12 +168,6 @@ class MultiCam:
         device_lookup = {dev['serial']: dev for dev in all_discovered_devices}
 
         claimed_serials = set()
-
-        # Get the camera configurations from the config file
-        configured_sources = self.config.get('sources', {})
-        if not configured_sources:
-            logger.warning("No cameras defined in the 'sources' section of the config file.")
-            return
 
         # Define the list of global keys that can be applied to cameras
         valid_global_settings = [
@@ -559,39 +565,39 @@ class MultiCam:
 
     def _correct_video_framerate(self, filepath: Path, actual_fps: float):
         """ Corrects the framerate metadata in a video file without re-encoding """
+        return
+        # if not filepath.exists() or actual_fps <= 0:
+        #     return
 
-        if not filepath.exists() or actual_fps <= 0:
-            return
+        # ffmpeg_path = shutil.which(self.config.get('ffmpeg', {}).get('path', 'ffmpeg'))
+        # if not ffmpeg_path or not os.access(ffmpeg_path, os.X_OK):
+        #     return
 
-        ffmpeg_path = shutil.which(self.config.get('ffmpeg', {}).get('path', 'ffmpeg'))
-        if not ffmpeg_path or not os.access(ffmpeg_path, os.X_OK):
-            return
+        # logger.info(f"Correcting framerate for {filepath.name} to {actual_fps:.3f} fps.")
+        # temp_filepath = filepath.with_suffix('.temp.mp4')
 
-        logger.info(f"Correcting framerate for {filepath.name} to {actual_fps:.3f} fps.")
-        temp_filepath = filepath.with_suffix('.temp.mp4')
+        # command = [
+        #     ffmpeg_path,
+        #     '-i', str(filepath.resolve()),
+        #     '-c', 'copy',
+        #     '-r', f'{actual_fps:.3f}',
+        #     str(temp_filepath)
+        # ]
 
-        command = [
-            ffmpeg_path,
-            '-i', str(filepath.resolve()),
-            '-c', 'copy',
-            '-r', f'{actual_fps:.3f}',
-            str(temp_filepath)
-        ]
+        # try:
+        #     p = subprocess.run(command, check=True, capture_output=True, text=True)
+        #     if p.returncode == 0:
+        #         if not safe_replace(str(temp_filepath), str(filepath)):
+        #             logger.error(f"Could not rename {temp_filepath}.")
 
-        try:
-            p = subprocess.run(command, check=True, capture_output=True, text=True)
-            if p.returncode == 0:
-                if not safe_replace(str(temp_filepath), str(filepath)):
-                    logger.error(f"Could not rename {temp_filepath}.")
+        # except (subprocess.CalledProcessError, FileNotFoundError) as e:
+        #     logger.error(f"FFmpeg failed to correct framerate for {filepath.name}: {e}")
 
-        except (subprocess.CalledProcessError, FileNotFoundError) as e:
-            logger.error(f"FFmpeg failed to correct framerate for {filepath.name}: {e}")
+        #     if isinstance(e, subprocess.CalledProcessError):
+        #         logger.error(f"FFmpeg stderr:\n{e.stderr}")
 
-            if isinstance(e, subprocess.CalledProcessError):
-                logger.error(f"FFmpeg stderr:\n{e.stderr}")
-
-            if temp_filepath.exists():
-                os.remove(temp_filepath)
+        #     if temp_filepath.exists():
+        #         os.remove(temp_filepath)
 
     def take_snapshot(self) -> bool:
         """ Takes a snapshot from all cameras (tries to sync) """
