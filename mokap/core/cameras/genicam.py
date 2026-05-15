@@ -303,37 +303,7 @@ class GenICamCamera(AbstractCamera, abc.ABC):
             except AttributeError:
                 pass
 
-            try:
-                actual_trigger_source = self._get_feature_value('TriggerSource')
-            except AttributeError:
-                actual_trigger_source = '<unavailable>'
-
-            try:
-                actual_trigger_mode = self._get_feature_value('TriggerMode')
-            except AttributeError:
-                actual_trigger_mode = '<unavailable>'
-
-            try:
-                actual_line_mode = self._get_feature_value('LineMode')
-            except AttributeError:
-                actual_line_mode = '<unavailable>'
-
-            try:
-                actual_line_selector = self._get_feature_value('LineSelector')
-            except AttributeError:
-                actual_line_selector = '<unavailable>'
-
-            try:
-                actual_trigger_activation = self._get_feature_value('TriggerActivation')
-            except AttributeError:
-                actual_trigger_activation = '<unavailable>'
-
-            logger.debug(
-                f"{self.name} trigger configured: requested={trigger_source}, "
-                f"TriggerSource={actual_trigger_source}, TriggerMode={actual_trigger_mode}, "
-                f"LineSelector={actual_line_selector}, LineMode={actual_line_mode}, "
-                f"TriggerActivation={actual_trigger_activation}"
-            )
+            logger.debug(f"{self.name} trigger configured on {trigger_source}")
         else:
             self._set_feature_value('TriggerMode', 'Off')
             try:
