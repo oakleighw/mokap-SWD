@@ -22,8 +22,8 @@ class GenICamCamera(AbstractCamera, abc.ABC):
 
         # Initialize all cached properties
         self._pixel_format: Optional[str] = None
-        self._binning: Optional[int] = None
-        self._binning_mode: Optional[str] = None
+        # self._binning: Optional[int] = None
+        # self._binning_mode: Optional[str] = None
         self._hardware_triggered: Optional[bool] = None
         self._trigger_line: Any = None
         self._framerate: Optional[float] = None
@@ -46,8 +46,8 @@ class GenICamCamera(AbstractCamera, abc.ABC):
             'pixel_format': 'Mono8',
             'hardware_trigger': True,
             'trigger_line': 4,
-            'binning': 1,
-            'binning_mode': 'Sum',
+            # 'binning': 1,
+            # 'binning_mode': 'Sum',
             'gamma': 1.0,
             'black_level': 1.0,
             'roi': None
@@ -60,8 +60,8 @@ class GenICamCamera(AbstractCamera, abc.ABC):
 
         # Cache the state before setting hardware
         self._pixel_format = settings['pixel_format']
-        self._binning = settings['binning']
-        self._binning_mode = settings['binning_mode']
+        # self._binning = settings['binning']
+        # self._binning_mode = settings['binning_mode']
         self._hardware_triggered = settings['hardware_trigger']
         self._trigger_line = settings['trigger_line']
         self._framerate = settings['framerate']
@@ -72,8 +72,8 @@ class GenICamCamera(AbstractCamera, abc.ABC):
 
         # Apply to the hardware by calling the setters
         self.pixel_format = self._pixel_format
-        self.binning = self._binning
-        self.binning_mode = self._binning_mode
+        # self.binning = self._binning
+        # self.binning_mode = self._binning_mode
         self.hardware_triggered = self._hardware_triggered
         self.framerate = self._framerate
         self.exposure = self._exposure
@@ -285,13 +285,55 @@ class GenICamCamera(AbstractCamera, abc.ABC):
             # apparently some SDKs use integers, others use strings so we do a bit of voodoo here
             trigger_source = f"Line{''.join([char for char in str(self._trigger_line) if char.isdigit()])}"
 
+            try:
+                self._set_feature_value('LineSelector', trigger_source)
+                self._set_feature_value('LineMode', 'Input')
+            except AttributeError:
+                pass
+
             self._set_feature_value('TriggerSelector', 'FrameStart')
             self._set_feature_value('TriggerMode', 'On')
             self._set_feature_value('TriggerSource', trigger_source)
             try:
+                self._set_feature_value('TriggerActivation', 'RisingEdge')
+            except AttributeError:
+                pass
+            try:
                 self._set_feature_value('AcquisitionFrameRateEnable', False)
             except AttributeError:
                 pass
+
+            try:
+                actual_trigger_source = self._get_feature_value('TriggerSource')
+            except AttributeError:
+                actual_trigger_source = '<unavailable>'
+
+            try:
+                actual_trigger_mode = self._get_feature_value('TriggerMode')
+            except AttributeError:
+                actual_trigger_mode = '<unavailable>'
+
+            try:
+                actual_line_mode = self._get_feature_value('LineMode')
+            except AttributeError:
+                actual_line_mode = '<unavailable>'
+
+            try:
+                actual_line_selector = self._get_feature_value('LineSelector')
+            except AttributeError:
+                actual_line_selector = '<unavailable>'
+
+            try:
+                actual_trigger_activation = self._get_feature_value('TriggerActivation')
+            except AttributeError:
+                actual_trigger_activation = '<unavailable>'
+
+            logger.debug(
+                f"{self.name} trigger configured: requested={trigger_source}, "
+                f"TriggerSource={actual_trigger_source}, TriggerMode={actual_trigger_mode}, "
+                f"LineSelector={actual_line_selector}, LineMode={actual_line_mode}, "
+                f"TriggerActivation={actual_trigger_activation}"
+            )
         else:
             self._set_feature_value('TriggerMode', 'Off')
             try:
@@ -301,48 +343,48 @@ class GenICamCamera(AbstractCamera, abc.ABC):
         self._hardware_triggered = enabled
         self.framerate = self._framerate
 
-    @property
-    def binning(self) -> int:
-        return self._binning
+    # @property
+    # def binning(self) -> int:
+    #     return self._binning
 
-    @binning.setter
-    def binning(self, value: int):
-        was_grabbing = self.is_grabbing
-        if was_grabbing:
-            self.stop_grabbing()
+    # @binning.setter
+    # def binning(self, value: int):
+    #     was_grabbing = self.is_grabbing
+    #     if was_grabbing:
+    #         self.stop_grabbing()
 
-        h_val = self._set_feature_value('BinningHorizontal', value)
-        v_val = self._set_feature_value('BinningVertical', value)
+    #     h_val = self._set_feature_value('BinningHorizontal', value)
+    #     v_val = self._set_feature_value('BinningVertical', value)
 
-        if h_val != v_val:
-            logger.warning(f"Binning mismatch! H={h_val} V={v_val}")
+    #     if h_val != v_val:
+    #         logger.warning(f"Binning mismatch! H={h_val} V={v_val}")
 
-        self._binning = h_val
+    #     self._binning = h_val
 
-        self._set_feature_value('OffsetX', 0)
-        self._set_feature_value('OffsetY', 0)
-        self._set_feature_value('Width', self._get_feature_max_value('Width'))
-        self._set_feature_value('Height', self._get_feature_max_value('Height'))
+    #     self._set_feature_value('OffsetX', 0)
+    #     self._set_feature_value('OffsetY', 0)
+    #     self._set_feature_value('Width', self._get_feature_max_value('Width'))
+    #     self._set_feature_value('Height', self._get_feature_max_value('Height'))
 
-        self._roi = (0, 0, self._get_feature_value('Width'), self._get_feature_value('Height'))
+    #     self._roi = (0, 0, self._get_feature_value('Width'), self._get_feature_value('Height'))
 
-        if was_grabbing:
-            self.start_grabbing()
+    #     if was_grabbing:
+    #         self.start_grabbing()
 
-    @property
-    def binning_mode(self) -> str:
-        return self._binning_mode
+    # @property
+    # def binning_mode(self) -> str:
+    #     return self._binning_mode
 
-    @binning_mode.setter
-    def binning_mode(self, value: str):
-        mode = 'Average' if value.lower() in ['a', 'avg', 'average'] else 'Sum'
-        h_mode = self._set_feature_value('BinningHorizontalMode', mode)
-        self._set_feature_value('BinningVerticalMode', mode)
-        self._binning_mode = h_mode
+    # @binning_mode.setter
+    # def binning_mode(self, value: str):
+    #     mode = 'Average' if value.lower() in ['a', 'avg', 'average'] else 'Sum'
+    #     h_mode = self._set_feature_value('BinningHorizontalMode', mode)
+    #     self._set_feature_value('BinningVerticalMode', mode)
+    #     self._binning_mode = h_mode
 
-    @property
-    def available_binning_modes(self) -> list[str]:
-        return self._get_feature_entries('BinningHorizontalMode')
+    # @property
+    # def available_binning_modes(self) -> list[str]:
+    #     return self._get_feature_entries('BinningHorizontalMode')
 
     @property
     def temperature(self) -> Optional[float]:

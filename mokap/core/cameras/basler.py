@@ -43,6 +43,26 @@ class BaslerCamera(GenICamCamera):
         self._set_feature_value('UserSetSelector', 'Default')
         self._ptr.UserSetLoad.Execute()
 
+        # Match the transport and trigger-side defaults from the working legacy
+        # implementation so Basler GigE cameras behave consistently here too.
+        try:
+            self._set_feature_value('ExposureMode', 'Timed')
+        except AttributeError:
+            pass
+
+        try:
+            self._set_feature_value('DeviceLinkThroughputLimitMode', 'On')
+            self._set_feature_value('DeviceLinkThroughputLimit', 342000000)
+        except AttributeError:
+            pass
+
+        try:
+            self._set_feature_value('TriggerDelay', 0.0)
+            self._set_feature_value('LineDebouncerTime', 5.0)
+            self._set_feature_value('MaxNumBuffer', 20)
+        except AttributeError:
+            pass
+
     def disconnect(self) -> None:
         if self.is_grabbing: self.stop_grabbing()
         if self._ptr and self._ptr.IsOpen(): self._ptr.Close()
@@ -96,7 +116,8 @@ class BaslerCamera(GenICamCamera):
         try:
             node = self._ptr.GetNodeMap().GetNode(name)
             if not geni.IsWritable(node):
-                raise AttributeError(f"Feature '{name}' not writable.")
+                logger.info(f"Feature '{name}' not writable.")
+                #raise AttributeError(f"Feature '{name}' not writable.")
 
             if isinstance(node, geni.IEnumeration):
                 node.FromString(str(value))

@@ -143,33 +143,33 @@ class AbstractCamera(abc.ABC):
         """ Min and max gamma """
         pass
 
-    @property
-    @abc.abstractmethod
-    def binning(self) -> int:
-        """ The binning factor (1 for 1x1, 2 for 2x2, etc) """
-        pass
+    # @property
+    # @abc.abstractmethod
+    # def binning(self) -> int:
+    #     """ The binning factor (1 for 1x1, 2 for 2x2, etc) """
+    #     pass
 
-    @binning.setter
-    @abc.abstractmethod
-    def binning(self, value: int):
-        pass
+    # @binning.setter
+    # @abc.abstractmethod
+    # def binning(self, value: int):
+    #     pass
 
-    @property
-    @abc.abstractmethod
-    def binning_mode(self) -> str:
-        """ The binning mode, typically "sum" or "average" """
-        pass
+    # @property
+    # @abc.abstractmethod
+    # def binning_mode(self) -> str:
+    #     """ The binning mode, typically "sum" or "average" """
+    #     pass
 
-    @binning_mode.setter
-    @abc.abstractmethod
-    def binning_mode(self, value: str):
-        pass
+    # @binning_mode.setter
+    # @abc.abstractmethod
+    # def binning_mode(self, value: str):
+    #     pass
 
-    @property
-    @abc.abstractmethod
-    def available_binning_modes(self) -> list[str]:
-        """ Returns a list of available binning mode strings """
-        pass
+    # @property
+    # @abc.abstractmethod
+    # def available_binning_modes(self) -> list[str]:
+    #     """ Returns a list of available binning mode strings """
+    #     pass
 
     @property
     @abc.abstractmethod

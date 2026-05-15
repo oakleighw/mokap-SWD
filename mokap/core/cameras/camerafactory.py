@@ -69,6 +69,7 @@ class CameraFactory:
             from pypylon import pylon as py
             tlf = py.TlFactory.GetInstance()
             pylon_devices = tlf.EnumerateDevices()
+            
             for dev_info in pylon_devices:
                 CameraFactory._discovered_devices.append({
                     'vendor': 'Basler',

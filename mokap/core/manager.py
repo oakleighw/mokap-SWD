@@ -166,7 +166,7 @@ class MultiCam:
         # Define the list of global keys that can be applied to cameras
         valid_global_settings = [
             'exposure', 'gain', 'gamma', 'pixel_format', 'black_level',
-            'binning', 'framerate', 'hardware_trigger', 'roi'
+            'framerate', 'hardware_trigger', 'trigger_line', 'roi'
         ]
 
         # Create a base dictionary of global settings found in the config
@@ -270,9 +270,6 @@ class MultiCam:
         self._acquiring.set()
         self._threads = []
 
-        if self.hardware_triggered:
-            self._trigger_instance.start(self._framerate)
-
         for i, cam in enumerate(self.cameras):
             # Start one grabber, one writer, and one display thread per camera
             g = Thread(target=self._grabber_thread, args=(i,))
@@ -280,6 +277,9 @@ class MultiCam:
             self._threads.extend([g, w])
             g.start()
             w.start()
+
+        if self.hardware_triggered:
+            self._trigger_instance.start(self._framerate)
 
         logger.info(f"Acquisition started with {self.nb_cameras} cameras.")
 
@@ -321,7 +321,7 @@ class MultiCam:
 
         # Prepare metadata snapshot for this session
         keys_order = ['exposure', 'gain', 'gamma', 'black_level', 'pixel_format',
-                      'binning', 'binning_mode', 'roi', 'save_format']
+                       'roi', 'save_format']
         session_config = {k: self.config[k] for k in keys_order if k in self.config}
 
         if session_config.get('save_format') !=  'mp4' and self.config.get('save_quality'):
@@ -422,10 +422,8 @@ class MultiCam:
         cam.start_grabbing()
         while self._acquiring.is_set():
             try:
-                frame, frame_data = cam.grab_frame(timeout_ms=2000)
-                if frame is None:
-                    continue
-                else:
+                frame, frame_data = cam.grab_frame(timeout_ms=5000)
+                if frame is not None:
                     # Update the shared buffer for any other thread to read
                     with lock:
                         self._latest_frames[cam_idx] = (frame, frame_data)

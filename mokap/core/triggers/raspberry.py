@@ -9,28 +9,6 @@ import paramiko
 logger = logging.getLogger(__name__)
 
 
-def detect_pi_version() -> Optional[int]:
-    """
-    Detect Raspberry Pi version via SSH.
-    Returns: 4 for Pi 4, 5 for Pi 5, None if detection fails
-    """
-    command = "cat /proc/device-tree/model 2>/dev/null || echo 'Unknown'"
-    try:
-        result = subprocess.run(command, shell=True, capture_output=True, text=True, timeout=2)
-        model_str = result.stdout.strip().lower()
-        
-        if 'raspberry pi 5' in model_str or 'pi 5' in model_str:
-            return 5
-        elif 'raspberry pi 4' in model_str or 'pi 4' in model_str:
-            return 4
-        else:
-            logger.warning(f"Could not determine Pi version from: {model_str}")
-            return None
-    except Exception as e:
-        logger.warning(f"Failed to detect Pi version: {e}")
-        return None
-
-
 class RaspberryTrigger(AbstractTrigger):
     """
     Manages a hardware trigger signal from a Raspberry Pi.
@@ -190,19 +168,19 @@ class RaspberryTrigger(AbstractTrigger):
         
         # Create a persistent Python script that keeps PWM alive
         script = f'''import time
-import sys
-from gpiozero import PWMOutputDevice
-sys.stdout.reconfigure(line_buffering=True)
-pwm = PWMOutputDevice({self.gpio_pin}, frequency={frequency})
-pwm.value = {duty_cycle}
-sys.stdout.write("PWM_STARTED\\n")
-sys.stdout.flush()
-try:
-    while True:
-        time.sleep(1)  # Keep process alive indefinitely
-except KeyboardInterrupt:
-    pwm.off()
-'''
+        import sys
+        from gpiozero import PWMOutputDevice
+        sys.stdout.reconfigure(line_buffering=True)
+        pwm = PWMOutputDevice({self.gpio_pin}, frequency={frequency})
+        pwm.value = {duty_cycle}
+        sys.stdout.write("PWM_STARTED\\n")
+        sys.stdout.flush()
+        try:
+            while True:
+                time.sleep(1)  # Keep process alive indefinitely
+        except KeyboardInterrupt:
+            pwm.off()
+        '''
 
         # Run with nohup to keep process alive even if SSH connection closes
         command = f"nohup python3 << 'EOF' > /tmp/mokap_pwm_{self.gpio_pin}.log 2>&1 &\n{script}\nEOF"
