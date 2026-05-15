@@ -428,7 +428,7 @@ class MultiCam:
         cam.start_grabbing()
         while self._acquiring.is_set():
             try:
-                frame, frame_data = cam.grab_frame(timeout_ms=5000)
+                frame, frame_data = cam.grab_frame(timeout_ms=1000)
                 if frame is not None:
                     # Update the shared buffer for any other thread to read
                     with lock:
