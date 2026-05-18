@@ -2,6 +2,7 @@ import logging
 import os
 import time
 import subprocess
+import textwrap
 from typing import Optional, Dict
 from mokap.core.triggers.interface import AbstractTrigger
 import paramiko
@@ -167,20 +168,22 @@ class RaspberryTrigger(AbstractTrigger):
         duty_cycle = duty_cycle_percent / 100.0  # gpiozero uses 0-1
         
         # Create a persistent Python script that keeps PWM alive
-        script = f'''import time
-        import sys
-        from gpiozero import PWMOutputDevice
-        sys.stdout.reconfigure(line_buffering=True)
-        pwm = PWMOutputDevice({self.gpio_pin}, frequency={frequency})
-        pwm.value = {duty_cycle}
-        sys.stdout.write("PWM_STARTED\\n")
-        sys.stdout.flush()
-        try:
-            while True:
-                time.sleep(1)  # Keep process alive indefinitely
-        except KeyboardInterrupt:
-            pwm.off()
-        '''
+        script = textwrap.dedent(f'''
+            import time
+            import sys
+            from gpiozero import PWMOutputDevice
+
+            sys.stdout.reconfigure(line_buffering=True)
+            pwm = PWMOutputDevice({self.gpio_pin}, frequency={frequency})
+            pwm.value = {duty_cycle}
+            sys.stdout.write("PWM_STARTED\\n")
+            sys.stdout.flush()
+            try:
+                while True:
+                    time.sleep(1)  # Keep process alive indefinitely
+            except KeyboardInterrupt:
+                pwm.off()
+        ''').strip()
 
         # Run with nohup to keep process alive even if SSH connection closes
         command = f"nohup python3 << 'EOF' > /tmp/mokap_pwm_{self.gpio_pin}.log 2>&1 &\n{script}\nEOF"
