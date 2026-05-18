@@ -1,4 +1,5 @@
 from collections import deque
+import time
 from typing import Tuple
 from pathlib import Path
 
@@ -519,6 +520,15 @@ class RecordingLiveView(LiveViewBase):
 
         # tell the UI to update with this *actual* value
         self.update_slider_value(label, actual_value_set)
+
+        # A live camera reconfiguration can briefly pause acquisition, especially on IC4
+        # when the camera is stopped/restarted to apply exposure or other sensor settings.
+        # Reset the FPS accumulator so the displayed FPS reflects the new steady state
+        # instead of averaging across the reconfigure gap.
+        if self._mainwindow.manager.acquiring:
+            self._fps_clock = time.monotonic()
+            self._last_frame_number_for_fps = self._current_frame_data.get('frame_number', 0)
+            self._capture_fps_deque.clear()
 
         # update the polled value cache. This prevents the slow update loop from redundantly updating on next tick
         self._last_polled_values[label] = actual_value_set
