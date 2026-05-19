@@ -325,6 +325,9 @@ class MultiCam:
             logger.warning("Already recording.")
             return
 
+        # Re-create the session directory if a previous empty acquisition removed it.
+        self.full_path.mkdir(parents=True, exist_ok=True)
+
         # Prepare metadata snapshot for this session
         keys_order = ['exposure', 'gain', 'gamma', 'black_level', 'pixel_format',
                        'roi', 'save_format']
@@ -695,6 +698,7 @@ class MultiCam:
 
     def save_metadata(self):
         """ Saves the current session metadata to a JSON file """
+        self.full_path.mkdir(parents=True, exist_ok=True)
         meta_path = self.full_path / 'metadata.json'
         with open(meta_path, 'w', encoding='utf-8') as f:
             json.dump(self._metadata, f, ensure_ascii=False, indent=4)
